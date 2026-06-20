@@ -120,4 +120,16 @@ public class InfluxQlParserTests
         Assert.Equal("mean", query.Select[0].Func);
         Assert.Equal("max", query.Select[1].Func);
     }
+
+    [Fact]
+    public void Parse_SelectWithSeriesWindowAndUnit_ParsesSeriesPagingAndDurationParameter()
+    {
+        var query = InfluxQlParser.Parse("SELECT derivative(value, 1m) FROM cpu GROUP BY time(1m),host ORDER BY time DESC SLIMIT 2 SOFFSET 1");
+
+        Assert.True(query.Desc);
+        Assert.Equal(2, query.SeriesLimit);
+        Assert.Equal(1, query.SeriesOffset);
+        Assert.Equal("derivative", query.Select[0].Func);
+        Assert.Equal(60_000_000_000, query.Select[0].UnitNs);
+    }
 }

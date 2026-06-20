@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 namespace MiniInflux.Net10.Storage;
 
@@ -256,6 +257,21 @@ public sealed class Manifest
         }
     }
 
+    public void RemoveSegmentsFromShard(string db, string rp, int shardId, IEnumerable<string> segmentFiles)
+    {
+        lock (_lock)
+        {
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return;
+            if (!dbInfo.RetentionPolicies.TryGetValue(rp, out var rpInfo)) return;
+            var shard = rpInfo.ShardGroups.FirstOrDefault(s => s.Id == shardId);
+            if (shard == null) return;
+
+            var names = new HashSet<string>(segmentFiles.Select(Path.GetFileName).Where(name => !string.IsNullOrWhiteSpace(name))!, StringComparer.OrdinalIgnoreCase);
+            shard.SegmentFiles.RemoveAll(file => names.Contains(file));
+            Save();
+        }
+    }
+
     #endregion
 
     #region Indexes
@@ -278,11 +294,19 @@ public sealed class Manifest
                 // Tag inverted index
                 if (!dbInfo.TagIndex.TryGetValue(meas, out var tagMap))
                 { tagMap = new(StringComparer.Ordinal); dbInfo.TagIndex[meas] = tagMap; }
+                if (!dbInfo.TagSeriesIndex.TryGetValue(meas, out var tagSeriesMap))
+                { tagSeriesMap = new(StringComparer.Ordinal); dbInfo.TagSeriesIndex[meas] = tagSeriesMap; }
                 foreach (var (k, v) in tags)
                 {
                     if (!tagMap.TryGetValue(k, out var valSet))
                     { valSet = new(StringComparer.Ordinal); tagMap[k] = valSet; }
                     valSet.Add(v);
+
+                    if (!tagSeriesMap.TryGetValue(k, out var valueMap))
+                    { valueMap = new(StringComparer.Ordinal); tagSeriesMap[k] = valueMap; }
+                    if (!valueMap.TryGetValue(v, out var tagValueSeries))
+                    { tagValueSeries = new(StringComparer.Ordinal); valueMap[v] = tagValueSeries; }
+                    tagValueSeries.Add(tagsCanon);
                 }
             }
             Save();
@@ -300,6 +324,38 @@ public sealed class Manifest
             if (measurement != null)
                 return dbInfo.SeriesIndex.TryGetValue(measurement, out var s) ? s.Order().ToArray() : [];
             return dbInfo.SeriesIndex.Values.SelectMany(s => s).Distinct().Order().ToArray();
+        }
+    }
+
+    public int GetTagValueCardinality(string db, string? measurement, string? tagKey)
+    {
+        lock (_lock)
+        {
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return 0;
+            var values = new HashSet<string>(StringComparer.Ordinal);
+            var measurements = measurement != null
+                ? (dbInfo.TagIndex.ContainsKey(measurement) ? new[] { measurement } : Array.Empty<string>())
+                : dbInfo.TagIndex.Keys.ToArray();
+            foreach (var m in measurements)
+            {
+                if (!dbInfo.TagIndex.TryGetValue(m, out var tagMap)) continue;
+                var keys = tagKey != null
+                    ? (tagMap.ContainsKey(tagKey) ? new[] { tagKey } : Array.Empty<string>())
+                    : tagMap.Keys.ToArray();
+                foreach (var key in keys)
+                    if (tagMap.TryGetValue(key, out var vals))
+                        foreach (var value in vals) values.Add($"{key}={value}");
+            }
+            return values.Count;
+        }
+    }
+
+    public IReadOnlyList<string> ListMeasurements(string db)
+    {
+        lock (_lock)
+        {
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
+            return dbInfo.SeriesIndex.Keys.Order().ToArray();
         }
     }
 
@@ -331,6 +387,46 @@ public sealed class Manifest
         }
     }
 
+    public IReadOnlyList<string> GetSeriesForTagValue(string db, string measurement, string tagKey, string tagValue)
+    {
+        lock (_lock)
+        {
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
+            if (!dbInfo.TagSeriesIndex.TryGetValue(measurement, out var tagMap)) return [];
+            if (!tagMap.TryGetValue(tagKey, out var valueMap)) return [];
+            return valueMap.TryGetValue(tagValue, out var series) ? series.Order().ToArray() : [];
+        }
+    }
+
+    public IReadOnlyList<string> GetSeriesForTagKey(string db, string measurement, string tagKey)
+    {
+        lock (_lock)
+        {
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
+            if (!dbInfo.TagSeriesIndex.TryGetValue(measurement, out var tagMap)) return [];
+            if (!tagMap.TryGetValue(tagKey, out var valueMap)) return [];
+            return valueMap.Values.SelectMany(v => v).Distinct(StringComparer.Ordinal).Order().ToArray();
+        }
+    }
+
+    public IReadOnlyList<string> GetSeriesForTagRegex(string db, string measurement, string tagKey, string pattern, bool negate)
+    {
+        lock (_lock)
+        {
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
+            if (!dbInfo.TagSeriesIndex.TryGetValue(measurement, out var tagMap)) return [];
+            if (!tagMap.TryGetValue(tagKey, out var valueMap)) return [];
+
+            var regex = new Regex(pattern, RegexOptions.CultureInvariant);
+            return valueMap
+                .Where(kv => negate ? !regex.IsMatch(kv.Key) : regex.IsMatch(kv.Key))
+                .SelectMany(kv => kv.Value)
+                .Distinct(StringComparer.Ordinal)
+                .Order()
+                .ToArray();
+        }
+    }
+
     /// <summary>
     /// Remove series/tag index entries for a measurement (on DROP MEASUREMENT).
     /// </summary>
@@ -341,7 +437,59 @@ public sealed class Manifest
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return;
             dbInfo.SeriesIndex.Remove(measurement);
             dbInfo.TagIndex.Remove(measurement);
+            dbInfo.TagSeriesIndex.Remove(measurement);
             Save();
+        }
+    }
+
+    public void RemoveSeriesIndex(string db, string measurement, IReadOnlySet<string> tagsCanonicalSet)
+    {
+        lock (_lock)
+        {
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return;
+            if (dbInfo.SeriesIndex.TryGetValue(measurement, out var series))
+                series.RemoveWhere(tagsCanonicalSet.Contains);
+
+            // Rebuild tag indexes for the measurement from remaining series keys.
+            dbInfo.TagIndex.Remove(measurement);
+            dbInfo.TagSeriesIndex.Remove(measurement);
+            if (!dbInfo.SeriesIndex.TryGetValue(measurement, out var remaining) || remaining.Count == 0)
+            {
+                dbInfo.SeriesIndex.Remove(measurement);
+                Save();
+                return;
+            }
+
+            var tagMap = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+            var tagSeriesMap = new Dictionary<string, Dictionary<string, HashSet<string>>>(StringComparer.Ordinal);
+            foreach (var tagsCanonical in remaining)
+            {
+                foreach (var (key, value) in ParseTags(tagsCanonical))
+                {
+                    if (!tagMap.TryGetValue(key, out var vals))
+                    { vals = new(StringComparer.Ordinal); tagMap[key] = vals; }
+                    vals.Add(value);
+
+                    if (!tagSeriesMap.TryGetValue(key, out var valueMap))
+                    { valueMap = new(StringComparer.Ordinal); tagSeriesMap[key] = valueMap; }
+                    if (!valueMap.TryGetValue(value, out var seriesSet))
+                    { seriesSet = new(StringComparer.Ordinal); valueMap[value] = seriesSet; }
+                    seriesSet.Add(tagsCanonical);
+                }
+            }
+            dbInfo.TagIndex[measurement] = tagMap;
+            dbInfo.TagSeriesIndex[measurement] = tagSeriesMap;
+            Save();
+        }
+    }
+
+    private static IEnumerable<(string Key, string Value)> ParseTags(string tagsCanonical)
+    {
+        if (string.IsNullOrWhiteSpace(tagsCanonical)) yield break;
+        foreach (var part in tagsCanonical.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var i = part.IndexOf('=');
+            if (i > 0) yield return (part[..i], part[(i + 1)..]);
         }
     }
 
@@ -406,6 +554,7 @@ internal sealed class DatabaseInfo
     public Dictionary<string, RetentionPolicyInfo> RetentionPolicies { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, HashSet<string>> SeriesIndex { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, Dictionary<string, HashSet<string>>> TagIndex { get; set; } = new(StringComparer.Ordinal);
+    public Dictionary<string, Dictionary<string, Dictionary<string, HashSet<string>>>> TagSeriesIndex { get; set; } = new(StringComparer.Ordinal);
 }
 
 internal sealed class ManifestData
@@ -422,5 +571,6 @@ internal sealed class ManifestData
 [JsonSerializable(typeof(Dictionary<string, RetentionPolicyInfo>))]
 [JsonSerializable(typeof(Dictionary<string, HashSet<string>>))]
 [JsonSerializable(typeof(Dictionary<string, Dictionary<string, HashSet<string>>>))]
+[JsonSerializable(typeof(Dictionary<string, Dictionary<string, Dictionary<string, HashSet<string>>>>))]
 [JsonSerializable(typeof(HashSet<string>))]
 internal partial class ManifestJsonContext : JsonSerializerContext { }

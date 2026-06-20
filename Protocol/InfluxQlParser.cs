@@ -6,26 +6,34 @@ public enum QueryKind
 {
     CreateDatabase, ShowDatabases, ShowMeasurements, ShowFieldKeys, ShowTagKeys, ShowTagValues, Select,
     CreateRetentionPolicy, AlterRetentionPolicy, DropRetentionPolicy, ShowRetentionPolicies,
-    DropDatabase, DropMeasurement, Delete
+    DropDatabase, DropMeasurement, DropSeries, DropShard, Delete,
+    ShowSeries, ShowSeriesCardinality, ShowMeasurementCardinality, ShowTagValuesCardinality,
+    CreateUser, GrantPrivilege, RevokePrivilege, ShowUsers, ShowGrants, DropUser
 }
 
 public enum TagOp { Eq, Neq, Regex, NotRegex }
 public enum FieldOp { Gt, Gte, Lt, Lte, Eq, Neq }
 public enum FillMode { None, Null, Zero, Previous, Linear }
 
-public sealed record SelectItem(string Func, string Field, string Alias, double Param = 0);
+public sealed record SelectItem(string Func, string Field, string Alias, double Param = 0, long? UnitNs = null);
 public sealed record TagFilter(string Key, string Value, TagOp Op);
 public sealed record FieldFilter(string Field, double Value, FieldOp Op);
+public sealed record GrantPrivilege(string UserName, string Database, string Privilege);
 
 public sealed class ParsedQuery
 {
     public required QueryKind Kind { get; init; }
     public string? Database { get; init; }
     public string? Measurement { get; init; }
+    public string? SourceDatabase { get; init; }
+    public string? SourceRpName { get; init; }
     public List<SelectItem> Select { get; init; } = [];
     public long? MinTimeNs { get; init; }
     public long? MaxTimeNs { get; init; }
     public int? Limit { get; init; }
+    public int? Offset { get; init; }
+    public int? SeriesLimit { get; init; }
+    public int? SeriesOffset { get; init; }
     public bool Desc { get; init; }
     public long? GroupByNs { get; init; }
     public List<string> GroupByTags { get; init; } = [];
@@ -36,6 +44,11 @@ public sealed class ParsedQuery
     public string? RpName { get; init; }
     public long? RpDurationNs { get; init; }
     public bool? RpDefault { get; init; }
+    public string? IntoTarget { get; init; }
+    public string? UserName { get; init; }
+    public string? Password { get; init; }
+    public bool? IsAdmin { get; init; }
+    public GrantPrivilege? Grant { get; init; }
 }
 
 public static class InfluxQlParser
@@ -52,13 +65,31 @@ public static class InfluxQlParser
             return new() { Kind = QueryKind.DropDatabase, Database = Unq(q[14..].Trim()) };
         if (q.StartsWith("DROP MEASUREMENT ", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.DropMeasurement, Measurement = Unq(q[17..].Trim()) };
+        if (q.StartsWith("DROP SERIES", StringComparison.OrdinalIgnoreCase)) return ParseDropSeries(q);
+        if (q.StartsWith("DROP SHARD ", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.DropShard, Limit = int.Parse(q["DROP SHARD ".Length..].Trim(), CultureInfo.InvariantCulture) };
         if (q.StartsWith("DELETE FROM ", StringComparison.OrdinalIgnoreCase)) return ParseDelete(q);
+        if (q.StartsWith("CREATE USER ", StringComparison.OrdinalIgnoreCase)) return ParseCreateUser(q);
+        if (q.StartsWith("GRANT ", StringComparison.OrdinalIgnoreCase)) return ParseGrant(q);
+        if (q.StartsWith("REVOKE ", StringComparison.OrdinalIgnoreCase)) return ParseRevoke(q);
+        if (q.StartsWith("SHOW USERS", StringComparison.OrdinalIgnoreCase)) return new() { Kind = QueryKind.ShowUsers };
+        if (q.StartsWith("SHOW GRANTS FOR ", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowGrants, UserName = Unq(q["SHOW GRANTS FOR ".Length..].Trim()) };
+        if (q.StartsWith("DROP USER ", StringComparison.OrdinalIgnoreCase)) return new() { Kind = QueryKind.DropUser, UserName = Unq(q["DROP USER ".Length..].Trim()) };
         if (q.StartsWith("CREATE DATABASE ", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.CreateDatabase, Database = Unq(q[16..].Trim()) };
         if (q.Equals("SHOW DATABASES", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowDatabases };
         if (q.Equals("SHOW MEASUREMENTS", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowMeasurements };
+        if (q.StartsWith("SHOW SERIES CARDINALITY", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowSeriesCardinality, Measurement = AfterFrom(q) };
+        if (q.StartsWith("SHOW SERIES", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowSeries, Measurement = AfterFrom(q) };
+        if (q.StartsWith("SHOW MEASUREMENT CARDINALITY", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowMeasurementCardinality };
+        if (q.StartsWith("SHOW TAG VALUES CARDINALITY", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowTagValuesCardinality, Measurement = AfterFrom(q), TagKey = AfterKey(q) };
         if (q.StartsWith("SHOW FIELD KEYS", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowFieldKeys, Measurement = AfterFrom(q) };
         if (q.StartsWith("SHOW TAG KEYS", StringComparison.OrdinalIgnoreCase))
@@ -123,16 +154,44 @@ public static class InfluxQlParser
             MinTimeNs = min, MaxTimeNs = max, TagFilters = tagFilters, FieldFilters = fieldFilters };
     }
 
+    static ParsedQuery ParseDropSeries(string q)
+    {
+        var rest = q["DROP SERIES".Length..].Trim();
+        string? meas = null;
+        long? min = null, max = null;
+        var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
+
+        if (rest.StartsWith("FROM ", StringComparison.OrdinalIgnoreCase))
+        {
+            rest = rest["FROM ".Length..].Trim();
+            meas = Unq(ReadToken(ref rest));
+        }
+
+        var upper = rest.ToUpperInvariant(); var wi = upper.IndexOf(" WHERE ");
+        if (wi >= 0) ParseWhere(rest[(wi + 7)..], out min, out max, tagFilters, fieldFilters);
+        return new() { Kind = QueryKind.DropSeries, Measurement = meas, MinTimeNs = min, MaxTimeNs = max,
+            TagFilters = tagFilters, FieldFilters = fieldFilters };
+    }
+
     static ParsedQuery ParseSelect(string q)
     {
         var u = q.ToUpperInvariant();
         int fi = u.IndexOf(" FROM ");
         if (fi < 0) throw new FormatException("SELECT requires FROM");
         var fieldText = q[7..fi].Trim();
+        string? intoTarget = null;
+        var intoIndex = fieldText.ToUpperInvariant().LastIndexOf(" INTO ", StringComparison.Ordinal);
+        if (intoIndex >= 0)
+        {
+            intoTarget = Unq(fieldText[(intoIndex + 6)..].Trim());
+            fieldText = fieldText[..intoIndex].Trim();
+        }
         var rest = q[(fi + 6)..].Trim();
-        string meas = rest.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
-        string tail = rest.Length > meas.Length ? rest[meas.Length..] : "";
-        long? min = null, max = null, gb = null; int? limit = null;
+        string sourceToken = rest.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
+        var source = ParseQualifiedMeasurement(sourceToken);
+        string tail = rest.Length > sourceToken.Length ? rest[sourceToken.Length..] : "";
+        long? min = null, max = null, gb = null; int? limit = null, offset = null;
+        int? slimit = null, soffset = null;
         bool desc = u.Contains(" ORDER BY TIME DESC");
         var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
         var groupByTags = new List<string>(); var fill = FillMode.None;
@@ -146,9 +205,67 @@ public static class InfluxQlParser
             fill = fv switch { "null" => FillMode.Null, "0" => FillMode.Zero, "previous" => FillMode.Previous, "linear" => FillMode.Linear, _ => FillMode.None }; } }
         var lu = tu.LastIndexOf(" LIMIT ");
         if (lu >= 0) limit = int.Parse(tail[(lu + 7)..].Trim().Split(' ')[0], CultureInfo.InvariantCulture);
-        return new() { Kind = QueryKind.Select, Measurement = Unq(meas), Select = ParseItems(fieldText),
+        var ou = tu.LastIndexOf(" OFFSET ");
+        if (ou >= 0) offset = int.Parse(tail[(ou + 8)..].Trim().Split(' ')[0], CultureInfo.InvariantCulture);
+        var slu = tu.LastIndexOf(" SLIMIT ");
+        if (slu >= 0) slimit = int.Parse(tail[(slu + 8)..].Trim().Split(' ')[0], CultureInfo.InvariantCulture);
+        var sou = tu.LastIndexOf(" SOFFSET ");
+        if (sou >= 0) soffset = int.Parse(tail[(sou + 9)..].Trim().Split(' ')[0], CultureInfo.InvariantCulture);
+        return new() { Kind = QueryKind.Select, Measurement = source.Measurement, SourceDatabase = source.Database, SourceRpName = source.RetentionPolicy, Select = ParseItems(fieldText),
             MinTimeNs = min, MaxTimeNs = max, Limit = limit, Desc = desc, GroupByNs = gb,
-            GroupByTags = groupByTags, Fill = fill, TagFilters = tagFilters, FieldFilters = fieldFilters };
+            Offset = offset, SeriesLimit = slimit, SeriesOffset = soffset,
+            GroupByTags = groupByTags, Fill = fill, TagFilters = tagFilters, FieldFilters = fieldFilters, IntoTarget = intoTarget };
+    }
+
+    static ParsedQuery ParseCreateUser(string q)
+    {
+        var rest = q["CREATE USER ".Length..].Trim();
+        var user = ReadToken(ref rest);
+        ConsumeKeyword(ref rest, "WITH");
+        ConsumeKeyword(ref rest, "PASSWORD");
+        var password = rest.TrimStart();
+        var admin = false;
+        if (password.StartsWith('\''))
+        {
+            var end = password.IndexOf('\'', 1);
+            if (end < 1) throw new FormatException("CREATE USER requires quoted password");
+            var pwd = password[1..end];
+            var tail = password[(end + 1)..].Trim();
+            if (tail.StartsWith("WITH ALL PRIVILEGES", StringComparison.OrdinalIgnoreCase))
+                admin = true;
+            return new() { Kind = QueryKind.CreateUser, UserName = Unq(user), Password = pwd, IsAdmin = admin };
+        }
+        throw new FormatException("CREATE USER requires quoted password");
+    }
+
+    static ParsedQuery ParseGrant(string q)
+    {
+        var rest = q["GRANT ".Length..].Trim();
+        var privilege = NormalizePrivilege(ReadToken(ref rest));
+        ConsumeKeyword(ref rest, "ON");
+        var scope = ReadToken(ref rest);
+        ConsumeKeyword(ref rest, "TO");
+        var user = ReadToken(ref rest);
+        return new()
+        {
+            Kind = QueryKind.GrantPrivilege,
+            Grant = new GrantPrivilege(Unq(user), Unq(scope), privilege)
+        };
+    }
+
+    static ParsedQuery ParseRevoke(string q)
+    {
+        var rest = q["REVOKE ".Length..].Trim();
+        var privilege = NormalizePrivilege(ReadToken(ref rest));
+        ConsumeKeyword(ref rest, "ON");
+        var scope = ReadToken(ref rest);
+        ConsumeKeyword(ref rest, "FROM");
+        var user = ReadToken(ref rest);
+        return new()
+        {
+            Kind = QueryKind.RevokePrivilege,
+            Grant = new GrantPrivilege(Unq(user), Unq(scope), privilege)
+        };
     }
 
     static void ParseGroupBy(string text, out long? gbNs, List<string> tags)
@@ -198,7 +315,7 @@ public static class InfluxQlParser
     }
 
     static string ExtractRegex(string s) { s = s.Trim(); return s.Length >= 2 && s[0] == '/' && s[^1] == '/' ? s[1..^1] : s; }
-    static int EndClause(string u, int st) => new[] { u.IndexOf(" GROUP BY ", st), u.IndexOf(" ORDER BY ", st), u.IndexOf(" LIMIT ", st), u.IndexOf(" FILL(", st) }.Where(x => x >= 0).DefaultIfEmpty(u.Length).Min();
+    static int EndClause(string u, int st) => new[] { u.IndexOf(" GROUP BY ", st), u.IndexOf(" ORDER BY ", st), u.IndexOf(" LIMIT ", st), u.IndexOf(" OFFSET ", st), u.IndexOf(" SLIMIT ", st), u.IndexOf(" SOFFSET ", st), u.IndexOf(" FILL(", st) }.Where(x => x >= 0).DefaultIfEmpty(u.Length).Min();
     static List<SelectItem> ParseItems(string s)
     {
         if (s == "*") return [new("", "*", "*")];
@@ -216,9 +333,18 @@ public static class InfluxQlParser
                 var args = inner.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
                 var fld = Unq(args[0]);
                 double param = 0;
-                if (args.Length > 1) double.TryParse(args[1], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out param);
-                var alias = param != 0 ? $"{f}_{fld}_{(int)param}" : $"{f}_{fld}";
-                items.Add(new SelectItem(f, fld, alias, param));
+                long? unitNs = null;
+                if (args.Length > 1)
+                {
+                    var second = args[1].Trim();
+                    if (double.TryParse(second, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var numeric))
+                        param = numeric;
+                    else
+                        unitNs = DurationToNs(second);
+                }
+                var aliasSuffix = args.Length > 1 ? "_" + args[1].Trim().Replace("\"", "").Replace("'", "") : "";
+                var alias = $"{f}_{fld}{aliasSuffix}";
+                items.Add(new SelectItem(f, fld, alias, param, unitNs));
             }
             else
             {
@@ -247,6 +373,29 @@ public static class InfluxQlParser
     static string ReadToken(ref string rest) { rest = rest.TrimStart(); int i = 0; while (i < rest.Length && !char.IsWhiteSpace(rest[i])) i++; var t = rest[..i]; rest = rest[i..]; return t; }
     static void ConsumeKeyword(ref string rest, string kw) { rest = rest.TrimStart(); if (rest.StartsWith(kw, StringComparison.OrdinalIgnoreCase)) rest = rest[kw.Length..]; }
     static string Unq(string s) { s = s.Trim(); return s.Length >= 2 && s[0] == '"' && s[^1] == '"' ? s[1..^1] : s; }
+    static string NormalizePrivilege(string privilege)
+    {
+        privilege = privilege.Trim().ToUpperInvariant();
+        return privilege switch
+        {
+            "ALL" => "ALL",
+            "WRITE" => "WRITE",
+            _ => "READ"
+        };
+    }
+
+    static (string? Database, string? RetentionPolicy, string Measurement) ParseQualifiedMeasurement(string token)
+    {
+        var parts = token.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(Unq)
+            .ToArray();
+        return parts.Length switch
+        {
+            3 => (parts[0], parts[1], parts[2]),
+            2 => (null, parts[0], parts[1]),
+            _ => (null, null, parts[0])
+        };
+    }
     static long ParseTime(string s) { s = s.Trim().Trim('\''); if (long.TryParse(s, out var n)) return n;
         return DateTimeOffset.Parse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal).ToUnixTimeMilliseconds() * 1_000_000; }
     public static long DurationToNs(string s)
