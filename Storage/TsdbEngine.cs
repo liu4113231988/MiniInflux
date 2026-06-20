@@ -30,7 +30,7 @@ public sealed class TsdbEngine : IDisposable
     public TsdbEngine(string rootPath, int flushThreshold = 50000,
         long maxWalFileBytes = 16 * 1024 * 1024, bool walFsync = true, int walFsyncIntervalMs = 1000,
         int rpCheckIntervalMs = 60000, long maxSeriesPerDb = 10_000_000, int maxFieldsPerMeasurement = 1024,
-        int flushIntervalMs = 5000, long maxBufferPoints = 1_000_000, long maxBufferBytes = 0)
+        int flushIntervalMs = 5000, long maxBufferPoints = 1_000_000, long maxBufferBytes = 0, int compactionIntervalMs = 30000)
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
         Directory.CreateDirectory(_root);
@@ -41,7 +41,7 @@ public sealed class TsdbEngine : IDisposable
         _tombstones = new TombstoneStore(_root);
         _compactor = new Compactor(_manifest, _shards, _tombstones, _schema);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
-        _compactionTimer = new Timer(_ => _compactor.CompactAll(), null, 30000, 30000);
+        if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => _compactor.CompactAll(), null, compactionIntervalMs, compactionIntervalMs);
         if (flushIntervalMs > 0) _flushTimer = new Timer(_ => PeriodicFlush(), null, flushIntervalMs, flushIntervalMs);
     }
 
@@ -352,6 +352,7 @@ public sealed class TsdbEngine : IDisposable
     }
 
     public CompactionStatsSnapshot GetCompactionStats() => _compactor.GetStats();
+    public int CompactNow() => _compactor.CompactAll();
 
     public void DropDatabase(string db)
     {

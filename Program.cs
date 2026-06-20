@@ -9,18 +9,10 @@ var builder = WebApplication.CreateSlimBuilder(args);
 var options = MiniInfluxOptions.Load(builder.Configuration);
 BackupManager.ApplyPendingRestore(options.DataPath);
 
-if (args.Length > 0 && string.Equals(args[0], "benchmark", StringComparison.OrdinalIgnoreCase))
+var cliExitCode = ManagementCli.TryRun(args, options, Console.Out, Console.Error);
+if (cliExitCode.HasValue)
 {
-    var benchmarkRoot = Path.Combine(options.DataPath, "benchmarks", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString());
-    var benchmarkOptions = ParseBenchmarkOptions(args.Skip(1).ToArray());
-    var benchmarkFormat = ParseBenchmarkFormat(args.Skip(1).ToArray());
-    var benchmark = BenchmarkRunner.Run(benchmarkRoot, benchmarkOptions);
-    Console.WriteLine(benchmarkFormat switch
-    {
-        "json" => BenchmarkRunner.FormatJson(benchmark),
-        "prometheus" => BenchmarkRunner.FormatPrometheus(benchmark),
-        _ => BenchmarkRunner.FormatText(benchmark)
-    });
+    Environment.ExitCode = cliExitCode.Value;
     return;
 }
 
@@ -316,36 +308,6 @@ static string? GetIntoTargetDatabase(string? defaultDb, string intoTarget)
 {
     var parts = intoTarget.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     return parts.Length >= 2 ? Unquote(parts[0]) : defaultDb;
-}
-
-static BenchmarkRunOptions ParseBenchmarkOptions(string[] args)
-{
-    var points = 10_000;
-    var concurrency = 1;
-    for (int i = 0; i < args.Length; i++)
-    {
-        if (string.Equals(args[i], "--points", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length && int.TryParse(args[i + 1], out var parsedPoints))
-        {
-            points = parsedPoints;
-            i++;
-        }
-        else if (string.Equals(args[i], "--concurrency", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length && int.TryParse(args[i + 1], out var parsedConcurrency))
-        {
-            concurrency = parsedConcurrency;
-            i++;
-        }
-    }
-    return new BenchmarkRunOptions(points, concurrency);
-}
-
-static string ParseBenchmarkFormat(string[] args)
-{
-    for (int i = 0; i < args.Length; i++)
-    {
-        if (string.Equals(args[i], "--format", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
-            return args[i + 1].Trim().ToLowerInvariant();
-    }
-    return "text";
 }
 
 static string Unquote(string value)

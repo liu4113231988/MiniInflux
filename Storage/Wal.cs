@@ -20,7 +20,7 @@ public sealed class WalManager : IDisposable
     private FileStream? _currentStream;
     private int _currentFileId;
     private long _currentFileSize;
-    private int _checkpointFileId;
+    private WalPosition _checkpoint = WalPosition.Start;
     private Timer? _fsyncTimer;
     private bool _disposed;
 
@@ -45,8 +45,17 @@ public sealed class WalManager : IDisposable
         if (File.Exists(CheckpointPath))
         {
             var text = File.ReadAllText(CheckpointPath).Trim();
-            if (int.TryParse(text, out var id))
-                _checkpointFileId = id;
+            var parts = text.Split(':', 2, StringSplitOptions.TrimEntries);
+            if (parts.Length == 2
+                && int.TryParse(parts[0], out var fileId)
+                && long.TryParse(parts[1], out var offset))
+            {
+                _checkpoint = new WalPosition(fileId, Math.Max(0, offset));
+                return;
+            }
+
+            if (int.TryParse(text, out var legacyId))
+                _checkpoint = new WalPosition(legacyId, 0);
         }
     }
 
@@ -81,8 +90,9 @@ public sealed class WalManager : IDisposable
     /// <summary>
     /// Append points to the WAL. Each point is written as a single record.
     /// </summary>
-    public void Append(string db, string rp, IEnumerable<Point> points)
+    public IReadOnlyList<WalPosition> Append(string db, string rp, IEnumerable<Point> points)
     {
+        var positions = new List<WalPosition>();
         lock (_lock)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
@@ -90,7 +100,7 @@ public sealed class WalManager : IDisposable
             {
                 var line = FormatRecord(db, rp, p);
                 var payload = Encoding.UTF8.GetBytes(line);
-                WriteRecord(payload);
+                positions.Add(WriteRecord(payload));
 
                 if (_currentFileSize >= _maxFileBytes)
                     RotateLocked();
@@ -99,17 +109,20 @@ public sealed class WalManager : IDisposable
             if (!_fsync || _fsyncIntervalMs <= 0)
                 _currentStream?.Flush(false);
         }
+        return positions;
     }
 
-    private void WriteRecord(byte[] payload)
+    private WalPosition WriteRecord(byte[] payload)
     {
-        if (_currentStream == null) return;
+        if (_currentStream == null) return CurrentPosition;
+        var recordStart = _currentFileSize;
         var header = new byte[8];
         BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(0, 4), payload.Length);
         BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(4, 4), Crc32.Compute(payload));
         _currentStream.Write(header);
         _currentStream.Write(payload);
         _currentFileSize += 8 + payload.Length;
+        return new WalPosition(_currentFileId, recordStart);
     }
 
     private static string FormatRecord(string db, string rp, Point p)
@@ -150,21 +163,21 @@ public sealed class WalManager : IDisposable
     /// Mark all WAL files up to and including the given file ID as checkpointed.
     /// Deletes old WAL files before the checkpoint.
     /// </summary>
-    public void Checkpoint(int upToFileId)
+    public void Checkpoint(WalPosition position)
     {
         lock (_lock)
         {
-            if (upToFileId <= _checkpointFileId) return;
-            _checkpointFileId = upToFileId;
+            if (Compare(position, _checkpoint) <= 0) return;
+            _checkpoint = position;
 
             // Atomic checkpoint write: write to .tmp then rename (same pattern as segment writes)
             var tmpPath = CheckpointPath + ".tmp";
-            File.WriteAllText(tmpPath, _checkpointFileId.ToString());
+            File.WriteAllText(tmpPath, $"{_checkpoint.FileId}:{_checkpoint.Offset}");
             File.Move(tmpPath, CheckpointPath, overwrite: true);
 
             foreach (var file in Directory.GetFiles(_walDir, "*.wal"))
             {
-                if (int.TryParse(Path.GetFileNameWithoutExtension(file), out var id) && id < _checkpointFileId)
+                if (int.TryParse(Path.GetFileNameWithoutExtension(file), out var id) && id < _checkpoint.FileId)
                 {
                     try { File.Delete(file); } catch { /* best effort */ }
                 }
@@ -180,6 +193,16 @@ public sealed class WalManager : IDisposable
         get { lock (_lock) return _currentFileId; }
     }
 
+    public WalPosition CurrentPosition
+    {
+        get { lock (_lock) return new WalPosition(_currentFileId, _currentFileSize); }
+    }
+
+    public WalPosition CheckpointPosition
+    {
+        get { lock (_lock) return _checkpoint; }
+    }
+
     /// <summary>
     /// Replay all WAL records after the checkpoint.
     /// Returns list of (db, rp, points) tuples.
@@ -187,32 +210,44 @@ public sealed class WalManager : IDisposable
     public List<(string Db, string Rp, List<Point> Points)> Replay()
     {
         var result = new List<(string, string, List<Point>)>();
+        foreach (var item in ReplayWithPositions())
+            result.Add((item.Db, item.Rp, [item.Point]));
+        return result;
+    }
+
+    public List<WalReplayPoint> ReplayWithPositions()
+    {
+        var result = new List<WalReplayPoint>();
         var files = Directory.Exists(_walDir)
             ? Directory.GetFiles(_walDir, "*.wal")
                 .Select(f => int.TryParse(Path.GetFileNameWithoutExtension(f), out var id) ? (path: f, id) : (path: (string?)null, id: 0))
-                .Where(x => x.path != null && x.id >= _checkpointFileId)
+                .Where(x => x.path != null && (x.id > _checkpoint.FileId || (x.id == _checkpoint.FileId && File.Exists(x.path!))))
                 .OrderBy(x => x.id)
                 .ToArray()
             : [];
 
-        foreach (var (path, _) in files)
+        foreach (var (path, id) in files)
         {
             if (path == null) continue;
-            var records = ReadWalFile(path);
-            foreach (var (db, rp, pts) in records)
-                result.Add((db, rp, pts));
+            var startOffset = id == _checkpoint.FileId ? _checkpoint.Offset : 0;
+            result.AddRange(ReadWalFile(path, id, startOffset));
         }
         return result;
     }
 
-    private static List<(string Db, string Rp, List<Point> Points)> ReadWalFile(string path)
+    private static List<WalReplayPoint> ReadWalFile(string path, int fileId, long startOffset)
     {
-        var result = new List<(string, string, List<Point>)>();
+        var result = new List<WalReplayPoint>();
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         using var br = new BinaryReader(fs, Encoding.UTF8);
+        if (startOffset > 0 && startOffset < fs.Length)
+            fs.Position = startOffset;
+        else if (startOffset >= fs.Length)
+            return result;
 
         while (fs.Position < fs.Length - 8)
         {
+            var recordStart = fs.Position;
             if (fs.Length - fs.Position < 8) break;
             var length = br.ReadInt32();
             var expectedCrc = br.ReadUInt32();
@@ -236,7 +271,9 @@ public sealed class WalManager : IDisposable
             try
             {
                 var points = LineProtocolParser.ParseMany(lineProtocol, TimestampPrecision.Parse("ns"));
-                result.Add((db, rp, points));
+                var position = new WalPosition(fileId, recordStart);
+                foreach (var point in points)
+                    result.Add(new WalReplayPoint(db, rp, point, position));
             }
             catch
             {
@@ -244,6 +281,12 @@ public sealed class WalManager : IDisposable
             }
         }
         return result;
+    }
+
+    private static int Compare(WalPosition left, WalPosition right)
+    {
+        var fileCompare = left.FileId.CompareTo(right.FileId);
+        return fileCompare != 0 ? fileCompare : left.Offset.CompareTo(right.Offset);
     }
 
     public void Dispose()
@@ -257,3 +300,10 @@ public sealed class WalManager : IDisposable
         }
     }
 }
+
+public readonly record struct WalPosition(int FileId, long Offset)
+{
+    public static WalPosition Start => new(0, 0);
+}
+
+public sealed record WalReplayPoint(string Db, string Rp, Point Point, WalPosition Position);
