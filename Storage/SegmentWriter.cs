@@ -7,11 +7,11 @@ namespace MiniInflux.Net10.Storage;
 public static class SegmentWriter
 {
     private const uint Magic = 0x4D545344;
-    private const byte FormatVersion = 2;
+    private const byte FormatVersion = 3;
 
     /// <summary>
     /// Write segment atomically: write to .tmp, fsync, rename to .seg.
-    /// Format v2: [magic:4][version:1][columnCount:4][columns...][crc32:4]
+    /// Format v3: [magic:4][version:1][columnCount:4][columns...][crc32:4]
     /// </summary>
     public static void WriteSegment(string path, IEnumerable<Point> points)
     {
@@ -35,16 +35,20 @@ public static class SegmentWriter
                     var kind = o[0].Value.Kind;
                     var ts = o.Select(x => x.TimestampNs).ToArray();
                     var vals = o.Select(x => x.Value).ToArray();
-                    var tb = Brotli(CompressionCodec.EncodeTimestamps(ts));
-                    var vb = Brotli(CompressionCodec.EncodeValues(kind, vals));
+                    var timestampBlock = CompressionCodec.EncodeTimestampsAdaptive(ts);
+                    var valueBlock = CompressionCodec.EncodeValuesAdaptive(kind, vals);
                     WriteString(bw, g.Key.Series.Measurement);
                     WriteString(bw, g.Key.Series.TagsCanonical);
                     WriteString(bw, g.Key.Field);
                     bw.Write((byte)kind);
                     bw.Write(ts[0]); bw.Write(ts[^1]); bw.Write(ts.Length);
-                    bw.Write(tb.Length); bw.Write(tb);
-                    bw.Write(vb.Length); bw.Write(vb);
-                    // Block stats (v2)
+                    bw.Write((byte)timestampBlock.Codec);
+                    bw.Write((byte)timestampBlock.Compression);
+                    bw.Write((byte)valueBlock.Codec);
+                    bw.Write((byte)valueBlock.Compression);
+                    bw.Write(timestampBlock.Payload.Length); bw.Write(timestampBlock.Payload);
+                    bw.Write(valueBlock.Payload.Length); bw.Write(valueBlock.Payload);
+                    // Block stats
                     var stats = ComputeStats(kind, vals);
                     bw.Write(stats.Min); bw.Write(stats.Max); bw.Write(stats.Sum); bw.Write(stats.Count);
                 }
@@ -75,9 +79,6 @@ public static class SegmentWriter
         { int tc = vals.Count(v => v.Boolean); min = tc > 0 ? 0 : 1; max = tc > 0 ? 1 : 0; sum = tc; }
         return (min, max, sum, vals.Length);
     }
-
-    private static byte[] Brotli(byte[] input)
-    { using var ms = new MemoryStream(); using (var bs = new BrotliStream(ms, CompressionLevel.SmallestSize, true)) bs.Write(input); return ms.ToArray(); }
 
     private static void WriteString(BinaryWriter bw, string v)
     { var b = Encoding.UTF8.GetBytes(v); bw.Write(b.Length); bw.Write(b); }

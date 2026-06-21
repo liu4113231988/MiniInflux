@@ -26,6 +26,16 @@ public class CompressionCodecTests
     }
 
     [Fact]
+    public void GorillaTimestamps_Roundtrip_PreservesValues()
+    {
+        var timestamps = new List<long> { 1_000, 2_000, 3_000, 4_000, 4_500, 5_000, 9_000, 9_500 };
+        var encoded = CompressionCodec.EncodeTimestamps(TimestampCodecKind.Gorilla, timestamps);
+        var decoded = CompressionCodec.DecodeTimestamps(TimestampCodecKind.Gorilla, encoded);
+
+        Assert.Equal(timestamps, decoded);
+    }
+
+    [Fact]
     public void Doubles_Roundtrip_PreservesValues()
     {
         var values = new List<FieldValue>
@@ -37,6 +47,27 @@ public class CompressionCodecTests
         };
         var encoded = CompressionCodec.EncodeValues(FieldKind.Float, values);
         var decoded = CompressionCodec.DecodeValues(FieldKind.Float, encoded);
+
+        Assert.Equal(values.Count, decoded.Count);
+        for (int i = 0; i < values.Count; i++)
+            Assert.Equal(values[i].Float, decoded[i].Float, 10);
+    }
+
+    [Fact]
+    public void GorillaDoubles_Roundtrip_PreservesValues()
+    {
+        var values = new List<FieldValue>
+        {
+            FieldValue.FromDouble(12.25),
+            FieldValue.FromDouble(12.25),
+            FieldValue.FromDouble(12.5),
+            FieldValue.FromDouble(13.0),
+            FieldValue.FromDouble(13.0),
+            FieldValue.FromDouble(14.75)
+        };
+
+        var encoded = CompressionCodec.EncodeValues(FieldKind.Float, ValueCodecKind.Gorilla, values);
+        var decoded = CompressionCodec.DecodeValues(FieldKind.Float, ValueCodecKind.Gorilla, encoded);
 
         Assert.Equal(values.Count, decoded.Count);
         for (int i = 0; i < values.Count; i++)
@@ -106,5 +137,46 @@ public class CompressionCodecTests
         var decoded = CompressionCodec.DecodeTimestamps(encoded);
 
         Assert.Empty(decoded);
+    }
+
+    [Fact]
+    public void AdaptiveFloatEncoding_CanSelectGorilla()
+    {
+        var values = Enumerable.Range(0, 256)
+            .Select(i => FieldValue.FromDouble(1000.0 + (i / 16) * 0.5))
+            .ToList();
+
+        var block = CompressionCodec.EncodeValuesAdaptive(FieldKind.Float, values);
+        var decoded = CompressionCodec.DecodeValues(FieldKind.Float, block.Codec, block.Compression, block.Payload);
+
+        Assert.Equal(values.Count, decoded.Count);
+        Assert.Equal(ValueCodecKind.Gorilla, block.Codec);
+        Assert.Equal(BlockCompressionKind.None, block.Compression);
+    }
+
+    [Fact]
+    public void AdaptiveFloatEncoding_CanSelectLegacyRawForVolatileSeries()
+    {
+        var values = Enumerable.Range(0, 256)
+            .Select(i => FieldValue.FromDouble(1000.0 + Math.Sin(i / 8.0) * 50.0 + ((i % 7) - 3) * 0.137))
+            .ToList();
+
+        var block = CompressionCodec.EncodeValuesAdaptive(FieldKind.Float, values);
+
+        Assert.Equal(ValueCodecKind.Legacy, block.Codec);
+        Assert.Equal(BlockCompressionKind.None, block.Compression);
+    }
+
+    [Fact]
+    public void AdaptiveFloatEncoding_CanSelectLegacyBrotliForSmoothLinearSeries()
+    {
+        var values = Enumerable.Range(0, 256)
+            .Select(i => FieldValue.FromDouble(1000.0 + i * 0.25))
+            .ToList();
+
+        var block = CompressionCodec.EncodeValuesAdaptive(FieldKind.Float, values);
+
+        Assert.Equal(ValueCodecKind.Legacy, block.Codec);
+        Assert.Equal(BlockCompressionKind.Brotli, block.Compression);
     }
 }

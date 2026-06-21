@@ -220,8 +220,35 @@ public class P1TodoTests : IDisposable
         Assert.True(result.QueryLatencyMs >= 0);
         Assert.True(result.RecoveryMs >= 0);
         Assert.True(result.CompactionMs >= 0);
+        Assert.True(result.CodecComparison.Legacy.TotalBytes > 0);
+        Assert.True(result.CodecComparison.Gorilla.TotalBytes > 0);
+        Assert.True(result.CodecComparison.Gorilla.TimestampBytes <= result.CodecComparison.Legacy.TimestampBytes);
+        Assert.True(result.CodecComparison.Gorilla.EncodeMs >= 0);
+        Assert.True(result.CodecComparison.Gorilla.DecodeMs >= 0);
+        Assert.Equal("Gorilla", result.CodecComparison.Gorilla.TimestampCodec);
+        Assert.Equal("Gorilla", result.CodecComparison.Gorilla.ValueCodec);
+        Assert.Equal(3, result.FloatStrategyBenchmarks.Count);
+        Assert.Contains(result.FloatStrategyBenchmarks, x => x.Workload == "smooth_linear");
+        Assert.All(result.FloatStrategyBenchmarks, workload =>
+        {
+            Assert.Equal(5, workload.Strategies.Count);
+            Assert.Contains(workload.Strategies, x => x.Strategy == "legacy_raw");
+            Assert.Contains(workload.Strategies, x => x.Strategy == "legacy_brotli");
+            Assert.Contains(workload.Strategies, x => x.Strategy == "gorilla_raw");
+            Assert.Contains(workload.Strategies, x => x.Strategy == "gorilla_brotli");
+            Assert.Contains(workload.Strategies, x => x.Strategy == "adaptive");
+        });
+        Assert.Contains(result.FloatStrategyBenchmarks, x => x.Workload == "repeating_plateau" && x.Strategies.Any(s => s.Strategy == "adaptive" && s.ValueCodec == "Gorilla" && s.ValueCompression == "None"));
+        Assert.Contains(result.FloatStrategyBenchmarks, x => x.Workload == "smooth_linear" && x.Strategies.Any(s => s.Strategy == "adaptive" && s.ValueCodec == "Legacy" && s.ValueCompression == "Brotli"));
+        Assert.Contains(result.FloatStrategyBenchmarks, x => x.Workload == "noisy_sine" && x.Strategies.Any(s => s.Strategy == "adaptive" && s.ValueCodec == "Legacy" && s.ValueCompression == "None"));
         Assert.Contains("mini_influx_benchmark_points_written", BenchmarkRunner.FormatPrometheus(result));
+        Assert.Contains("mini_influx_benchmark_codec_gorilla_total_bytes", BenchmarkRunner.FormatPrometheus(result));
+        Assert.Contains("mini_influx_benchmark_float_workload_best_size", BenchmarkRunner.FormatPrometheus(result));
         Assert.Contains("\"PointsWritten\":128", BenchmarkRunner.FormatJson(result));
+        Assert.Contains("\"CodecComparison\"", BenchmarkRunner.FormatJson(result));
+        Assert.Contains("\"FloatStrategyBenchmarks\"", BenchmarkRunner.FormatJson(result));
+        Assert.Contains("codec_gorilla_total_bytes=", BenchmarkRunner.FormatText(result));
+        Assert.Contains("float_workload_smooth_linear_best_size=", BenchmarkRunner.FormatText(result));
     }
 
     [Fact]

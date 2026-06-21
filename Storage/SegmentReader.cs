@@ -1,4 +1,3 @@
-using System.IO.Compression;
 using System.Text;
 using MiniInflux.Net10.Model;
 
@@ -9,11 +8,19 @@ public sealed record BlockStats(double Min, double Max, double Sum, int Count);
 public sealed record SegmentColumn(
     string Measurement, string TagsCanonical, string Field, FieldKind Kind,
     long MinTime, long MaxTime, List<long> Timestamps, List<FieldValue> Values,
-    BlockStats? Stats = null);
+    BlockStats? Stats = null,
+    TimestampCodecKind TimestampCodec = TimestampCodecKind.DeltaOfDeltaVarint,
+    ValueCodecKind ValueCodec = ValueCodecKind.Legacy,
+    BlockCompressionKind TimestampCompression = BlockCompressionKind.Brotli,
+    BlockCompressionKind ValueCompression = BlockCompressionKind.Brotli);
 
 public sealed record SegmentColumnMeta(
     string Measurement, string TagsCanonical, string Field, FieldKind Kind,
-    long MinTime, long MaxTime, int PointCount, BlockStats? Stats = null);
+    long MinTime, long MaxTime, int PointCount, BlockStats? Stats = null,
+    TimestampCodecKind TimestampCodec = TimestampCodecKind.DeltaOfDeltaVarint,
+    ValueCodecKind ValueCodec = ValueCodecKind.Legacy,
+    BlockCompressionKind TimestampCompression = BlockCompressionKind.Brotli,
+    BlockCompressionKind ValueCompression = BlockCompressionKind.Brotli);
 
 public static class SegmentReader
 {
@@ -54,20 +61,24 @@ public static class SegmentReader
             // Projection pushdown: skip reading compressed data for unneeded columns
             if (requestedFields != null && !requestedFields.Contains(f))
             {
+                if (version >= 3)
+                    ms.Position += 4; // timestamp/value codec + compression ids
                 var skipTl = br.ReadInt32(); ms.Position += skipTl;
                 var skipVl = br.ReadInt32(); ms.Position += skipVl;
                 if (version >= 2) { ms.Position += 28; } // 3 doubles + 1 int
                 continue;
             }
 
+            var codecs = ReadCodecInfo(version, br);
             var tl = br.ReadInt32(); var tb = br.ReadBytes(tl);
             var vl = br.ReadInt32(); var vb = br.ReadBytes(vl);
             BlockStats? stats = null;
             if (version >= 2) { stats = new BlockStats(br.ReadDouble(), br.ReadDouble(), br.ReadDouble(), br.ReadInt32()); }
 
             result.Add(new SegmentColumn(m, tags, f, k, min, max,
-                CompressionCodec.DecodeTimestamps(UnBrotli(tb)),
-                CompressionCodec.DecodeValues(k, UnBrotli(vb)), stats));
+                CompressionCodec.DecodeTimestamps(codecs.TimestampCodec, codecs.TimestampCompression, tb),
+                CompressionCodec.DecodeValues(k, codecs.ValueCodec, codecs.ValueCompression, vb), stats,
+                codecs.TimestampCodec, codecs.ValueCodec, codecs.TimestampCompression, codecs.ValueCompression));
         }
         return result;
     }
@@ -92,27 +103,38 @@ public static class SegmentReader
             var m = ReadString(br); var tags = ReadString(br); var f = ReadString(br);
             var k = (FieldKind)br.ReadByte();
             var min = br.ReadInt64(); var max = br.ReadInt64(); var pc = br.ReadInt32();
+            var codecs = ReadCodecInfo(version, br);
             var tl = br.ReadInt32(); ms.Position += tl;
             var vl = br.ReadInt32(); ms.Position += vl;
             BlockStats? stats = null;
             if (version >= 2) { stats = new BlockStats(br.ReadDouble(), br.ReadDouble(), br.ReadDouble(), br.ReadInt32()); }
-            result.Add(new SegmentColumnMeta(m, tags, f, k, min, max, pc, stats));
+            result.Add(new SegmentColumnMeta(m, tags, f, k, min, max, pc, stats,
+                codecs.TimestampCodec, codecs.ValueCodec, codecs.TimestampCompression, codecs.ValueCompression));
         }
         return result;
+    }
+
+    private static (TimestampCodecKind TimestampCodec, BlockCompressionKind TimestampCompression, ValueCodecKind ValueCodec, BlockCompressionKind ValueCompression) ReadCodecInfo(byte version, BinaryReader br)
+    {
+        if (version < 3)
+            return (TimestampCodecKind.DeltaOfDeltaVarint, BlockCompressionKind.Brotli, ValueCodecKind.Legacy, BlockCompressionKind.Brotli);
+
+        return (
+            (TimestampCodecKind)br.ReadByte(),
+            (BlockCompressionKind)br.ReadByte(),
+            (ValueCodecKind)br.ReadByte(),
+            (BlockCompressionKind)br.ReadByte());
     }
 
     private static (byte Version, int Count) ReadVersionAndCount(BinaryReader br, MemoryStream ms)
     {
         var nextBytes = br.ReadBytes(5);
-        if (nextBytes[0] == 2)
-            return (2, BitConverter.ToInt32(nextBytes, 1));
+        if (nextBytes[0] is 2 or 3)
+            return (nextBytes[0], BitConverter.ToInt32(nextBytes, 1));
         // v1: no version byte, first 4 bytes are columnCount, 5th byte belongs to first column
         ms.Position -= 1;
         return (1, BitConverter.ToInt32(nextBytes, 0));
     }
-
-    private static byte[] UnBrotli(byte[] input)
-    { using var src = new MemoryStream(input); using var bs = new BrotliStream(src, CompressionMode.Decompress); using var o = new MemoryStream(); bs.CopyTo(o); return o.ToArray(); }
 
     private static string ReadString(BinaryReader br)
     { int len = br.ReadInt32(); return Encoding.UTF8.GetString(br.ReadBytes(len)); }
