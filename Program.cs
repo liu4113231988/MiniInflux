@@ -84,6 +84,8 @@ builder.Services.AddSingleton(options);
 builder.Services.AddSingleton<MetricsCollector>();
 builder.Services.AddSingleton(new AccessLogWriter(options.Http.AccessLogPath));
 builder.Services.AddSingleton(sp => new WriteQueue(sp.GetRequiredService<TsdbEngine>(), options.Write.QueueCapacity, options.Write.BatchSize));
+builder.Services.AddSingleton<ContinuousQueryRunner>();
+builder.Services.AddHostedService<ContinuousQueryHostedService>();
 
 var app = builder.Build();
 var runtimeLogger = app.Logger;
@@ -288,7 +290,8 @@ static bool EnsureQueryAuthorized(HttpRequest request, MiniInfluxOptions options
 
     if (parsed.Kind is QueryKind.ShowUsers or QueryKind.ShowGrants or QueryKind.CreateUser or QueryKind.GrantPrivilege or QueryKind.RevokePrivilege or QueryKind.DropUser
         or QueryKind.CreateDatabase or QueryKind.DropDatabase or QueryKind.CreateRetentionPolicy or QueryKind.AlterRetentionPolicy
-        or QueryKind.DropRetentionPolicy or QueryKind.DropShard)
+        or QueryKind.DropRetentionPolicy or QueryKind.CreateContinuousQuery or QueryKind.ShowContinuousQueries
+        or QueryKind.DropContinuousQuery or QueryKind.DropShard)
     {
         return EnsureAuthorized(request, options, authStore, AuthPermission.Admin, parsed.Database ?? db, out _, out result);
     }

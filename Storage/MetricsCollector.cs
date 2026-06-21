@@ -9,6 +9,7 @@ namespace MiniInflux.Net10.Storage;
 /// </summary>
 public sealed class MetricsCollector
 {
+    private readonly object _continuousQueryMetricsLock = new();
     private long _writePointsTotal;
     private long _queryTotal;
     private long _queryErrorTotal;
@@ -18,11 +19,17 @@ public sealed class MetricsCollector
     private long _queryEstimatedInputBytesTotal;
     private long _queryEstimatedResultBytesTotal;
     private long _lastQueryEstimatedPeakBytes;
+    private long _continuousQueryRunsTotal;
+    private long _continuousQueryErrorsTotal;
+    private long _continuousQueryBucketsTotal;
+    private long _continuousQueryRecomputeBucketsTotal;
+    private long _lastContinuousQueryDurationMs;
     private long _compactionCount;
     private int _compactionRunning;
     private readonly long[] _queryDurationBuckets = new long[8];
     private static readonly int[] QueryDurationBoundsMs = [1, 5, 10, 50, 100, 500, 1000, 5000];
     private readonly TsdbEngine _engine;
+    private readonly Dictionary<string, ContinuousQueryMetrics> _continuousQueryMetrics = new(StringComparer.Ordinal);
 
     public MetricsCollector(TsdbEngine engine) { _engine = engine; }
 
@@ -49,6 +56,34 @@ public sealed class MetricsCollector
     }
     public void SetCompactionRunning(bool v) => Interlocked.Exchange(ref _compactionRunning, v ? 1 : 0);
     public void RecordCompaction() => Interlocked.Increment(ref _compactionCount);
+    public void RecordContinuousQueryRun(string database, string name, int bucketsProcessed, bool hadError, bool wasRecompute, long durationMs, long? lastBucketStartNs = null)
+    {
+        if (bucketsProcessed <= 0 && !hadError)
+            return;
+
+        Interlocked.Increment(ref _continuousQueryRunsTotal);
+        if (hadError) Interlocked.Increment(ref _continuousQueryErrorsTotal);
+        if (bucketsProcessed > 0) Interlocked.Add(ref _continuousQueryBucketsTotal, bucketsProcessed);
+        if (wasRecompute && bucketsProcessed > 0) Interlocked.Add(ref _continuousQueryRecomputeBucketsTotal, bucketsProcessed);
+        Interlocked.Exchange(ref _lastContinuousQueryDurationMs, durationMs);
+
+        lock (_continuousQueryMetricsLock)
+        {
+            var key = $"{database}/{name}";
+            if (!_continuousQueryMetrics.TryGetValue(key, out var metric))
+            {
+                metric = new ContinuousQueryMetrics { Database = database, Name = name };
+                _continuousQueryMetrics[key] = metric;
+            }
+
+            metric.RunsTotal++;
+            if (hadError) metric.ErrorsTotal++;
+            metric.BucketsTotal += Math.Max(0, bucketsProcessed);
+            if (wasRecompute) metric.RecomputeBucketsTotal += Math.Max(0, bucketsProcessed);
+            metric.LastDurationMs = durationMs;
+            if (lastBucketStartNs.HasValue) metric.LastBucketStartNs = lastBucketStartNs.Value;
+        }
+    }
 
     public long WritePointsTotal => Interlocked.Read(ref _writePointsTotal);
     public long QueryTotal => Interlocked.Read(ref _queryTotal);
@@ -59,6 +94,11 @@ public sealed class MetricsCollector
     public long QueryEstimatedInputBytesTotal => Interlocked.Read(ref _queryEstimatedInputBytesTotal);
     public long QueryEstimatedResultBytesTotal => Interlocked.Read(ref _queryEstimatedResultBytesTotal);
     public long LastQueryEstimatedPeakBytes => Interlocked.Read(ref _lastQueryEstimatedPeakBytes);
+    public long ContinuousQueryRunsTotal => Interlocked.Read(ref _continuousQueryRunsTotal);
+    public long ContinuousQueryErrorsTotal => Interlocked.Read(ref _continuousQueryErrorsTotal);
+    public long ContinuousQueryBucketsTotal => Interlocked.Read(ref _continuousQueryBucketsTotal);
+    public long ContinuousQueryRecomputeBucketsTotal => Interlocked.Read(ref _continuousQueryRecomputeBucketsTotal);
+    public long LastContinuousQueryDurationMs => Interlocked.Read(ref _lastContinuousQueryDurationMs);
     public bool CompactionRunning => Interlocked.CompareExchange(ref _compactionRunning, 0, 0) == 1;
     public long CompactionCount => Interlocked.Read(ref _compactionCount);
 
@@ -86,6 +126,11 @@ public sealed class MetricsCollector
             QueryEstimatedInputBytesTotal = QueryEstimatedInputBytesTotal,
             QueryEstimatedResultBytesTotal = QueryEstimatedResultBytesTotal,
             LastQueryEstimatedPeakBytes = LastQueryEstimatedPeakBytes,
+            ContinuousQueryRunsTotal = ContinuousQueryRunsTotal,
+            ContinuousQueryErrorsTotal = ContinuousQueryErrorsTotal,
+            ContinuousQueryBucketsTotal = ContinuousQueryBucketsTotal,
+            ContinuousQueryRecomputeBucketsTotal = ContinuousQueryRecomputeBucketsTotal,
+            LastContinuousQueryDurationMs = LastContinuousQueryDurationMs,
             SegmentCount = CountSegmentFiles(),
             CompactionRunning = compaction.Running || CompactionRunning,
             CompactionCount = compaction.TotalRuns > 0 ? compaction.TotalRuns : CompactionCount,
@@ -95,8 +140,31 @@ public sealed class MetricsCollector
             SeriesCardinality = cardinality,
             MemoryBufferPoints = _engine.GetBufferedPointCount(),
             MemoryBufferBytes = _engine.GetBufferedByteCount(),
-            QueryDurationBuckets = durationBuckets
+            QueryDurationBuckets = durationBuckets,
+            ContinuousQueryMetrics = GetContinuousQueryMetricsSnapshot()
         };
+    }
+
+    private List<ContinuousQueryMetrics> GetContinuousQueryMetricsSnapshot()
+    {
+        lock (_continuousQueryMetricsLock)
+        {
+            return _continuousQueryMetrics.Values
+                .OrderBy(x => x.Database, StringComparer.Ordinal)
+                .ThenBy(x => x.Name, StringComparer.Ordinal)
+                .Select(x => new ContinuousQueryMetrics
+                {
+                    Database = x.Database,
+                    Name = x.Name,
+                    RunsTotal = x.RunsTotal,
+                    ErrorsTotal = x.ErrorsTotal,
+                    BucketsTotal = x.BucketsTotal,
+                    RecomputeBucketsTotal = x.RecomputeBucketsTotal,
+                    LastDurationMs = x.LastDurationMs,
+                    LastBucketStartNs = x.LastBucketStartNs
+                })
+                .ToList();
+        }
     }
 
     private int CountSegmentFiles()
@@ -156,6 +224,46 @@ public sealed class MetricsCollector
         sb.AppendLine("# HELP mini_influx_last_query_estimated_peak_bytes Estimated peak memory footprint of the latest query.");
         sb.AppendLine("# TYPE mini_influx_last_query_estimated_peak_bytes gauge");
         sb.AppendLine($"mini_influx_last_query_estimated_peak_bytes {stats.LastQueryEstimatedPeakBytes}");
+
+        sb.AppendLine("# HELP mini_influx_continuous_query_runs_total Total number of continuous query executions.");
+        sb.AppendLine("# TYPE mini_influx_continuous_query_runs_total counter");
+        sb.AppendLine($"mini_influx_continuous_query_runs_total {stats.ContinuousQueryRunsTotal}");
+
+        sb.AppendLine("# HELP mini_influx_continuous_query_errors_total Total number of failed continuous query executions.");
+        sb.AppendLine("# TYPE mini_influx_continuous_query_errors_total counter");
+        sb.AppendLine($"mini_influx_continuous_query_errors_total {stats.ContinuousQueryErrorsTotal}");
+
+        sb.AppendLine("# HELP mini_influx_continuous_query_buckets_total Total number of continuous query buckets processed.");
+        sb.AppendLine("# TYPE mini_influx_continuous_query_buckets_total counter");
+        sb.AppendLine($"mini_influx_continuous_query_buckets_total {stats.ContinuousQueryBucketsTotal}");
+
+        sb.AppendLine("# HELP mini_influx_continuous_query_recompute_buckets_total Total number of continuous query buckets recomputed.");
+        sb.AppendLine("# TYPE mini_influx_continuous_query_recompute_buckets_total counter");
+        sb.AppendLine($"mini_influx_continuous_query_recompute_buckets_total {stats.ContinuousQueryRecomputeBucketsTotal}");
+
+        sb.AppendLine("# HELP mini_influx_last_continuous_query_duration_ms Duration of the latest continuous query execution.");
+        sb.AppendLine("# TYPE mini_influx_last_continuous_query_duration_ms gauge");
+        sb.AppendLine($"mini_influx_last_continuous_query_duration_ms {stats.LastContinuousQueryDurationMs}");
+
+        sb.AppendLine("# HELP mini_influx_continuous_query_run_total Total number of continuous query executions by query.");
+        sb.AppendLine("# TYPE mini_influx_continuous_query_run_total counter");
+        foreach (var metric in stats.ContinuousQueryMetrics)
+            sb.AppendLine($"mini_influx_continuous_query_run_total{{db=\"{metric.Database}\",name=\"{metric.Name}\"}} {metric.RunsTotal}");
+
+        sb.AppendLine("# HELP mini_influx_continuous_query_error_total Total number of failed continuous query executions by query.");
+        sb.AppendLine("# TYPE mini_influx_continuous_query_error_total counter");
+        foreach (var metric in stats.ContinuousQueryMetrics)
+            sb.AppendLine($"mini_influx_continuous_query_error_total{{db=\"{metric.Database}\",name=\"{metric.Name}\"}} {metric.ErrorsTotal}");
+
+        sb.AppendLine("# HELP mini_influx_continuous_query_bucket_total Total number of processed continuous query buckets by query.");
+        sb.AppendLine("# TYPE mini_influx_continuous_query_bucket_total counter");
+        foreach (var metric in stats.ContinuousQueryMetrics)
+            sb.AppendLine($"mini_influx_continuous_query_bucket_total{{db=\"{metric.Database}\",name=\"{metric.Name}\"}} {metric.BucketsTotal}");
+
+        sb.AppendLine("# HELP mini_influx_continuous_query_recompute_bucket_total Total number of recomputed continuous query buckets by query.");
+        sb.AppendLine("# TYPE mini_influx_continuous_query_recompute_bucket_total counter");
+        foreach (var metric in stats.ContinuousQueryMetrics)
+            sb.AppendLine($"mini_influx_continuous_query_recompute_bucket_total{{db=\"{metric.Database}\",name=\"{metric.Name}\"}} {metric.RecomputeBucketsTotal}");
 
         sb.AppendLine("# HELP mini_influx_query_duration_ms Query duration bucket counters.");
         sb.AppendLine("# TYPE mini_influx_query_duration_ms histogram");
@@ -220,6 +328,11 @@ public sealed class DebugStats
     public long QueryEstimatedInputBytesTotal { get; set; }
     public long QueryEstimatedResultBytesTotal { get; set; }
     public long LastQueryEstimatedPeakBytes { get; set; }
+    public long ContinuousQueryRunsTotal { get; set; }
+    public long ContinuousQueryErrorsTotal { get; set; }
+    public long ContinuousQueryBucketsTotal { get; set; }
+    public long ContinuousQueryRecomputeBucketsTotal { get; set; }
+    public long LastContinuousQueryDurationMs { get; set; }
     public int SegmentCount { get; set; }
     public bool CompactionRunning { get; set; }
     public long CompactionCount { get; set; }
@@ -230,4 +343,17 @@ public sealed class DebugStats
     public long MemoryBufferPoints { get; set; }
     public long MemoryBufferBytes { get; set; }
     public Dictionary<string, long> QueryDurationBuckets { get; set; } = new();
+    public List<ContinuousQueryMetrics> ContinuousQueryMetrics { get; set; } = [];
+}
+
+public sealed class ContinuousQueryMetrics
+{
+    public string Database { get; set; } = "";
+    public string Name { get; set; } = "";
+    public long RunsTotal { get; set; }
+    public long ErrorsTotal { get; set; }
+    public long BucketsTotal { get; set; }
+    public long RecomputeBucketsTotal { get; set; }
+    public long LastDurationMs { get; set; }
+    public long? LastBucketStartNs { get; set; }
 }

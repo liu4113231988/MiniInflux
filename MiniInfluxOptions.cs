@@ -8,6 +8,7 @@ public sealed class MiniInfluxOptions
     public DataOptions Data { get; init; } = new();
     public HttpOptions Http { get; init; } = new();
     public LoggingOptions Logging { get; init; } = new();
+    public ContinuousQueryOptions ContinuousQuery { get; init; } = new();
     public WalOptions Wal { get; init; } = new();
     public WriteOptions Write { get; init; } = new();
     public StorageOptions Storage { get; init; } = new();
@@ -58,6 +59,15 @@ public sealed class MiniInfluxOptions
                 ConsoleEnabled = ReadBool(config, true, "Logging:ConsoleEnabled"),
                 FileEnabled = ReadBool(config, false, "Logging:FileEnabled"),
                 FilePath = ReadString(config, "Logging:FilePath", "./logs/miniinflux.log")!
+            },
+            ContinuousQuery = new ContinuousQueryOptions
+            {
+                Enabled = ReadBool(config, true, "ContinuousQuery:Enabled"),
+                CheckIntervalMs = ReadInt(config, 5000, "ContinuousQuery:CheckIntervalMs"),
+                MaxCatchUpRunsPerCycle = ReadInt(config, 8, "ContinuousQuery:MaxCatchUpRunsPerCycle"),
+                RecomputeRecentBuckets = ReadInt(config, 0, "ContinuousQuery:RecomputeRecentBuckets"),
+                InitialBackfillDuration = ReadString(config, "ContinuousQuery:InitialBackfillDuration", "0s")!,
+                InitialBackfillDurationNs = ParseDurationOrZero(ReadString(config, "ContinuousQuery:InitialBackfillDuration", "0s"))
             },
             Wal = new WalOptions
             {
@@ -171,6 +181,14 @@ public sealed class MiniInfluxOptions
 
         return $"http://{trimmed}";
     }
+
+    private static long ParseDurationOrZero(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value == "0" || value == "0s")
+            return 0;
+
+        return MiniInflux.Net10.Protocol.InfluxQlParser.DurationToNs(value);
+    }
 }
 
 public sealed class DataOptions
@@ -197,6 +215,16 @@ public sealed class LoggingOptions
     public bool ConsoleEnabled { get; init; } = true;
     public bool FileEnabled { get; init; }
     public string FilePath { get; init; } = "./logs/miniinflux.log";
+}
+
+public sealed class ContinuousQueryOptions
+{
+    public bool Enabled { get; init; } = true;
+    public int CheckIntervalMs { get; init; } = 5000;
+    public int MaxCatchUpRunsPerCycle { get; init; } = 8;
+    public int RecomputeRecentBuckets { get; init; }
+    public string InitialBackfillDuration { get; init; } = "0s";
+    public long InitialBackfillDurationNs { get; init; }
 }
 
 public sealed class WalOptions

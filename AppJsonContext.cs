@@ -17,6 +17,8 @@ using MiniInflux.Net10.Storage;
 [JsonSerializable(typeof(BackupFileEntry))]
 [JsonSerializable(typeof(RetentionPolicyInfo))]
 [JsonSerializable(typeof(DebugStats))]
+[JsonSerializable(typeof(ContinuousQueryMetrics))]
+[JsonSerializable(typeof(List<ContinuousQueryMetrics>))]
 [JsonSerializable(typeof(Dictionary<string, int>))]
 [JsonSerializable(typeof(Dictionary<string, long>))]
 internal partial class AppJsonContext : JsonSerializerContext { }

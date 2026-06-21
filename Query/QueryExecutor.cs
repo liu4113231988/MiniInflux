@@ -158,6 +158,9 @@ public sealed class QueryExecutor
             QueryKind.AlterRetentionPolicy => AlterRetentionPolicy(e, q),
             QueryKind.DropRetentionPolicy => DropRetentionPolicy(e, q),
             QueryKind.ShowRetentionPolicies => ShowRetentionPolicies(e, db, q),
+            QueryKind.CreateContinuousQuery => CreateContinuousQuery(e, q),
+            QueryKind.ShowContinuousQueries => ShowContinuousQueries(e, q),
+            QueryKind.DropContinuousQuery => DropContinuousQuery(e, q),
             QueryKind.DropDatabase => DropDatabase(e, q),
             QueryKind.DropMeasurement => DropMeasurement(e, db, q),
             QueryKind.DropSeries => DropSeriesResult(e, db, q),
@@ -277,6 +280,67 @@ public sealed class QueryExecutor
         }];
     }
 
+    List<QuerySeries>? CreateContinuousQuery(TsdbEngine e, ParsedQuery q)
+    {
+        Req(q.Database);
+        Req(q.ContinuousQueryName);
+        Req(q.ContinuousQueryText);
+
+        var parsedSelect = InfluxQlParser.Parse(q.ContinuousQueryText!);
+        if (parsedSelect.Kind != QueryKind.Select)
+            throw new NotSupportedException("continuous query body must be a SELECT statement");
+        if (string.IsNullOrWhiteSpace(parsedSelect.IntoTarget))
+            throw new NotSupportedException("continuous query requires SELECT ... INTO ...");
+        if (!parsedSelect.GroupByNs.HasValue)
+            throw new NotSupportedException("continuous query requires GROUP BY time(...)");
+
+        var cadence = q.ContinuousQueryEveryNs ?? parsedSelect.GroupByNs.Value;
+        if (cadence <= 0)
+            throw new NotSupportedException("continuous query cadence must be positive");
+
+        e.CreateDatabase(q.Database!);
+        e.Meta.SaveContinuousQuery(q.Database!, new ContinuousQueryInfo
+        {
+            Name = q.ContinuousQueryName!,
+            Database = q.Database!,
+            QueryText = q.ContinuousQueryText!,
+            EveryNs = cadence,
+            ForNs = q.ContinuousQueryForNs ?? 0,
+            RecomputeRecentBuckets = q.ContinuousQueryRecomputeRecentBuckets ?? 0
+        });
+        return null;
+    }
+
+    List<QuerySeries>? ShowContinuousQueries(TsdbEngine e, ParsedQuery q)
+    {
+        var rows = e.Meta.ListContinuousQueries(q.Database)
+            .Select(cq => new List<object?>
+            {
+                cq.Database,
+                cq.Name,
+                cq.QueryText,
+                FormatDuration(cq.EveryNs),
+                cq.ForNs > 0 ? FormatDuration(cq.ForNs) : null,
+                cq.RecomputeRecentBuckets > 0 ? cq.RecomputeRecentBuckets : null,
+                cq.LastCompletedBucketStartNs == long.MinValue ? null : Time(cq.LastCompletedBucketStartNs)
+            })
+            .ToList();
+        return [new()
+        {
+            Name = "continuous queries",
+            Columns = ["database", "name", "query", "every", "for", "recomputeRecentBuckets", "lastRun"],
+            Values = rows
+        }];
+    }
+
+    List<QuerySeries>? DropContinuousQuery(TsdbEngine e, ParsedQuery q)
+    {
+        Req(q.Database);
+        Req(q.ContinuousQueryName);
+        e.Meta.RemoveContinuousQuery(q.Database!, q.ContinuousQueryName!);
+        return null;
+    }
+
     List<QuerySeries>? DropDatabase(TsdbEngine e, ParsedQuery q)
     {
         Req(q.Database);
@@ -366,6 +430,7 @@ public sealed class QueryExecutor
         Req(q.SourceDatabase ?? db);
         var sourceDb = q.SourceDatabase ?? db!;
         var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);
+        var resultMeasurement = ResolveResultMeasurementName(q);
         HashSet<string>? requestedFields = null;
         if (q.Select.Count > 0 && !(q.Select.Count == 1 && q.Select[0].Field == "*"))
             requestedFields = new HashSet<string>(q.Select.Select(x => x.Field), StringComparer.Ordinal);
@@ -373,30 +438,43 @@ public sealed class QueryExecutor
             foreach (var filter in q.FieldFilters)
                 requestedFields.Add(filter.Field);
 
-        var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
-        List<QuerySeries> result;
-        if (!q.GroupByNs.HasValue && q.GroupByTags.Count == 0 && q.Select.Any(s => s.Func != ""))
+        List<Point> pts;
+        if (q.Subquery != null)
         {
-            var pushedDown = TrySelectFunctionsWithPushdown(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, cancellationToken, report);
-            if (pushedDown != null)
+            var innerSeries = Run(e, db, q.Subquery, cancellationToken, report) ?? [];
+            pts = MaterializeSubqueryPoints(innerSeries);
+            EnsureQueryPointLimit(pts.Count);
+            var subqueryBytes = EstimatePointsBytes(pts);
+            report.EstimatedInputBytes = Math.Max(report.EstimatedInputBytes, subqueryBytes);
+            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, subqueryBytes);
+            EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+        }
+        else
+        {
+            var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
+            if (!q.GroupByNs.HasValue && q.GroupByTags.Count == 0 && q.Select.Any(s => s.Func != ""))
             {
-                var resultBytes = EstimateQuerySeriesBytes(pushedDown);
-                report.EstimatedResultBytes = resultBytes;
-                report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, resultBytes);
-                EnsureQueryMemoryLimit(resultBytes);
-                result = pushedDown;
-                if (!string.IsNullOrWhiteSpace(q.IntoTarget))
-                    ExecuteSelectInto(e, sourceDb, q, pushedDown);
-                return result;
+                var pushedDown = TrySelectFunctionsWithPushdown(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, cancellationToken, report);
+                if (pushedDown != null)
+                {
+                    var resultBytes = EstimateQuerySeriesBytes(pushedDown);
+                    report.EstimatedResultBytes = resultBytes;
+                    report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, resultBytes);
+                    EnsureQueryMemoryLimit(resultBytes);
+                    if (!string.IsNullOrWhiteSpace(q.IntoTarget))
+                        ExecuteSelectInto(e, sourceDb, q, pushedDown);
+                    return pushedDown;
+                }
             }
+
+            pts = e.ReadAllPoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken);
+            EnsureQueryPointLimit(pts.Count);
+            report.ScannedPoints += pts.Count;
+            report.EstimatedInputBytes = EstimatePointsBytes(pts);
+            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes);
+            EnsureQueryMemoryLimit(report.EstimatedInputBytes);
         }
 
-        var pts = e.ReadAllPoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken);
-        EnsureQueryPointLimit(pts.Count);
-        report.ScannedPoints += pts.Count;
-        report.EstimatedInputBytes = EstimatePointsBytes(pts);
-        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes);
-        EnsureQueryMemoryLimit(report.EstimatedInputBytes);
         cancellationToken.ThrowIfCancellationRequested();
         pts = ApplyTagFilters(pts, q.TagFilters);
         cancellationToken.ThrowIfCancellationRequested();
@@ -405,24 +483,24 @@ public sealed class QueryExecutor
 
         if (q.GroupByNs.HasValue || q.GroupByTags.Count > 0)
         {
-            result = AggGroupBy(pts, q, cancellationToken);
-            report.EstimatedResultBytes = EstimateQuerySeriesBytes(result);
+            var aggregateResult = AggGroupBy(pts, q, cancellationToken, resultMeasurement);
+            report.EstimatedResultBytes = EstimateQuerySeriesBytes(aggregateResult);
             report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + report.EstimatedResultBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
             if (!string.IsNullOrWhiteSpace(q.IntoTarget))
-                ExecuteSelectInto(e, sourceDb, q, result);
-            return result;
+                ExecuteSelectInto(e, sourceDb, q, aggregateResult);
+            return aggregateResult;
         }
 
         if (q.Select.Any(s => s.Func != ""))
         {
-            result = SelectFunctions(pts, q, cancellationToken);
-            report.EstimatedResultBytes = EstimateQuerySeriesBytes(result);
+            var functionResult = SelectFunctions(pts, q, cancellationToken, resultMeasurement);
+            report.EstimatedResultBytes = EstimateQuerySeriesBytes(functionResult);
             report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + report.EstimatedResultBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
             if (!string.IsNullOrWhiteSpace(q.IntoTarget))
-                ExecuteSelectInto(e, sourceDb, q, result);
-            return result;
+                ExecuteSelectInto(e, sourceDb, q, functionResult);
+            return functionResult;
         }
 
         var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
@@ -447,16 +525,16 @@ public sealed class QueryExecutor
         }
 
         EnsureWithinLimit(vals.Count);
-        result = [new() { Name = q.Measurement ?? "", Columns = cols, Values = vals }];
-        report.EstimatedResultBytes = EstimateQuerySeriesBytes(result);
+        List<QuerySeries> rawResult = [new() { Name = resultMeasurement, Columns = cols, Values = vals }];
+        report.EstimatedResultBytes = EstimateQuerySeriesBytes(rawResult);
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + report.EstimatedResultBytes);
         EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
         if (!string.IsNullOrWhiteSpace(q.IntoTarget))
-            ExecuteSelectInto(e, sourceDb, q, result);
-        return result;
+            ExecuteSelectInto(e, sourceDb, q, rawResult);
+        return rawResult;
     }
 
-    List<QuerySeries> AggGroupBy(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken)
+    List<QuerySeries> AggGroupBy(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken, string resultMeasurement)
     {
         long? step = q.GroupByNs;
         var tagNames = q.GroupByTags;
@@ -495,7 +573,7 @@ public sealed class QueryExecutor
             {
                 var cols = new List<string> { "time" };
                 cols.AddRange(items.Select(x => x.Alias));
-                series = new QuerySeries { Name = q.Measurement ?? "", Tags = tagsDict, Columns = cols, Values = [] };
+                series = new QuerySeries { Name = resultMeasurement, Tags = tagsDict, Columns = cols, Values = [] };
                 seriesMap[seriesKey] = series;
             }
             var row = new List<object?> { Time(key.BucketTime ?? 0) };
@@ -642,6 +720,56 @@ public sealed class QueryExecutor
             }
         }
         return points;
+    }
+
+    static List<Point> MaterializeSubqueryPoints(List<QuerySeries> seriesList)
+    {
+        var points = new List<Point>();
+        foreach (var series in seriesList)
+        {
+            var timeIndex = IndexOfColumn(series.Columns, "time");
+            var seriesTags = series.Tags == null
+                ? new Dictionary<string, string>(StringComparer.Ordinal)
+                : new Dictionary<string, string>(series.Tags, StringComparer.Ordinal);
+
+            foreach (var row in series.Values)
+            {
+                var timestampNs = timeIndex >= 0 && timeIndex < row.Count ? ParseTimeNs(row[timeIndex]) : 0;
+                var tags = new Dictionary<string, string>(seriesTags, StringComparer.Ordinal);
+                var fields = new Dictionary<string, FieldValue>(StringComparer.Ordinal);
+                for (int i = 0; i < series.Columns.Count && i < row.Count; i++)
+                {
+                    var column = series.Columns[i];
+                    if (string.Equals(column, "time", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var value = row[i];
+                    if (value == null)
+                        continue;
+
+                    if (value is string s)
+                    {
+                        tags[column] = s;
+                        continue;
+                    }
+
+                    fields[column] = ToFieldValue(value);
+                }
+
+                if (fields.Count == 0)
+                    continue;
+
+                points.Add(new Point
+                {
+                    Measurement = series.Name,
+                    Tags = tags,
+                    Fields = fields,
+                    TimestampNs = timestampNs
+                });
+            }
+        }
+
+        return points.OrderBy(p => p.TimestampNs).ToList();
     }
 
     static bool ShouldTreatAsTag(ParsedQuery query, HashSet<string> selectedColumns, HashSet<string> knownFields, string column, object value)
@@ -875,11 +1003,11 @@ public sealed class QueryExecutor
         }
     }
 
-    List<QuerySeries> SelectFunctions(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken)
+    List<QuerySeries> SelectFunctions(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken, string resultMeasurement)
     {
         var series = new QuerySeries
         {
-            Name = q.Measurement ?? "",
+            Name = resultMeasurement,
             Columns = ["time"]
         };
         series.Columns.AddRange(q.Select.Select(s => s.Alias));
@@ -1279,6 +1407,13 @@ public sealed class QueryExecutor
         if (s % 60 == 0 && s >= 60) return $"{s / 60}m";
         return $"{s}s";
     }
+
+    static string ResolveResultMeasurementName(ParsedQuery q) =>
+        !string.IsNullOrWhiteSpace(q.Measurement)
+            ? q.Measurement!
+            : !string.IsNullOrWhiteSpace(q.Subquery?.Measurement)
+                ? q.Subquery!.Measurement!
+                : "subquery";
 
     private sealed record IntoTarget(string Database, string RetentionPolicy, string Measurement);
 }

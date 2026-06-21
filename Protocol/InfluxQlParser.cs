@@ -6,6 +6,7 @@ public enum QueryKind
 {
     CreateDatabase, ShowDatabases, ShowMeasurements, ShowFieldKeys, ShowTagKeys, ShowTagValues, Select,
     CreateRetentionPolicy, AlterRetentionPolicy, DropRetentionPolicy, ShowRetentionPolicies,
+    CreateContinuousQuery, ShowContinuousQueries, DropContinuousQuery,
     DropDatabase, DropMeasurement, DropSeries, DropShard, Delete,
     ShowSeries, ShowSeriesCardinality, ShowMeasurementCardinality, ShowTagValuesCardinality,
     CreateUser, GrantPrivilege, RevokePrivilege, ShowUsers, ShowGrants, DropUser
@@ -25,6 +26,7 @@ public sealed class ParsedQuery
     public required QueryKind Kind { get; init; }
     public string? Database { get; init; }
     public string? Measurement { get; init; }
+    public ParsedQuery? Subquery { get; init; }
     public string? SourceDatabase { get; init; }
     public string? SourceRpName { get; init; }
     public List<SelectItem> Select { get; init; } = [];
@@ -44,6 +46,11 @@ public sealed class ParsedQuery
     public string? RpName { get; init; }
     public long? RpDurationNs { get; init; }
     public bool? RpDefault { get; init; }
+    public string? ContinuousQueryName { get; init; }
+    public string? ContinuousQueryText { get; init; }
+    public long? ContinuousQueryEveryNs { get; init; }
+    public long? ContinuousQueryForNs { get; init; }
+    public int? ContinuousQueryRecomputeRecentBuckets { get; init; }
     public string? IntoTarget { get; init; }
     public string? UserName { get; init; }
     public string? Password { get; init; }
@@ -59,6 +66,10 @@ public static class InfluxQlParser
         if (q.StartsWith("CREATE RETENTION POLICY ", StringComparison.OrdinalIgnoreCase)) return ParseCreateRp(q);
         if (q.StartsWith("ALTER RETENTION POLICY ", StringComparison.OrdinalIgnoreCase)) return ParseAlterRp(q);
         if (q.StartsWith("DROP RETENTION POLICY ", StringComparison.OrdinalIgnoreCase)) return ParseDropRp(q);
+        if (q.StartsWith("CREATE CONTINUOUS QUERY ", StringComparison.OrdinalIgnoreCase)) return ParseCreateContinuousQuery(q);
+        if (q.StartsWith("DROP CONTINUOUS QUERY ", StringComparison.OrdinalIgnoreCase)) return ParseDropContinuousQuery(q);
+        if (q.Equals("SHOW CONTINUOUS QUERIES", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowContinuousQueries };
         if (q.StartsWith("SHOW RETENTION POLICIES", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowRetentionPolicies, Database = AfterOn(q) };
         if (q.StartsWith("DROP DATABASE ", StringComparison.OrdinalIgnoreCase))
@@ -142,6 +153,82 @@ public static class InfluxQlParser
         return new() { Kind = QueryKind.DropRetentionPolicy, RpName = Unq(name), Database = Unq(db) };
     }
 
+    static ParsedQuery ParseCreateContinuousQuery(string q)
+    {
+        var rest = q["CREATE CONTINUOUS QUERY ".Length..].Trim();
+        var name = ReadToken(ref rest);
+        ConsumeKeyword(ref rest, "ON");
+        var db = ReadToken(ref rest);
+        rest = rest.TrimStart();
+
+        long? everyNs = null;
+        long? forNs = null;
+        int? recomputeRecentBuckets = null;
+        if (rest.StartsWith("RESAMPLE ", StringComparison.OrdinalIgnoreCase))
+        {
+            rest = rest["RESAMPLE ".Length..].TrimStart();
+            while (!rest.StartsWith("BEGIN", StringComparison.OrdinalIgnoreCase))
+            {
+                if (rest.StartsWith("EVERY ", StringComparison.OrdinalIgnoreCase))
+                {
+                    rest = rest["EVERY ".Length..];
+                    everyNs = DurationToNs(ReadToken(ref rest));
+                }
+                else if (rest.StartsWith("FOR ", StringComparison.OrdinalIgnoreCase))
+                {
+                    rest = rest["FOR ".Length..];
+                    forNs = DurationToNs(ReadToken(ref rest));
+                }
+                else if (rest.StartsWith("RECOMPUTE ", StringComparison.OrdinalIgnoreCase))
+                {
+                    rest = rest["RECOMPUTE ".Length..];
+                    recomputeRecentBuckets = int.Parse(ReadToken(ref rest), CultureInfo.InvariantCulture);
+                }
+                else
+                {
+                    break;
+                }
+
+                rest = rest.TrimStart();
+            }
+        }
+
+        var beginIndex = rest.IndexOf("BEGIN", StringComparison.OrdinalIgnoreCase);
+        var endIndex = rest.LastIndexOf("END", StringComparison.OrdinalIgnoreCase);
+        if (beginIndex < 0 || endIndex < 0 || endIndex <= beginIndex)
+            throw new FormatException("CREATE CONTINUOUS QUERY requires BEGIN ... END");
+
+        var queryText = rest[(beginIndex + "BEGIN".Length)..endIndex].Trim();
+        var parsed = Parse(queryText);
+        if (parsed.Kind != QueryKind.Select)
+            throw new NotSupportedException("continuous query body must be a SELECT statement");
+
+        return new()
+        {
+            Kind = QueryKind.CreateContinuousQuery,
+            Database = Unq(db),
+            ContinuousQueryName = Unq(name),
+            ContinuousQueryText = queryText,
+            ContinuousQueryEveryNs = everyNs,
+            ContinuousQueryForNs = forNs,
+            ContinuousQueryRecomputeRecentBuckets = recomputeRecentBuckets
+        };
+    }
+
+    static ParsedQuery ParseDropContinuousQuery(string q)
+    {
+        var rest = q["DROP CONTINUOUS QUERY ".Length..].Trim();
+        var name = ReadToken(ref rest);
+        ConsumeKeyword(ref rest, "ON");
+        var db = ReadToken(ref rest);
+        return new()
+        {
+            Kind = QueryKind.DropContinuousQuery,
+            Database = Unq(db),
+            ContinuousQueryName = Unq(name)
+        };
+    }
+
     static ParsedQuery ParseDelete(string q)
     {
         var rest = q["DELETE FROM ".Length..].Trim();
@@ -175,8 +262,7 @@ public static class InfluxQlParser
 
     static ParsedQuery ParseSelect(string q)
     {
-        var u = q.ToUpperInvariant();
-        int fi = u.IndexOf(" FROM ");
+        int fi = IndexOfTopLevelKeyword(q, " FROM ");
         if (fi < 0) throw new FormatException("SELECT requires FROM");
         var fieldText = q[7..fi].Trim();
         string? intoTarget = null;
@@ -187,15 +273,40 @@ public static class InfluxQlParser
             fieldText = fieldText[..intoIndex].Trim();
         }
         var rest = q[(fi + 6)..].Trim();
-        string sourceToken = rest.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
-        var source = ParseQualifiedMeasurement(sourceToken);
-        string tail = rest.Length > sourceToken.Length ? rest[sourceToken.Length..] : "";
+        ParsedQuery? subquery = null;
+        string? measurement = null;
+        string? sourceDb = null;
+        string? sourceRp = null;
+        string tail;
+
+        if (rest.StartsWith('('))
+        {
+            var closeIndex = FindMatchingParen(rest, 0);
+            if (closeIndex < 0)
+                throw new FormatException("subquery requires closing ')'");
+
+            var inner = rest[1..closeIndex].Trim();
+            subquery = Parse(inner);
+            if (subquery.Kind != QueryKind.Select)
+                throw new NotSupportedException("subquery must be a SELECT statement");
+            tail = rest.Length > closeIndex + 1 ? rest[(closeIndex + 1)..] : "";
+        }
+        else
+        {
+            string sourceToken = ReadSourceToken(rest);
+            var source = ParseQualifiedMeasurement(sourceToken);
+            measurement = source.Measurement;
+            sourceDb = source.Database;
+            sourceRp = source.RetentionPolicy;
+            tail = rest.Length > sourceToken.Length ? rest[sourceToken.Length..] : "";
+        }
+
         long? min = null, max = null, gb = null; int? limit = null, offset = null;
         int? slimit = null, soffset = null;
-        bool desc = u.Contains(" ORDER BY TIME DESC");
+        var tu = tail.ToUpperInvariant();
+        bool desc = tu.Contains(" ORDER BY TIME DESC");
         var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
         var groupByTags = new List<string>(); var fill = FillMode.None;
-        var tu = tail.ToUpperInvariant();
         int wi = tu.IndexOf(" WHERE ");
         if (wi >= 0) { var end = EndClause(tu, wi + 7); ParseWhere(tail[(wi + 7)..end], out min, out max, tagFilters, fieldFilters); }
         var gu = tu.IndexOf(" GROUP BY ");
@@ -211,7 +322,7 @@ public static class InfluxQlParser
         if (slu >= 0) slimit = int.Parse(tail[(slu + 8)..].Trim().Split(' ')[0], CultureInfo.InvariantCulture);
         var sou = tu.LastIndexOf(" SOFFSET ");
         if (sou >= 0) soffset = int.Parse(tail[(sou + 9)..].Trim().Split(' ')[0], CultureInfo.InvariantCulture);
-        return new() { Kind = QueryKind.Select, Measurement = source.Measurement, SourceDatabase = source.Database, SourceRpName = source.RetentionPolicy, Select = ParseItems(fieldText),
+        return new() { Kind = QueryKind.Select, Measurement = measurement, Subquery = subquery, SourceDatabase = sourceDb, SourceRpName = sourceRp, Select = ParseItems(fieldText),
             MinTimeNs = min, MaxTimeNs = max, Limit = limit, Desc = desc, GroupByNs = gb,
             Offset = offset, SeriesLimit = slimit, SeriesOffset = soffset,
             GroupByTags = groupByTags, Fill = fill, TagFilters = tagFilters, FieldFilters = fieldFilters, IntoTarget = intoTarget };
@@ -406,5 +517,63 @@ public static class InfluxQlParser
         return unit switch { "ns" => num, "u" or "us" => num * 1000, "ms" => num * 1_000_000, "s" => num * 1_000_000_000,
             "m" => num * 60_000_000_000, "h" => num * 3600_000_000_000, "d" => num * 86400_000_000_000, "w" => num * 7 * 86400_000_000_000,
             _ => throw new FormatException($"bad duration: {s}") };
+    }
+
+    static int IndexOfTopLevelKeyword(string text, string keyword)
+    {
+        int depth = 0;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+        for (int i = 0; i <= text.Length - keyword.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '\'' && !inDoubleQuote) inSingleQuote = !inSingleQuote;
+            else if (ch == '"' && !inSingleQuote) inDoubleQuote = !inDoubleQuote;
+            else if (!inSingleQuote && !inDoubleQuote)
+            {
+                if (ch == '(') depth++;
+                else if (ch == ')') depth--;
+            }
+
+            if (depth == 0 && !inSingleQuote && !inDoubleQuote &&
+                text.AsSpan(i, keyword.Length).Equals(keyword.AsSpan(), StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+
+        return -1;
+    }
+
+    static string ReadSourceToken(string text)
+    {
+        text = text.TrimStart();
+        int i = 0;
+        while (i < text.Length && !char.IsWhiteSpace(text[i]))
+            i++;
+        return text[..i];
+    }
+
+    static int FindMatchingParen(string text, int openIndex)
+    {
+        int depth = 0;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+        for (int i = openIndex; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '\'' && !inDoubleQuote) inSingleQuote = !inSingleQuote;
+            else if (ch == '"' && !inSingleQuote) inDoubleQuote = !inDoubleQuote;
+            else if (!inSingleQuote && !inDoubleQuote)
+            {
+                if (ch == '(') depth++;
+                else if (ch == ')')
+                {
+                    depth--;
+                    if (depth == 0)
+                        return i;
+                }
+            }
+        }
+
+        return -1;
     }
 }

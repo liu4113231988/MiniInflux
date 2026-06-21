@@ -15,7 +15,11 @@
   - `SHOW FIELD KEYS`
   - `SHOW TAG KEYS FROM measurement`
   - `SHOW TAG VALUES FROM measurement WITH KEY = tagKey`
+  - `CREATE CONTINUOUS QUERY ... BEGIN SELECT ... INTO ... END`
+  - `SHOW CONTINUOUS QUERIES`
+  - `DROP CONTINUOUS QUERY ... ON db`
 - `SELECT * FROM measurement [WHERE ...] [GROUP BY time(1m)] [ORDER BY time DESC] [LIMIT n]`
+  - 支持 `FROM (<select ...>)` 聚合型子查询第一版
   - 聚合函数：`count,sum,mean,min,max,first,last`
 - WAL + Segment 存储
 - Segment v3 列编码：时间戳 `delta-of-delta/Gorilla`、浮点 `legacy XOR/Gorilla`、整数 delta、bool bit-pack、string 字典
@@ -56,6 +60,13 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
     "ConsoleEnabled": true,
     "FileEnabled": false,
     "FilePath": "./logs/miniinflux.log"
+  },
+  "ContinuousQuery": {
+    "Enabled": true,
+    "CheckIntervalMs": 5000,
+    "MaxCatchUpRunsPerCycle": 8,
+    "RecomputeRecentBuckets": 0,
+    "InitialBackfillDuration": "0s"
   }
 }
 ```
@@ -76,6 +87,11 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 - `Logging.ConsoleEnabled`：是否输出到控制台
 - `Logging.FileEnabled`：是否输出到文件
 - `Logging.FilePath`：应用日志文件路径
+- `ContinuousQuery.Enabled`：是否启用 Continuous Query 后台调度器
+- `ContinuousQuery.CheckIntervalMs`：调度扫描周期
+- `ContinuousQuery.MaxCatchUpRunsPerCycle`：单次扫描最多补跑多少个 bucket
+- `ContinuousQuery.RecomputeRecentBuckets`：每轮额外重算最近多少个已关闭 bucket，默认 `0` 关闭
+- `ContinuousQuery.InitialBackfillDuration`：当 CQ 未显式声明 `RESAMPLE FOR` 时，首次创建或长时间停机恢复后默认允许补跑的窗口
 
 环境变量兼容：
 
@@ -147,6 +163,73 @@ curl -G http://localhost:8086/query \
   --data-urlencode "db=metrics" \
   --data-urlencode "q=SELECT mean(value),max(temp) FROM cpu GROUP BY time(1m)"
 ```
+
+## Continuous Query
+
+第一版支持：
+
+- `CREATE CONTINUOUS QUERY`
+- `SHOW CONTINUOUS QUERIES`
+- `DROP CONTINUOUS QUERY`
+- 后台按 `GROUP BY time(...)` 周期调度
+- `SELECT ... INTO ...` 结果自动回写
+
+示例：
+
+```sql
+CREATE CONTINUOUS QUERY cq_cpu_1m ON metrics
+BEGIN
+  SELECT mean(value) INTO cpu_1m FROM cpu GROUP BY time(1m),host
+END
+```
+
+也支持显式指定调度周期：
+
+```sql
+CREATE CONTINUOUS QUERY cq_cpu_10s ON metrics
+RESAMPLE EVERY 10s
+BEGIN
+  SELECT max(value) INTO cpu_10s FROM cpu GROUP BY time(10s),host
+END
+```
+
+也支持基础窗口补跑语义：
+
+```sql
+CREATE CONTINUOUS QUERY cq_cpu_10s ON metrics
+RESAMPLE EVERY 10s FOR 30s
+BEGIN
+  SELECT max(value) INTO cpu_10s FROM cpu GROUP BY time(10s),host
+END
+```
+
+也支持单个 CQ 的独立重算策略：
+
+```sql
+CREATE CONTINUOUS QUERY cq_cpu_10s ON metrics
+RESAMPLE EVERY 10s FOR 30s RECOMPUTE 2
+BEGIN
+  SELECT max(value) INTO cpu_10s FROM cpu GROUP BY time(10s),host
+END
+```
+
+查看与删除：
+
+```sql
+SHOW CONTINUOUS QUERIES
+DROP CONTINUOUS QUERY cq_cpu_1m ON metrics
+```
+
+当前限制：
+
+- 第一版要求 CQ body 必须是 `SELECT ... INTO ...`
+- 第一版要求 CQ body 必须包含 `GROUP BY time(...)`
+- 已支持基础 `RESAMPLE FOR` 窗口，但还不是完整 InfluxDB 全语义
+- 未显式声明 `FOR` 时，会回退到 `ContinuousQuery.InitialBackfillDuration`
+- 可通过 `ContinuousQuery.RecomputeRecentBuckets` 对最近已关闭 bucket 做受控重算
+- 已暴露 CQ 运行指标到 `/debug/stats` 与 `/metrics`
+- 单个 CQ 也可通过 `RESAMPLE ... RECOMPUTE n` 覆盖全局重算策略
+- `/metrics` 已支持按 `db`、`name` label 导出 CQ 明细指标
 
 ## 管理 CLI
 

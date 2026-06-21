@@ -18,6 +18,17 @@ public sealed class RetentionPolicyInfo
     public long DurationMs => DurationNs / 1_000_000;
 }
 
+public sealed class ContinuousQueryInfo
+{
+    public string Name { get; set; } = "";
+    public string Database { get; set; } = "";
+    public string QueryText { get; set; } = "";
+    public long EveryNs { get; set; }
+    public long ForNs { get; set; }
+    public int RecomputeRecentBuckets { get; set; }
+    public long LastCompletedBucketStartNs { get; set; } = long.MinValue;
+}
+
 /// <summary>
 /// Shard group metadata. Each shard covers a specific time range within a db/rp.
 /// </summary>
@@ -182,6 +193,81 @@ public sealed class Manifest
             if (_data.Databases.TryGetValue(db, out var dbInfo))
                 return dbInfo.RetentionPolicies.Values.ToList();
             return [];
+        }
+    }
+
+    public void SaveContinuousQuery(string db, ContinuousQueryInfo query)
+    {
+        lock (_lock)
+        {
+            EnsureDatabase(db);
+            var dbInfo = _data.Databases[db];
+            dbInfo.ContinuousQueries[query.Name] = new ContinuousQueryInfo
+            {
+                Name = query.Name,
+                Database = db,
+                QueryText = query.QueryText,
+                EveryNs = query.EveryNs,
+                ForNs = query.ForNs,
+                RecomputeRecentBuckets = query.RecomputeRecentBuckets,
+                LastCompletedBucketStartNs = query.LastCompletedBucketStartNs
+            };
+            Save();
+        }
+    }
+
+    public bool RemoveContinuousQuery(string db, string name)
+    {
+        lock (_lock)
+        {
+            if (_data.Databases.TryGetValue(db, out var dbInfo) && dbInfo.ContinuousQueries.Remove(name))
+            {
+                Save();
+                return true;
+            }
+            return false;
+        }
+    }
+
+    public IReadOnlyList<ContinuousQueryInfo> ListContinuousQueries(string? db = null)
+    {
+        lock (_lock)
+        {
+            if (!string.IsNullOrWhiteSpace(db))
+            {
+                if (_data.Databases.TryGetValue(db!, out var dbInfo))
+                    return dbInfo.ContinuousQueries.Values
+                        .OrderBy(q => q.Name, StringComparer.Ordinal)
+                        .ToList();
+                return [];
+            }
+
+            return _data.Databases
+                .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .SelectMany(kv => kv.Value.ContinuousQueries.Values.OrderBy(q => q.Name, StringComparer.Ordinal))
+                .ToList();
+        }
+    }
+
+    public ContinuousQueryInfo? GetContinuousQuery(string db, string name)
+    {
+        lock (_lock)
+        {
+            if (_data.Databases.TryGetValue(db, out var dbInfo) && dbInfo.ContinuousQueries.TryGetValue(name, out var query))
+                return query;
+            return null;
+        }
+    }
+
+    public void UpdateContinuousQueryProgress(string db, string name, long lastCompletedBucketStartNs)
+    {
+        lock (_lock)
+        {
+            if (_data.Databases.TryGetValue(db, out var dbInfo) && dbInfo.ContinuousQueries.TryGetValue(name, out var query))
+            {
+                query.LastCompletedBucketStartNs = lastCompletedBucketStartNs;
+                Save();
+            }
         }
     }
 
@@ -552,6 +638,7 @@ public sealed class Manifest
 internal sealed class DatabaseInfo
 {
     public Dictionary<string, RetentionPolicyInfo> RetentionPolicies { get; set; } = new(StringComparer.Ordinal);
+    public Dictionary<string, ContinuousQueryInfo> ContinuousQueries { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, HashSet<string>> SeriesIndex { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, Dictionary<string, HashSet<string>>> TagIndex { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, Dictionary<string, Dictionary<string, HashSet<string>>>> TagSeriesIndex { get; set; } = new(StringComparer.Ordinal);
@@ -565,10 +652,13 @@ internal sealed class ManifestData
 [JsonSerializable(typeof(ManifestData))]
 [JsonSerializable(typeof(DatabaseInfo))]
 [JsonSerializable(typeof(RetentionPolicyInfo))]
+[JsonSerializable(typeof(ContinuousQueryInfo))]
 [JsonSerializable(typeof(ShardGroupInfo))]
+[JsonSerializable(typeof(List<ContinuousQueryInfo>))]
 [JsonSerializable(typeof(List<ShardGroupInfo>))]
 [JsonSerializable(typeof(Dictionary<string, DatabaseInfo>))]
 [JsonSerializable(typeof(Dictionary<string, RetentionPolicyInfo>))]
+[JsonSerializable(typeof(Dictionary<string, ContinuousQueryInfo>))]
 [JsonSerializable(typeof(Dictionary<string, HashSet<string>>))]
 [JsonSerializable(typeof(Dictionary<string, Dictionary<string, HashSet<string>>>))]
 [JsonSerializable(typeof(Dictionary<string, Dictionary<string, Dictionary<string, HashSet<string>>>>))]

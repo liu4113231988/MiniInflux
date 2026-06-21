@@ -132,4 +132,61 @@ public class InfluxQlParserTests
         Assert.Equal("derivative", query.Select[0].Func);
         Assert.Equal(60_000_000_000, query.Select[0].UnitNs);
     }
+
+    [Fact]
+    public void Parse_SelectWithSubquery_ParsesNestedSource()
+    {
+        var query = InfluxQlParser.Parse("SELECT mean(max_value) FROM (SELECT max(value) FROM cpu GROUP BY time(10s)) GROUP BY time(1m)");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.Null(query.Measurement);
+        Assert.NotNull(query.Subquery);
+        Assert.Equal(QueryKind.Select, query.Subquery!.Kind);
+        Assert.Equal("cpu", query.Subquery.Measurement);
+        Assert.Equal(10_000_000_000L, query.Subquery.GroupByNs);
+        Assert.Equal("mean", query.Select[0].Func);
+        Assert.Equal("max_value", query.Select[0].Field);
+        Assert.Equal(60_000_000_000L, query.GroupByNs);
+    }
+
+    [Fact]
+    public void Parse_CreateContinuousQuery_ParsesDefinition()
+    {
+        var query = InfluxQlParser.Parse("CREATE CONTINUOUS QUERY cq_cpu ON metrics RESAMPLE EVERY 10s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");
+
+        Assert.Equal(QueryKind.CreateContinuousQuery, query.Kind);
+        Assert.Equal("metrics", query.Database);
+        Assert.Equal("cq_cpu", query.ContinuousQueryName);
+        Assert.Equal(10_000_000_000L, query.ContinuousQueryEveryNs);
+        Assert.Contains("SELECT mean(value) INTO cpu_rollup", query.ContinuousQueryText);
+    }
+
+    [Fact]
+    public void Parse_CreateContinuousQuery_WithResampleFor_ParsesWindow()
+    {
+        var query = InfluxQlParser.Parse("CREATE CONTINUOUS QUERY cq_cpu ON metrics RESAMPLE FOR 30s EVERY 10s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");
+
+        Assert.Equal(QueryKind.CreateContinuousQuery, query.Kind);
+        Assert.Equal(10_000_000_000L, query.ContinuousQueryEveryNs);
+        Assert.Equal(30_000_000_000L, query.ContinuousQueryForNs);
+    }
+
+    [Fact]
+    public void Parse_CreateContinuousQuery_WithRecompute_ParsesStrategy()
+    {
+        var query = InfluxQlParser.Parse("CREATE CONTINUOUS QUERY cq_cpu ON metrics RESAMPLE EVERY 10s FOR 30s RECOMPUTE 2 BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");
+
+        Assert.Equal(QueryKind.CreateContinuousQuery, query.Kind);
+        Assert.Equal(2, query.ContinuousQueryRecomputeRecentBuckets);
+    }
+
+    [Fact]
+    public void Parse_DropContinuousQuery_ParsesDefinition()
+    {
+        var query = InfluxQlParser.Parse("DROP CONTINUOUS QUERY cq_cpu ON metrics");
+
+        Assert.Equal(QueryKind.DropContinuousQuery, query.Kind);
+        Assert.Equal("metrics", query.Database);
+        Assert.Equal("cq_cpu", query.ContinuousQueryName);
+    }
 }
