@@ -29,7 +29,99 @@
 dotnet run -c Release --project MiniInflux.Net10.csproj
 ```
 
-默认监听 `http://0.0.0.0:8086`。数据目录默认是 `./data`，也可以通过 `appsettings.json` 里的 `MiniInflux:DataPath` 或环境变量 `MINI_INFLUX_DATA` 指定。
+默认监听 `http://0.0.0.0:8086`。当前配置同时兼容旧版 `MiniInflux:DataPath`，也支持更接近 InfluxDB 1.x 风格的 `Data`、`Http`、`Logging` 段。
+
+## 配置
+
+默认 `appsettings.json`：
+
+```json
+{
+  "Data": {
+    "Dir": "./data",
+    "QueryLogEnabled": true
+  },
+  "Http": {
+    "Enabled": true,
+    "BindAddress": "0.0.0.0:8086",
+    "AuthEnabled": false,
+    "LogEnabled": true,
+    "SuppressWriteLog": false,
+    "AccessLogPath": "",
+    "AccessLogStatusFilters": [],
+    "WriteTracing": false
+  },
+  "Logging": {
+    "Level": "Information",
+    "ConsoleEnabled": true,
+    "FileEnabled": false,
+    "FilePath": "./logs/miniinflux.log"
+  }
+}
+```
+
+设计参考了 InfluxDB 官方配置/日志项思路，但当前只实现了与 MiniInflux 现阶段能力匹配的子集：
+
+- `Data.Dir`：数据目录，优先于旧版 `MiniInflux:DataPath`
+- `Data.QueryLogEnabled`：是否记录查询语句
+- `Http.Enabled`：是否启用 HTTP 服务；关闭后仍可使用管理 CLI
+- `Http.BindAddress`：监听地址，会自动映射成 ASP.NET Core 使用的 `Urls`
+- `Http.AuthEnabled`：HTTP 认证总开关，同时回填到现有 `Auth.Enabled`
+- `Http.LogEnabled`：是否启用访问日志
+- `Http.SuppressWriteLog`：是否抑制 `/write` 请求访问日志
+- `Http.AccessLogPath`：访问日志文件路径；留空时写到应用 logger
+- `Http.AccessLogStatusFilters`：按状态码筛选访问日志，例如 `["4xx","5xx","503"]`
+- `Http.WriteTracing`：记录 `/write` 原始请求体，便于排障，默认应关闭
+- `Logging.Level`：应用日志级别，支持 `Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`
+- `Logging.ConsoleEnabled`：是否输出到控制台
+- `Logging.FileEnabled`：是否输出到文件
+- `Logging.FilePath`：应用日志文件路径
+
+环境变量兼容：
+
+- `MINI_INFLUX_DATA` 可继续覆盖数据目录
+
+## 日志示例
+
+只输出到控制台：
+
+```json
+"Logging": {
+  "Level": "Information",
+  "ConsoleEnabled": true,
+  "FileEnabled": false,
+  "FilePath": "./logs/miniinflux.log"
+}
+```
+
+同时输出到文件：
+
+```json
+"Logging": {
+  "Level": "Debug",
+  "ConsoleEnabled": true,
+  "FileEnabled": true,
+  "FilePath": "./logs/miniinflux.log"
+}
+```
+
+只记录异常访问请求：
+
+```json
+"Http": {
+  "LogEnabled": true,
+  "SuppressWriteLog": true,
+  "AccessLogPath": "./logs/access.log",
+  "AccessLogStatusFilters": ["4xx", "5xx", "503"]
+}
+```
+
+说明：
+
+- 应用日志和访问日志是分开的；`Logging.*` 控制应用 logger，`Http.*` 控制 HTTP 访问日志
+- `SuppressWriteLog=true` 适合高吞吐写入场景，避免 `/write` 访问日志过大
+- `WriteTracing=true` 会记录原始写入内容，只建议在短时排障时开启
+- `QueryLogEnabled=true` 会记录查询语句，便于排查查询行为和性能问题
 
 ## AOT 发布
 

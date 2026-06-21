@@ -23,7 +23,7 @@ public class IndexTests : IDisposable
     }
 
     [Fact]
-    public void SeriesIndex_TracksSeriesAfterWrite()
+    public async Task SeriesIndex_TracksSeriesAfterWrite()
     {
         var points = new List<Point>
         {
@@ -50,7 +50,7 @@ public class IndexTests : IDisposable
             }
         };
 
-        _engine.WriteAsync("testdb", "autogen", points).Wait();
+        await _engine.WriteAsync("testdb", "autogen", points);
 
         // Check series index via Manifest
         var cpuSeries = _engine.Meta.GetSeries("testdb", "cpu");
@@ -64,7 +64,7 @@ public class IndexTests : IDisposable
     }
 
     [Fact]
-    public void TagIndex_TracksTagKeysAndValues()
+    public async Task TagIndex_TracksTagKeysAndValues()
     {
         var points = new List<Point>
         {
@@ -84,7 +84,7 @@ public class IndexTests : IDisposable
             }
         };
 
-        _engine.WriteAsync("testdb", "autogen", points).Wait();
+        await _engine.WriteAsync("testdb", "autogen", points);
 
         // Check tag index
         var hostValues = _engine.Meta.GetTagValues("testdb", "cpu", "host");
@@ -99,7 +99,7 @@ public class IndexTests : IDisposable
     }
 
     [Fact]
-    public void ListTagValues_UsesIndex()
+    public async Task ListTagValues_UsesIndex()
     {
         var points = new List<Point>
         {
@@ -119,14 +119,14 @@ public class IndexTests : IDisposable
             }
         };
 
-        _engine.WriteAsync("testdb", "autogen", points).Wait();
+        await _engine.WriteAsync("testdb", "autogen", points);
 
         var tagValues = _engine.ListTagValues("testdb", "cpu", "host");
         Assert.Equal(2, tagValues.Count);
     }
 
     [Fact]
-    public void DropMeasurement_RemovesIndexEntries()
+    public async Task DropMeasurement_RemovesIndexEntries()
     {
         var points = new List<Point>
         {
@@ -139,7 +139,7 @@ public class IndexTests : IDisposable
             }
         };
 
-        _engine.WriteAsync("testdb", "autogen", points).Wait();
+        await _engine.WriteAsync("testdb", "autogen", points);
 
         // Verify index exists
         Assert.NotEmpty(_engine.Meta.GetSeries("testdb", "cpu"));
@@ -153,7 +153,7 @@ public class IndexTests : IDisposable
     }
 
     [Fact]
-    public void ProjectionPushdown_OnlyReadsRequestedFields()
+    public async Task ProjectionPushdown_OnlyReadsRequestedFields()
     {
         // Write points with multiple fields
         var points = new List<Point>
@@ -172,7 +172,7 @@ public class IndexTests : IDisposable
             }
         };
 
-        _engine.WriteAsync("testdb", "autogen", points).Wait();
+        await _engine.WriteAsync("testdb", "autogen", points);
 
         // Read with field filter - only "value"
         var requestedFields = new HashSet<string>(StringComparer.Ordinal) { "value" };

@@ -1,6 +1,7 @@
 using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using MiniInflux.Net10.Protocol;
 using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
@@ -13,6 +14,34 @@ var cliExitCode = ManagementCli.TryRun(args, options, Console.Out, Console.Error
 if (cliExitCode.HasValue)
 {
     Environment.ExitCode = cliExitCode.Value;
+    return;
+}
+
+builder.Logging.ClearProviders();
+builder.Logging.SetMinimumLevel(ParseLogLevel(options.Logging.Level));
+if (options.Logging.ConsoleEnabled)
+{
+    builder.Logging.AddSimpleConsole(console =>
+    {
+        console.SingleLine = true;
+        console.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
+        console.UseUtcTimestamp = true;
+    });
+}
+if (options.Logging.FileEnabled)
+    builder.Logging.AddProvider(new FileLoggerProvider(options.Logging.FilePath));
+
+if (!options.Http.Enabled)
+{
+    var bootstrapLogger = LoggerFactory.Create(logging =>
+    {
+        logging.SetMinimumLevel(ParseLogLevel(options.Logging.Level));
+        if (options.Logging.ConsoleEnabled)
+            logging.AddSimpleConsole();
+        if (options.Logging.FileEnabled)
+            logging.AddProvider(new FileLoggerProvider(options.Logging.FilePath));
+    }).CreateLogger("MiniInflux.Bootstrap");
+    bootstrapLogger.LogWarning("HTTP service disabled by configuration. CLI commands remain available.");
     return;
 }
 
@@ -53,11 +82,38 @@ builder.Services.AddSingleton(new QueryExecutor(
     authStore));
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton<MetricsCollector>();
+builder.Services.AddSingleton(new AccessLogWriter(options.Http.AccessLogPath));
 builder.Services.AddSingleton(sp => new WriteQueue(sp.GetRequiredService<TsdbEngine>(), options.Write.QueueCapacity, options.Write.BatchSize));
 
 var app = builder.Build();
+var runtimeLogger = app.Logger;
+var accessLogWriter = app.Services.GetRequiredService<AccessLogWriter>();
 
 engine.Recover();
+runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {BindAddress}, auth {AuthEnabled}, log level {LogLevel}",
+    Path.GetFullPath(options.DataPath), options.Http.BindAddress, options.Auth.Enabled, options.Logging.Level);
+
+app.Use(async (context, next) =>
+{
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    try
+    {
+        await next();
+    }
+    finally
+    {
+        sw.Stop();
+        var shouldLog = HttpLoggingSupport.ShouldLogRequest(options.Http, context.Request.Path, context.Response.StatusCode);
+        if (shouldLog)
+        {
+            var line = HttpLoggingSupport.FormatAccessLogLine(context, sw.ElapsedMilliseconds);
+            if (accessLogWriter.Enabled)
+                accessLogWriter.Write(line);
+            else
+                runtimeLogger.LogInformation("{AccessLog}", line);
+        }
+    }
+});
 
 app.MapGet("/ping", () => Results.NoContent());
 
@@ -94,6 +150,8 @@ app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQu
     using var reader = new StreamReader(input, Encoding.UTF8);
     var body = await reader.ReadToEndAsync();
     if (string.IsNullOrWhiteSpace(body)) return Results.NoContent();
+    if (options.Http.WriteTracing)
+        runtimeLogger.LogDebug("write trace db={Db} rp={Rp} precision={Precision} body={Body}", db, rp ?? "autogen", precision ?? "ns", body);
 
     try
     {
@@ -103,27 +161,33 @@ app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQu
         {
             await writeQueue.EnqueueAsync(db, rp ?? "autogen", points, request.HttpContext.RequestAborted);
             metrics.RecordWrite(points.Count);
+            runtimeLogger.LogDebug("write accepted db={Db} rp={Rp} points={PointCount}", db, rp ?? "autogen", points.Count);
             return Results.NoContent();
         }
         catch (WriteQueueFullException)
         {
+            runtimeLogger.LogWarning("write queue full db={Db} rp={Rp}", db, rp ?? "autogen");
             return Results.StatusCode(429);
         }
         catch (FieldConflictException ex)
         {
+            runtimeLogger.LogWarning(ex, "write rejected by field conflict db={Db} rp={Rp}", db, rp ?? "autogen");
             return Results.BadRequest(new ErrorResponse(ex.Message));
         }
         catch (CardinalityLimitExceededException)
         {
+            runtimeLogger.LogWarning("write rejected by cardinality limit db={Db} rp={Rp}", db, rp ?? "autogen");
             return Results.StatusCode(429);
         }
         catch (MemoryLimitExceededException)
         {
+            runtimeLogger.LogWarning("write rejected by memory limit db={Db} rp={Rp}", db, rp ?? "autogen");
             return Results.StatusCode(429);
         }
     }
     catch (Exception ex)
     {
+        runtimeLogger.LogWarning(ex, "write parse failure db={Db} rp={Rp}", db, rp ?? "autogen");
         return Results.BadRequest(new ErrorResponse(ex.Message));
     }
 });
@@ -150,8 +214,16 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     if (!EnsureQueryAuthorized(request, options, authStore, db, parsed, out var authResult))
         return authResult;
 
+    if (options.Data.QueryLogEnabled)
+        runtimeLogger.LogInformation("query db={Db} text={Query}", db ?? "-", q);
+
     var outcome = executor.ExecuteWithReport(tsdbEngine, db, q, request.HttpContext.RequestAborted);
     metrics.RecordQuery(outcome.Report);
+    if (!string.IsNullOrWhiteSpace(outcome.Response.Results.FirstOrDefault()?.Error))
+        runtimeLogger.LogWarning("query failed db={Db} error={Error}", db ?? "-", outcome.Response.Results.First().Error);
+    else
+        runtimeLogger.LogDebug("query completed db={Db} rows={Rows} scanned={ScannedPoints} duration_ms={DurationMs}",
+            db ?? "-", outcome.Report.RowsReturned, outcome.Report.ScannedPoints, outcome.Report.DurationMs);
     if (chunked)
         return ChunkedResult(outcome.Response, chunkSize ?? 5000);
     return Results.Json(outcome.Response, AppJsonContext.Default.QueryResponse);
@@ -163,6 +235,7 @@ app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string
         return authResult;
     tsdbEngine.FlushAll();
     BackupManager.CreateBackup(tsdbEngine.RootPath, path);
+    runtimeLogger.LogInformation("backup created path={Path}", Path.GetFullPath(path));
     return Results.Ok(new AdminMessage("backup completed"));
 });
 
@@ -173,10 +246,12 @@ app.MapPost("/admin/restore", (HttpRequest request, TsdbEngine tsdbEngine, strin
     try
     {
         BackupManager.PrepareRestore(path, tsdbEngine.RootPath);
+        runtimeLogger.LogInformation("restore prepared path={Path}", Path.GetFullPath(path));
         return Results.Ok(new AdminMessage("restore prepared; restart required"));
     }
     catch (Exception ex)
     {
+        runtimeLogger.LogWarning(ex, "restore prepare failed path={Path}", path);
         return Results.BadRequest(new ErrorResponse(ex.Message));
     }
 });
@@ -195,6 +270,8 @@ app.MapGet("/debug/benchmark", (HttpRequest request, TsdbEngine tsdbEngine) =>
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {
+    runtimeLogger.LogInformation("MiniInflux shutting down");
+    accessLogWriter.Dispose();
     var wq = app.Services.GetRequiredService<WriteQueue>();
     wq.Dispose();
     var eng = app.Services.GetRequiredService<TsdbEngine>();
@@ -383,6 +460,9 @@ static bool TryParseBool(string? value) =>
 
 static int? ParseChunkSize(string? value) =>
     int.TryParse(value, out var parsed) && parsed > 0 ? parsed : null;
+
+static LogLevel ParseLogLevel(string? value) =>
+    Enum.TryParse<LogLevel>(value, true, out var parsed) ? parsed : LogLevel.Information;
 
 public sealed record ErrorResponse(string Error);
 public sealed record AdminMessage(string Message);

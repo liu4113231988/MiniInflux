@@ -101,6 +101,20 @@ public sealed class SchemaRegistry
         }
     }
 
+    public IReadOnlyList<string> ListMeasurements(string db)
+    {
+        lock (_lock)
+        {
+            var prefix = $"{db}|";
+            return _schema.Keys
+                .Where(k => k.StartsWith(prefix, StringComparison.Ordinal))
+                .Select(k => k.Split('|')[1])
+                .Distinct(StringComparer.Ordinal)
+                .Order()
+                .ToArray();
+        }
+    }
+
     private void Load()
     {
         if (!File.Exists(_schemaPath)) return;

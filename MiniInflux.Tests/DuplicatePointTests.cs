@@ -23,7 +23,7 @@ public class DuplicatePointTests : IDisposable
     }
 
     [Fact]
-    public void WriteDuplicatePoints_SameTimestamp_MergesFields()
+    public async Task WriteDuplicatePoints_SameTimestamp_MergesFields()
     {
         // Write two points with same measurement+tags+timestamp but different fields
         var points = new List<Point>
@@ -44,7 +44,7 @@ public class DuplicatePointTests : IDisposable
             }
         };
 
-        _engine.WriteAsync("testdb", "autogen", points).Wait();
+        await _engine.WriteAsync("testdb", "autogen", points);
 
         var result = _engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
         Assert.Single(result); // Should be merged into one point
@@ -55,7 +55,7 @@ public class DuplicatePointTests : IDisposable
     }
 
     [Fact]
-    public void WriteDuplicatePoints_SameField_LastWriteWins()
+    public async Task WriteDuplicatePoints_SameField_LastWriteWins()
     {
         // Write two points with same measurement+tags+timestamp+field - last value wins
         var points = new List<Point>
@@ -76,7 +76,7 @@ public class DuplicatePointTests : IDisposable
             }
         };
 
-        _engine.WriteAsync("testdb", "autogen", points).Wait();
+        await _engine.WriteAsync("testdb", "autogen", points);
 
         var result = _engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
         Assert.Single(result);
@@ -84,7 +84,7 @@ public class DuplicatePointTests : IDisposable
     }
 
     [Fact]
-    public void WriteDuplicatePoints_DifferentTimestamps_NotMerged()
+    public async Task WriteDuplicatePoints_DifferentTimestamps_NotMerged()
     {
         // Points with different timestamps should NOT be merged
         var points = new List<Point>
@@ -105,14 +105,14 @@ public class DuplicatePointTests : IDisposable
             }
         };
 
-        _engine.WriteAsync("testdb", "autogen", points).Wait();
+        await _engine.WriteAsync("testdb", "autogen", points);
 
         var result = _engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
         Assert.Equal(2, result.Count); // Two separate points
     }
 
     [Fact]
-    public void WriteDuplicatePoints_DifferentTags_NotMerged()
+    public async Task WriteDuplicatePoints_DifferentTags_NotMerged()
     {
         // Points with different tags should NOT be merged
         var points = new List<Point>
@@ -133,7 +133,7 @@ public class DuplicatePointTests : IDisposable
             }
         };
 
-        _engine.WriteAsync("testdb", "autogen", points).Wait();
+        await _engine.WriteAsync("testdb", "autogen", points);
 
         var result = _engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
         Assert.Equal(2, result.Count);

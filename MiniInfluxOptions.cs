@@ -1,8 +1,13 @@
+using Microsoft.Extensions.Configuration;
+
 public sealed class MiniInfluxOptions
 {
     public string DataPath { get; init; } = "./data";
     public int FlushThreshold { get; init; } = 50_000;
     public string Urls { get; init; } = "http://0.0.0.0:8086";
+    public DataOptions Data { get; init; } = new();
+    public HttpOptions Http { get; init; } = new();
+    public LoggingOptions Logging { get; init; } = new();
     public WalOptions Wal { get; init; } = new();
     public WriteOptions Write { get; init; } = new();
     public StorageOptions Storage { get; init; } = new();
@@ -15,58 +20,183 @@ public sealed class MiniInfluxOptions
         foreach (var child in config.GetSection("Auth:Users").GetChildren())
             if (!string.IsNullOrEmpty(child.Key) && child.Value != null) authUsers[child.Key] = child.Value;
 
+        var dataDir = ReadString(config, "Data:Dir")
+            ?? config["MiniInflux:DataPath"]
+            ?? Environment.GetEnvironmentVariable("MINI_INFLUX_DATA")
+            ?? "./data";
+
+        var httpEnabled = ReadBool(config, true, "Http:Enabled");
+        var bindAddress = ReadString(config, "Http:BindAddress");
+        var urls = !string.IsNullOrWhiteSpace(bindAddress)
+            ? BuildUrlFromBindAddress(bindAddress!)
+            : config["Urls"] ?? "http://0.0.0.0:8086";
+
         return new MiniInfluxOptions
         {
-            DataPath = config["MiniInflux:DataPath"] ?? Environment.GetEnvironmentVariable("MINI_INFLUX_DATA") ?? "./data",
-            FlushThreshold = ReadInt(config, "MiniInflux:FlushThreshold", 50_000),
-            Urls = config["Urls"] ?? "http://0.0.0.0:8086",
+            DataPath = dataDir,
+            FlushThreshold = ReadInt(config, 50_000, "MiniInflux:FlushThreshold"),
+            Urls = urls,
+            Data = new DataOptions
+            {
+                Dir = dataDir,
+                QueryLogEnabled = ReadBool(config, true, "Data:QueryLogEnabled")
+            },
+            Http = new HttpOptions
+            {
+                Enabled = httpEnabled,
+                BindAddress = bindAddress ?? "0.0.0.0:8086",
+                AuthEnabled = ReadBool(config, ReadBool(config, false, "Auth:Enabled"), "Http:AuthEnabled"),
+                LogEnabled = ReadBool(config, true, "Http:LogEnabled"),
+                SuppressWriteLog = ReadBool(config, false, "Http:SuppressWriteLog"),
+                AccessLogPath = ReadString(config, "Http:AccessLogPath"),
+                AccessLogStatusFilters = ReadStringList(config, "Http:AccessLogStatusFilters"),
+                WriteTracing = ReadBool(config, false, "Http:WriteTracing")
+            },
+            Logging = new LoggingOptions
+            {
+                Level = ReadString(config, "Logging:Level", "Information")!,
+                ConsoleEnabled = ReadBool(config, true, "Logging:ConsoleEnabled"),
+                FileEnabled = ReadBool(config, false, "Logging:FileEnabled"),
+                FilePath = ReadString(config, "Logging:FilePath", "./logs/miniinflux.log")!
+            },
             Wal = new WalOptions
             {
-                Fsync = ReadBool(config, "Wal:Fsync", true),
-                FsyncIntervalMs = ReadInt(config, "Wal:FsyncIntervalMs", 1000),
-                MaxWalFileBytes = ReadLong(config, "Wal:MaxWalFileBytes", 16 * 1024 * 1024)
+                Fsync = ReadBool(config, true, "Wal:Fsync"),
+                FsyncIntervalMs = ReadInt(config, 1000, "Wal:FsyncIntervalMs"),
+                MaxWalFileBytes = ReadLong(config, 16 * 1024 * 1024, "Wal:MaxWalFileBytes")
             },
             Write = new WriteOptions
             {
-                QueueCapacity = ReadInt(config, "Write:QueueCapacity", 100_000),
-                BatchSize = ReadInt(config, "Write:BatchSize", 10_000),
-                MaxRequestBodyBytes = ReadLong(config, "Write:MaxRequestBodyBytes", 26_214_400)
+                QueueCapacity = ReadInt(config, 100_000, "Write:QueueCapacity"),
+                BatchSize = ReadInt(config, 10_000, "Write:BatchSize"),
+                MaxRequestBodyBytes = ReadLong(config, 26_214_400, "Write:MaxRequestBodyBytes")
             },
             Storage = new StorageOptions
             {
-                RpCheckIntervalMs = ReadInt(config, "Storage:RpCheckIntervalMs", 60_000),
-                MaxSeriesPerDatabase = ReadLong(config, "Storage:MaxSeriesPerDatabase", 10_000_000),
-                MaxFieldsPerMeasurement = ReadInt(config, "Storage:MaxFieldsPerMeasurement", 1024),
-                MaxResponseRows = ReadInt(config, "Storage:MaxResponseRows", 100_000),
-                MaxQueryPoints = ReadInt(config, "Storage:MaxQueryPoints", 1_000_000),
-                MaxBufferPoints = ReadLong(config, "Storage:MaxBufferPoints", 1_000_000),
-                MaxQueryDurationMs = ReadInt(config, "Storage:MaxQueryDurationMs", 0),
-                MaxBufferBytes = ReadLong(config, "Storage:MaxBufferBytes", 0),
-                MaxQueryMemoryBytes = ReadLong(config, "Storage:MaxQueryMemoryBytes", 0)
+                RpCheckIntervalMs = ReadInt(config, 60_000, "Storage:RpCheckIntervalMs"),
+                MaxSeriesPerDatabase = ReadLong(config, 10_000_000, "Storage:MaxSeriesPerDatabase"),
+                MaxFieldsPerMeasurement = ReadInt(config, 1024, "Storage:MaxFieldsPerMeasurement"),
+                MaxResponseRows = ReadInt(config, 100_000, "Storage:MaxResponseRows"),
+                MaxQueryPoints = ReadInt(config, 1_000_000, "Storage:MaxQueryPoints"),
+                MaxBufferPoints = ReadLong(config, 1_000_000, "Storage:MaxBufferPoints"),
+                MaxQueryDurationMs = ReadInt(config, 0, "Storage:MaxQueryDurationMs"),
+                MaxBufferBytes = ReadLong(config, 0, "Storage:MaxBufferBytes"),
+                MaxQueryMemoryBytes = ReadLong(config, 0, "Storage:MaxQueryMemoryBytes")
             },
             Auth = new AuthOptions
             {
-                Enabled = ReadBool(config, "Auth:Enabled", false),
+                Enabled = ReadBool(config, false, "Auth:Enabled", "Http:AuthEnabled"),
                 Users = authUsers
             },
             Tls = new TlsOptions
             {
-                Enabled = ReadBool(config, "Tls:Enabled", false),
-                Port = ReadInt(config, "Tls:Port", 8087),
+                Enabled = ReadBool(config, false, "Tls:Enabled"),
+                Port = ReadInt(config, 8087, "Tls:Port"),
                 CertPath = config["Tls:CertPath"],
                 Password = config["Tls:Password"]
             }
         };
     }
 
-    private static int ReadInt(IConfiguration config, string key, int fallback) =>
-        int.TryParse(config[key], out var value) ? value : fallback;
+    private static string? ReadString(IConfiguration config, params string[] keys)
+    {
+        foreach (var key in keys)
+            if (!string.IsNullOrWhiteSpace(key) && !string.IsNullOrWhiteSpace(config[key]))
+                return config[key];
+        return null;
+    }
 
-    private static long ReadLong(IConfiguration config, string key, long fallback) =>
-        long.TryParse(config[key], out var value) ? value : fallback;
+    private static string? ReadString(IConfiguration config, string key, string? fallback)
+    {
+        var value = config[key];
+        return string.IsNullOrWhiteSpace(value) ? fallback : value;
+    }
 
-    private static bool ReadBool(IConfiguration config, string key, bool fallback) =>
-        bool.TryParse(config[key], out var value) ? value : fallback;
+    private static int ReadInt(IConfiguration config, int fallback, params string[] keys)
+    {
+        foreach (var key in keys)
+            if (int.TryParse(config[key], out var value))
+                return value;
+        return fallback;
+    }
+
+    private static long ReadLong(IConfiguration config, long fallback, params string[] keys)
+    {
+        foreach (var key in keys)
+            if (long.TryParse(config[key], out var value))
+                return value;
+        return fallback;
+    }
+
+    private static bool ReadBool(IConfiguration config, bool fallback, params string[] keys)
+    {
+        foreach (var key in keys)
+            if (bool.TryParse(config[key], out var value))
+                return value;
+        return fallback;
+    }
+
+    private static List<string> ReadStringList(IConfiguration config, string key)
+    {
+        var section = config.GetSection(key);
+        var values = section.GetChildren()
+            .Select(child => child.Value)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Cast<string>()
+            .ToList();
+
+        if (values.Count > 0)
+            return values;
+
+        var scalar = config[key];
+        if (string.IsNullOrWhiteSpace(scalar))
+            return [];
+
+        return scalar
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .ToList();
+    }
+
+    private static string BuildUrlFromBindAddress(string bindAddress)
+    {
+        var trimmed = bindAddress.Trim();
+        if (trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            return trimmed;
+
+        if (trimmed.StartsWith(':'))
+            return $"http://0.0.0.0{trimmed}";
+
+        if (!trimmed.Contains(':'))
+            return $"http://{trimmed}:8086";
+
+        return $"http://{trimmed}";
+    }
+}
+
+public sealed class DataOptions
+{
+    public string Dir { get; init; } = "./data";
+    public bool QueryLogEnabled { get; init; } = true;
+}
+
+public sealed class HttpOptions
+{
+    public bool Enabled { get; init; } = true;
+    public string BindAddress { get; init; } = "0.0.0.0:8086";
+    public bool AuthEnabled { get; init; }
+    public bool LogEnabled { get; init; } = true;
+    public bool SuppressWriteLog { get; init; }
+    public string? AccessLogPath { get; init; }
+    public List<string> AccessLogStatusFilters { get; init; } = [];
+    public bool WriteTracing { get; init; }
+}
+
+public sealed class LoggingOptions
+{
+    public string Level { get; init; } = "Information";
+    public bool ConsoleEnabled { get; init; } = true;
+    public bool FileEnabled { get; init; }
+    public string FilePath { get; init; } = "./logs/miniinflux.log";
 }
 
 public sealed class WalOptions

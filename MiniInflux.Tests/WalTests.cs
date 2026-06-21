@@ -91,8 +91,7 @@ public class WalTests : IDisposable
             wal.Append("testdb", "autogen", points);
         }
 
-        var fileId = wal.CurrentFileId;
-        wal.Checkpoint(fileId);
+        wal.Checkpoint(wal.CurrentPosition);
 
         // Old files should be deleted, only current file remains
         var walFiles = Directory.GetFiles(walDir, "*.wal");
@@ -150,5 +149,45 @@ public class WalTests : IDisposable
 
         var walFiles = Directory.GetFiles(walDir, "*.wal");
         Assert.True(walFiles.Length > 1, "Should have rotated to multiple WAL files");
+    }
+
+    [Fact]
+    public void Checkpoint_WithRecordOffset_ReplaysOnlyUncheckpointedRecords()
+    {
+        var walDir = Path.Combine(_testDir, "wal");
+        WalPosition secondRecordStart;
+
+        using (var wal = new WalManager(walDir, maxFileBytes: 1024 * 1024))
+        {
+            wal.Append("testdb", "autogen",
+            [
+                new Point
+                {
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string>(),
+                    Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(1) },
+                    TimestampNs = 1
+                }
+            ]);
+
+            secondRecordStart = Assert.Single(wal.Append("testdb", "autogen",
+            [
+                new Point
+                {
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string>(),
+                    Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(2) },
+                    TimestampNs = 2
+                }
+            ]));
+
+            wal.Checkpoint(secondRecordStart);
+        }
+
+        using var reopened = new WalManager(walDir, maxFileBytes: 1024 * 1024);
+        var replayed = reopened.Replay();
+
+        var only = Assert.Single(replayed);
+        Assert.Equal(2, only.Points[0].Fields["value"].Float);
     }
 }
