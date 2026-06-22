@@ -47,6 +47,19 @@ public class HighPriorityFixTests : IDisposable
     }
 
     [Fact]
+    public async Task FirstWrite_AutoCreatesDatabase_AndDefaultRetentionPolicy()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+
+        await engine.WriteAsync("metrics", "autogen", [Point("cpu", "value", 1.0, "server01", 1)]);
+
+        Assert.Contains("metrics", engine.ListDatabases());
+        Assert.Equal("autogen", engine.GetDefaultRpName("metrics"));
+        var point = Assert.Single(engine.ReadAllPoints("metrics", "autogen", "cpu", null, null));
+        Assert.Equal(1.0, point.Fields["value"].Float);
+    }
+
+    [Fact]
     public async Task Select_UsesDefaultRetentionPolicy()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);

@@ -8,6 +8,7 @@
 - `POST /write?db=metrics&precision=ns|u|ms|s|m|h`
 - `GET|POST /query?db=metrics&q=...`
 - Line Protocol 写入
+  - 首次向不存在的 `db` 写入时会自动创建数据库和默认 RP `autogen`
 - InfluxQL 子集：
   - `CREATE DATABASE name`
   - `SHOW DATABASES`
@@ -20,7 +21,22 @@
   - `DROP CONTINUOUS QUERY ... ON db`
 - `SELECT * FROM measurement [WHERE ...] [GROUP BY time(1m)] [ORDER BY time DESC] [LIMIT n]`
   - 支持 `FROM (<select ...>)` 聚合型子查询第一版
-  - 聚合函数：`count,sum,mean,min,max,first,last`
+  - 聚合函数：`count,sum,mean,min,max,first,last,spread,stddev,median,percentile`
+  - 序列函数：`difference,derivative,non_negative_derivative,moving_average,cumulative_sum,integral,elapsed`
+  - 采样/排名函数：`top,bottom,sample`
+  - 已支持 `GROUP BY time(...)`、`GROUP BY tag`、`GROUP BY time(...),tag`
+  - 已支持 `fill(none|null|previous|linear|zero)`、`ORDER BY time DESC`、`SLIMIT`、`SOFFSET`
+- `SELECT ... INTO ...`
+  - 支持写回 `measurement`、`db.measurement`、`db.rp.measurement`
+- 查询保护与观测
+  - chunked query response
+  - query count / error / timeout / rows / scanned points / duration buckets
+  - `MaxQueryDuration`、`MaxQueryPoints`、`MaxResponseRows`、`MaxQueryMemoryBytes`
+- 写入保护
+  - `MaxRequestBodyBytes`、`MaxBufferPoints`、`MaxBufferBytes`
+- 权限与认证
+  - HTTP Basic / query 参数认证
+  - `CREATE USER` / `DROP USER` / `GRANT` / `REVOKE` / `SHOW USERS` / `SHOW GRANTS`
 - WAL + Segment 存储
 - Segment v3 列编码：时间戳 `delta-of-delta/Gorilla`、浮点 `legacy XOR/Gorilla`、整数 delta、bool bit-pack、string 字典
 - 自适应浮点压缩策略：在 `legacy_raw`、`legacy_brotli`、`gorilla_raw` 之间按体积/速度折中选择
@@ -34,6 +50,14 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 ```
 
 默认监听 `http://0.0.0.0:8086`。当前配置同时兼容旧版 `MiniInflux:DataPath`，也支持更接近 InfluxDB 1.x 风格的 `Data`、`Http`、`Logging` 段。
+
+## 近期补齐
+
+- `GROUP BY` 查询已补齐到当前项目范围内的可用状态：`time`、`tag`、`time+tag`、`fill`、`SLIMIT/SOFFSET`、`top/bottom/sample` 组合都已支持。
+- `SELECT INTO` 已支持查询结果回写，并保留纳秒级时间戳。
+- Continuous Query 已支持基础调度、`RESAMPLE EVERY/FOR`、最近 bucket 受控重算，以及按 CQ 维度导出运行指标。
+- 查询执行路径已接入聚合下推、字段范围 predicate skip、regex tag 候选预筛选，以及 segment 内按 `measurement/tag/time` 的列级解压前跳过。
+- 首次写入不存在的数据库时，会自动创建数据库和默认 RP `autogen`，行为对齐 InfluxDB 1.x 常见使用方式。
 
 ## 配置
 
@@ -164,9 +188,14 @@ curl -G http://localhost:8086/query \
   --data-urlencode "q=SELECT mean(value),max(temp) FROM cpu GROUP BY time(1m)"
 ```
 
+说明：
+
+- 如果 `metrics` 还不存在，上面的第一次 `/write?db=metrics` 会自动创建数据库和默认 RP `autogen`。
+- 也仍然支持显式执行 `CREATE DATABASE metrics`，便于与 InfluxDB 1.x 的常见运维流程保持一致。
+
 ## Continuous Query
 
-第一版支持：
+支持：
 
 - `CREATE CONTINUOUS QUERY`
 - `SHOW CONTINUOUS QUERIES`
@@ -222,8 +251,8 @@ DROP CONTINUOUS QUERY cq_cpu_1m ON metrics
 
 当前限制：
 
-- 第一版要求 CQ body 必须是 `SELECT ... INTO ...`
-- 第一版要求 CQ body 必须包含 `GROUP BY time(...)`
+- CQ body 需要是 `SELECT ... INTO ...`
+- CQ body 需要包含 `GROUP BY time(...)`
 - 已支持基础 `RESAMPLE FOR` 窗口，但还不是完整 InfluxDB 全语义
 - 未显式声明 `FOR` 时，会回退到 `ContinuousQuery.InitialBackfillDuration`
 - 可通过 `ContinuousQuery.RecomputeRecentBuckets` 对最近已关闭 bucket 做受控重算
