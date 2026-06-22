@@ -179,6 +179,70 @@ public class MediumPriorityFixTests : IDisposable
     }
 
     [Fact]
+    public async Task GroupByTag_AllowsTopAndBottomFunctions()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 10, "server01", 1),
+            Point("cpu", "value", 30, "server01", 2),
+            Point("cpu", "value", 20, "server01", 3),
+            Point("cpu", "value", 5, "server02", 1),
+            Point("cpu", "value", 15, "server02", 2),
+            Point("cpu", "value", 25, "server02", 3)
+        ]);
+
+        var top = await new QueryExecutor().ExecuteAsync(engine, "testdb", "SELECT top(value, 2) FROM cpu GROUP BY host");
+        Assert.Null(top.Results[0].Error);
+        Assert.Equal(2, top.Results[0].Series!.Count);
+        var server01Top = Assert.Single(top.Results[0].Series!, s => s.Tags!["host"] == "server01");
+        var server02Top = Assert.Single(top.Results[0].Series!, s => s.Tags!["host"] == "server02");
+        Assert.Equal(2, server01Top.Values.Count);
+        Assert.Equal(30.0, server01Top.Values[0][1]);
+        Assert.Equal(20.0, server01Top.Values[1][1]);
+        Assert.Equal(2, server02Top.Values.Count);
+        Assert.Equal(15.0, server02Top.Values[0][1]);
+        Assert.Equal(25.0, server02Top.Values[1][1]);
+
+        var bottom = await new QueryExecutor().ExecuteAsync(engine, "testdb", "SELECT bottom(value, 1) FROM cpu GROUP BY host");
+        Assert.Null(bottom.Results[0].Error);
+        var server01Bottom = Assert.Single(bottom.Results[0].Series!, s => s.Tags!["host"] == "server01");
+        var server02Bottom = Assert.Single(bottom.Results[0].Series!, s => s.Tags!["host"] == "server02");
+        Assert.Single(server01Bottom.Values);
+        Assert.Equal(10.0, server01Bottom.Values[0][1]);
+        Assert.Single(server02Bottom.Values);
+        Assert.Equal(5.0, server02Bottom.Values[0][1]);
+    }
+
+    [Fact]
+    public async Task GroupByTime_AllowsSampleFunction()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1, "server01", 1),
+            Point("cpu", "value", 2, "server01", 2),
+            Point("cpu", "value", 3, "server01", 3),
+            Point("cpu", "value", 10, "server01", 61),
+            Point("cpu", "value", 20, "server01", 62),
+            Point("cpu", "value", 30, "server01", 63)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(
+            engine,
+            "testdb",
+            "SELECT sample(value, 2) FROM cpu WHERE time >= 0 AND time <= 120000000000 GROUP BY time(1m)");
+
+        Assert.Null(response.Results[0].Error);
+        var series = Assert.Single(response.Results[0].Series!);
+        Assert.Equal(4, series.Values.Count);
+        Assert.Equal(1.0, series.Values[0][1]);
+        Assert.Equal(3.0, series.Values[1][1]);
+        Assert.Equal(10.0, series.Values[2][1]);
+        Assert.Equal(30.0, series.Values[3][1]);
+    }
+
+    [Fact]
     public async Task DropSeries_RemovesOnlyMatchingSeries()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);

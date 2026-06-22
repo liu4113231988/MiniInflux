@@ -230,11 +230,7 @@ public sealed class TsdbEngine : IDisposable
                     catch { /* fall through to full read */ }
                 }
 
-                var cols = SegmentReader.ReadSegment(segPath, requestedFields)
-                    .Where(c => (meas == null || c.Measurement == meas)
-                        && (!min.HasValue || c.MaxTime >= min)
-                        && (!max.HasValue || c.MinTime <= max)
-                        && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(c.TagsCanonical))).ToList();
+                var cols = SegmentReader.ReadSegment(segPath, requestedFields, meas, min, max, allowedTagsCanonical);
                 var filtered = new List<SegmentColumn>();
                 foreach (var col in cols)
                 {

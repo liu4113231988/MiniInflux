@@ -37,6 +37,17 @@ public static class SegmentReader
     /// </summary>
     public static List<SegmentColumn> ReadSegment(string path, HashSet<string>? requestedFields)
     {
+        return ReadSegment(path, requestedFields, null, null, null, null);
+    }
+
+    public static List<SegmentColumn> ReadSegment(
+        string path,
+        HashSet<string>? requestedFields,
+        string? measurement,
+        long? minTimeNs,
+        long? maxTimeNs,
+        HashSet<string>? allowedTagsCanonical)
+    {
         var allBytes = File.ReadAllBytes(path);
         if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
         var dataBytes = allBytes.AsSpan(0, allBytes.Length - 4);
@@ -58,14 +69,10 @@ public static class SegmentReader
             var min = br.ReadInt64(); var max = br.ReadInt64();
             br.ReadInt32(); // point count (unused)
 
-            // Projection pushdown: skip reading compressed data for unneeded columns
-            if (requestedFields != null && !requestedFields.Contains(f))
+            // Projection and predicate pushdown: skip reading compressed data for irrelevant columns.
+            if (!ShouldReadColumn(requestedFields, measurement, minTimeNs, maxTimeNs, allowedTagsCanonical, m, tags, f, min, max))
             {
-                if (version >= 3)
-                    ms.Position += 4; // timestamp/value codec + compression ids
-                var skipTl = br.ReadInt32(); ms.Position += skipTl;
-                var skipVl = br.ReadInt32(); ms.Position += skipVl;
-                if (version >= 2) { ms.Position += 28; } // 3 doubles + 1 int
+                SkipColumnPayload(version, br, ms);
                 continue;
             }
 
@@ -134,6 +141,43 @@ public static class SegmentReader
         // v1: no version byte, first 4 bytes are columnCount, 5th byte belongs to first column
         ms.Position -= 1;
         return (1, BitConverter.ToInt32(nextBytes, 0));
+    }
+
+    private static bool ShouldReadColumn(
+        HashSet<string>? requestedFields,
+        string? measurement,
+        long? minTimeNs,
+        long? maxTimeNs,
+        HashSet<string>? allowedTagsCanonical,
+        string columnMeasurement,
+        string tagsCanonical,
+        string field,
+        long columnMinTimeNs,
+        long columnMaxTimeNs)
+    {
+        if (requestedFields != null && !requestedFields.Contains(field))
+            return false;
+        if (measurement != null && !string.Equals(columnMeasurement, measurement, StringComparison.Ordinal))
+            return false;
+        if (minTimeNs.HasValue && columnMaxTimeNs < minTimeNs.Value)
+            return false;
+        if (maxTimeNs.HasValue && columnMinTimeNs > maxTimeNs.Value)
+            return false;
+        if (allowedTagsCanonical != null && !allowedTagsCanonical.Contains(tagsCanonical))
+            return false;
+        return true;
+    }
+
+    private static void SkipColumnPayload(byte version, BinaryReader br, MemoryStream ms)
+    {
+        if (version >= 3)
+            ms.Position += 4; // timestamp/value codec + compression ids
+        var skipTl = br.ReadInt32();
+        ms.Position += skipTl;
+        var skipVl = br.ReadInt32();
+        ms.Position += skipVl;
+        if (version >= 2)
+            ms.Position += 28; // 3 doubles + 1 int
     }
 
     private static string ReadString(BinaryReader br)

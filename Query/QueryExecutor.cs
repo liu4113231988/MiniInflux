@@ -452,9 +452,11 @@ public sealed class QueryExecutor
         else
         {
             var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
-            if (!q.GroupByNs.HasValue && q.GroupByTags.Count == 0 && q.Select.Any(s => s.Func != ""))
+            if (!q.GroupByNs.HasValue && q.Select.Any(s => s.Func != ""))
             {
-                var pushedDown = TrySelectFunctionsWithPushdown(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, cancellationToken, report);
+                var pushedDown = q.GroupByTags.Count == 0
+                    ? TrySelectFunctionsWithPushdown(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, cancellationToken, report)
+                    : TryGroupByTagFunctionsWithPushdown(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, cancellationToken, report, resultMeasurement);
                 if (pushedDown != null)
                 {
                     var resultBytes = EstimateQuerySeriesBytes(pushedDown);
@@ -540,9 +542,7 @@ public sealed class QueryExecutor
         var tagNames = q.GroupByTags;
         var items = q.Select.Where(x => x.Func != "").ToList();
         if (items.Count == 0) items = [new("count", "*", "count")];
-
-        if (items.Any(it => it.Func is "top" or "bottom" or "sample"))
-            throw new NotSupportedException("top/bottom/sample with GROUP BY is not supported yet");
+        var hasRowExpandingFunctions = items.Any(IsRowExpandingGroupFunction);
 
         var groups = new Dictionary<(string TagKey, long? BucketTime), List<Point>>();
         foreach (var p in pts)
@@ -576,18 +576,12 @@ public sealed class QueryExecutor
                 series = new QuerySeries { Name = resultMeasurement, Tags = tagsDict, Columns = cols, Values = [] };
                 seriesMap[seriesKey] = series;
             }
-            var row = new List<object?> { Time(key.BucketTime ?? 0) };
-            foreach (var it in items)
-            {
-                var pairs = BuildValuePairs(groupPts, it.Field);
-                var groupValues = pairs.Select(p => p.Value).ToList();
-                var groupTimestamps = pairs.Select(p => p.TimestampNs).ToList();
-                row.Add(Calc(groupValues, it.Func, it.Param, groupTimestamps, it.UnitNs));
-            }
-            series.Values.Add(row);
+
+            foreach (var row in BuildGroupedRows(groupPts, items, key.BucketTime, cancellationToken))
+                series.Values.Add(row);
         }
 
-        if (step.HasValue && q.Fill != FillMode.None && q.MinTimeNs.HasValue && q.MaxTimeNs.HasValue)
+        if (!hasRowExpandingFunctions && step.HasValue && q.Fill != FillMode.None && q.MinTimeNs.HasValue && q.MaxTimeNs.HasValue)
             ApplyFill(seriesMap, q, step.Value, items);
 
         var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
@@ -601,6 +595,65 @@ public sealed class QueryExecutor
         EnsureWithinLimit(seriesList.Sum(s => s.Values.Count));
         return seriesList;
     }
+
+    static List<List<object?>> BuildGroupedRows(List<Point> groupPts, List<SelectItem> items, long? bucketTimeNs, CancellationToken cancellationToken)
+    {
+        if (!items.Any(IsRowExpandingGroupFunction))
+        {
+            var row = new List<object?> { Time(bucketTimeNs ?? 0) };
+            foreach (var it in items)
+            {
+                var pairs = BuildValuePairs(groupPts, it.Field);
+                var groupValues = pairs.Select(p => p.Value).ToList();
+                var groupTimestamps = pairs.Select(p => p.TimestampNs).ToList();
+                row.Add(Calc(groupValues, it.Func, it.Param, groupTimestamps, it.UnitNs));
+            }
+            return [row];
+        }
+
+        var timelines = new List<SortedDictionary<long, object?>>(items.Count);
+        foreach (var item in items)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (IsRowExpandingGroupFunction(item))
+            {
+                timelines.Add(BuildFunctionSeries(groupPts, item));
+                continue;
+            }
+
+            var pairs = BuildValuePairs(groupPts, item.Field);
+            var values = pairs.Select(p => p.Value).ToList();
+            var timestamps = pairs.Select(p => p.TimestampNs).ToList();
+            var scalar = Calc(values, item.Func, item.Param, timestamps, item.UnitNs);
+            var timeline = new SortedDictionary<long, object?>();
+            if (bucketTimeNs.HasValue)
+                timeline[bucketTimeNs.Value] = scalar;
+            timelines.Add(timeline);
+        }
+
+        var allTimes = timelines.SelectMany(t => t.Keys).Distinct().Order().ToList();
+        if (allTimes.Count == 0)
+        {
+            var fallbackTime = bucketTimeNs ?? 0;
+            var row = new List<object?> { Time(fallbackTime) };
+            foreach (var timeline in timelines)
+                row.Add(timeline.TryGetValue(fallbackTime, out var value) ? value : null);
+            return [row];
+        }
+
+        var rows = new List<List<object?>>();
+        foreach (var time in allTimes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var row = new List<object?> { Time(time) };
+            foreach (var timeline in timelines)
+                row.Add(timeline.TryGetValue(time, out var value) ? value : null);
+            rows.Add(row);
+        }
+        return rows;
+    }
+
+    static bool IsRowExpandingGroupFunction(SelectItem item) => item.Func is "top" or "bottom" or "sample";
 
     HashSet<string>? BuildSeriesFilter(TsdbEngine e, string db, ParsedQuery q, QueryExecutionReport report)
     {
@@ -1256,6 +1309,83 @@ public sealed class QueryExecutor
         }];
     }
 
+    List<QuerySeries>? TryGroupByTagFunctionsWithPushdown(
+        TsdbEngine e,
+        string db,
+        string rp,
+        ParsedQuery q,
+        HashSet<string>? requestedFields,
+        HashSet<string>? seriesFilter,
+        CancellationToken cancellationToken,
+        QueryExecutionReport report,
+        string resultMeasurement)
+    {
+        if (q.GroupByTags.Count == 0 || q.GroupByNs.HasValue)
+            return null;
+
+        var items = q.Select.Where(s => s.Func != "").ToList();
+        if (items.Count == 0)
+            return null;
+        if (items.Any(i => i.Func is "difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last"))
+            return null;
+        if (q.FieldFilters.Count > 0)
+            return null;
+        if (items.Any(i => i.Field == "*"))
+            return null;
+
+        var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
+        report.ScannedPoints += bufferPoints.Count;
+
+        var metas = e.ReadSegmentMetadata(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
+        if (metas.Count == 0)
+            return null;
+        if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null))
+            return null;
+        report.ScannedPoints += metas.Sum(m => m.PointCount);
+
+        var groupedMetas = metas.GroupBy(meta =>
+        {
+            var tags = ParseTagsCanonical(meta.TagsCanonical);
+            return BuildGroupByTagKey(tags, q.GroupByTags);
+        }).ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+
+        var groupedBufferPoints = bufferPoints.GroupBy(point => BuildGroupByTagKey(point.Tags, q.GroupByTags))
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+
+        var groupKeys = groupedMetas.Keys.Concat(groupedBufferPoints.Keys).Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        if (groupKeys.Count == 0)
+            return null;
+
+        var result = new List<QuerySeries>();
+        foreach (var groupKey in groupKeys)
+        {
+            groupedMetas.TryGetValue(groupKey, out var groupMetas);
+            groupedBufferPoints.TryGetValue(groupKey, out var groupBufferPoints);
+            groupMetas ??= [];
+            groupBufferPoints ??= [];
+
+            var row = new List<object?> { Time(MaxTime(groupMetas, groupBufferPoints)) };
+            foreach (var item in items)
+            {
+                var relevantMetas = groupMetas.Where(m => m.Field == item.Field).ToList();
+                if (relevantMetas.Count == 0 && !groupBufferPoints.Any(p => p.Fields.ContainsKey(item.Field)))
+                    return null;
+                row.Add(CalcPushdownValue(item.Func, item.Field, relevantMetas, groupBufferPoints));
+            }
+
+            result.Add(new QuerySeries
+            {
+                Name = resultMeasurement,
+                Tags = BuildGroupByTags(groupKey, q.GroupByTags),
+                Columns = ["time", .. items.Select(i => i.Alias)],
+                Values = [row]
+            });
+        }
+
+        report.UsedAggregatePushdown = true;
+        return ApplySeriesWindow(result, q.SeriesOffset, q.SeriesLimit);
+    }
+
     static bool IsFullCoverage(SegmentColumnMeta meta, long? minTimeNs, long? maxTimeNs) =>
         (!minTimeNs.HasValue || minTimeNs.Value <= meta.MinTime) && (!maxTimeNs.HasValue || maxTimeNs.Value >= meta.MaxTime);
 
@@ -1282,6 +1412,44 @@ public sealed class QueryExecutor
             "mean" => CombineMean(metaStats, bufferValues),
             _ => null
         };
+    }
+
+    static string BuildGroupByTagKey(IReadOnlyDictionary<string, string> tags, List<string> groupByTags)
+    {
+        if (groupByTags.Count == 0)
+            return string.Empty;
+        return string.Join("|", groupByTags.Select(tag => tags.TryGetValue(tag, out var value) ? value : ""));
+    }
+
+    static Dictionary<string, string>? BuildGroupByTags(string groupKey, List<string> groupByTags)
+    {
+        if (groupByTags.Count == 0)
+            return null;
+
+        var values = groupKey.Split('|');
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        for (int i = 0; i < groupByTags.Count; i++)
+        {
+            var value = i < values.Length ? values[i] : "";
+            result[groupByTags[i]] = value;
+        }
+        return result;
+    }
+
+    static Dictionary<string, string> ParseTagsCanonical(string tagsCanonical)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (string.IsNullOrEmpty(tagsCanonical))
+            return result;
+
+        foreach (var pair in tagsCanonical.Split(','))
+        {
+            var separator = pair.IndexOf('=');
+            if (separator > 0)
+                result[pair[..separator]] = pair[(separator + 1)..];
+        }
+
+        return result;
     }
 
     static object? CombineMin(List<BlockStats> stats, List<double> bufferValues)

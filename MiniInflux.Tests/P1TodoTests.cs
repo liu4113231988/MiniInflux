@@ -62,6 +62,45 @@ public class P1TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task AggregateQuery_GroupByTag_UsesBlockStatsPushdown()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", 1, "server01"),
+            Point("cpu", 2, "server01"),
+            Point("cpu", 10, "server02"),
+            Point("cpu", 20, "server02")
+        ]);
+        engine.FlushAll();
+
+        var outcome = new QueryExecutor().ExecuteWithReport(
+            engine,
+            "testdb",
+            "SELECT sum(value),count(value),max(value),mean(value) FROM cpu GROUP BY host");
+
+        Assert.True(outcome.Report.UsedAggregatePushdown);
+        var series = outcome.Response.Results[0].Series;
+        Assert.NotNull(series);
+        Assert.Equal(2, series.Count);
+
+        var server01 = Assert.Single(series, s => s.Tags?["host"] == "server01");
+        var server02 = Assert.Single(series, s => s.Tags?["host"] == "server02");
+
+        var row01 = Assert.Single(server01.Values);
+        Assert.Equal(3.0, row01[1]);
+        Assert.Equal(2, row01[2]);
+        Assert.Equal(2.0, row01[3]);
+        Assert.Equal(1.5, row01[4]);
+
+        var row02 = Assert.Single(server02.Values);
+        Assert.Equal(30.0, row02[1]);
+        Assert.Equal(2, row02[2]);
+        Assert.Equal(20.0, row02[3]);
+        Assert.Equal(15.0, row02[4]);
+    }
+
+    [Fact]
     public async Task SampleFunction_ReturnsDeterministicSamples()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);

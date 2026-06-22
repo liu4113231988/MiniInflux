@@ -142,6 +142,54 @@ public class SegmentTests : IDisposable
     }
 
     [Fact]
+    public void ReadSegment_WithColumnPredicatePushdown_SkipsIrrelevantColumnsBeforeDecode()
+    {
+        var points = new List<Point>
+        {
+            new()
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(1.5) },
+                TimestampNs = 1_000
+            },
+            new()
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server02" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(2.5) },
+                TimestampNs = 2_000
+            },
+            new()
+            {
+                Measurement = "mem",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["used"] = FieldValue.FromInteger(1024) },
+                TimestampNs = 3_000
+            }
+        };
+
+        var segPath = Path.Combine(_testDir, "predicate-pushdown.seg");
+        SegmentWriter.WriteSegment(segPath, points);
+
+        var columns = SegmentReader.ReadSegment(
+            segPath,
+            requestedFields: ["value"],
+            measurement: "cpu",
+            minTimeNs: 1_500,
+            maxTimeNs: 2_500,
+            allowedTagsCanonical: ["host=server02"]);
+
+        var column = Assert.Single(columns);
+        Assert.Equal("cpu", column.Measurement);
+        Assert.Equal("host=server02", column.TagsCanonical);
+        Assert.Equal("value", column.Field);
+        Assert.Single(column.Timestamps);
+        Assert.Equal(2_000, column.Timestamps[0]);
+        Assert.Equal(2.5, column.Values[0].Float, 10);
+    }
+
+    [Fact]
     public void ReadLegacyV2Segment_RemainsCompatible()
     {
         var points = new List<Point>
