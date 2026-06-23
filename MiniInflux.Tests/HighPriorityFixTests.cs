@@ -92,14 +92,127 @@ public class HighPriorityFixTests : IDisposable
     }
 
     [Fact]
-    public async Task Delete_WithFieldPredicate_ReturnsExplicitError()
+    public async Task Delete_WithFieldPredicate_DeletesOnlyMatchingPoints()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
-        await engine.WriteAsync("testdb", "autogen", [Point("cpu", "value", 1.0, "server01", 1)]);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1.0, "server01", 1),
+            Point("cpu", "value", 2.0, "server02", 2)
+        ]);
 
-        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "DELETE FROM cpu WHERE value > 0");
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "DELETE FROM cpu WHERE value > 1");
 
-        Assert.Contains("field predicates", response.Results[0].Error);
+        Assert.Null(response.Results[0].Error);
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
+        var point = Assert.Single(points);
+        Assert.Equal("server01", point.Tags["host"]);
+    }
+
+    [Fact]
+    public async Task DropSeries_WithFieldPredicate_DropsOnlyMatchingSeries()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1.0, "server01", 1),
+            Point("cpu", "value", 10.0, "server02", 2),
+            Point("cpu", "value", 20.0, "server02", 3)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "DROP SERIES FROM cpu WHERE value > 5");
+
+        Assert.Null(response.Results[0].Error);
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
+        var point = Assert.Single(points);
+        Assert.Equal("server01", point.Tags["host"]);
+    }
+
+    [Fact]
+    public async Task Delete_WithTagAndFieldPredicate_DeletesOnlyMatchingSubset()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1.0, "server01", 1),
+            Point("cpu", "value", 10.0, "server01", 2),
+            Point("cpu", "value", 10.0, "server02", 3)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "DELETE FROM cpu WHERE host='server01' AND value > 5");
+
+        Assert.Null(response.Results[0].Error);
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+        Assert.Equal(2, points.Count);
+        Assert.Equal("server01", points[0].Tags["host"]);
+        Assert.Equal(1.0, points[0].Fields["value"].AsDouble());
+        Assert.Equal("server02", points[1].Tags["host"]);
+    }
+
+    [Fact]
+    public async Task Delete_WithFieldPredicate_OnFlushedSeries_DoesNotDeleteNonMatchingPoints()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1.0, "server01", 1),
+            Point("cpu", "value", 10.0, "server01", 2)
+        ]);
+        engine.FlushAll();
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "DELETE FROM cpu WHERE value > 5");
+
+        Assert.Null(response.Results[0].Error);
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+        var point = Assert.Single(points);
+        Assert.Equal(1_000_000_000L, point.TimestampNs);
+        Assert.Equal(1.0, point.Fields["value"].AsDouble());
+    }
+
+    [Fact]
+    public async Task Delete_WithFieldPredicate_AppliesToNonDefaultRetentionPolicy()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        engine.CreateDatabase("testdb");
+        engine.Meta.CreateRetentionPolicy("testdb", "archive", 0, false);
+        await engine.WriteAsync("testdb", "archive",
+        [
+            Point("cpu", "value", 1.0, "server01", 1),
+            Point("cpu", "value", 10.0, "server01", 2)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "DELETE FROM cpu WHERE value > 5");
+
+        Assert.Null(response.Results[0].Error);
+        var points = engine.ReadAllPoints("testdb", "archive", "cpu", null, null);
+        var point = Assert.Single(points);
+        Assert.Equal(1.0, point.Fields["value"].AsDouble());
+    }
+
+    [Fact]
+    public async Task DropSeries_WithFieldPredicate_FindsMatchesAcrossRetentionPolicies()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        engine.CreateDatabase("testdb");
+        engine.Meta.CreateRetentionPolicy("testdb", "archive", 0, false);
+        await engine.WriteAsync("testdb", "archive",
+        [
+            Point("cpu", "value", 10.0, "server02", 1)
+        ]);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1.0, "server01", 1)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "DROP SERIES FROM cpu WHERE value > 5");
+
+        Assert.Null(response.Results[0].Error);
+        Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu", null, null));
+        Assert.Empty(engine.ReadAllPoints("testdb", "archive", "cpu", null, null));
     }
 
     [Fact]

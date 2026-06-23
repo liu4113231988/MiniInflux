@@ -110,6 +110,7 @@ public sealed class TsdbEngine : IDisposable
                             // Register schema for each field kind found in segment metadata
                             // SchemaRegistry is idempotent for matching types
                         }
+                        _manifest.AddSegmentToShard(db, shardRp, shard.Id, segFile);
                         _manifest.UpdateIndexes(db, pointsForIndex);
                     }
                     catch (InvalidDataException) { result.SegmentsCorrupted++; }
@@ -243,6 +244,77 @@ public sealed class TsdbEngine : IDisposable
             catch (InvalidDataException) { }
         }
         return DeduplicatePoints(res.OrderBy(x => x.TimestampNs).ToList());
+    }
+
+    public IEnumerable<Point> EnumeratePoints(string db, string rp, string? meas, long? min, long? max,
+        HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, List<FieldFilter>? fieldFilters = null,
+        CancellationToken cancellationToken = default)
+    {
+        List<Point> buffered = [];
+        var lk = GetLock(K(db, rp));
+        lk.EnterReadLock();
+        try
+        {
+            if (_buf.TryGetValue(K(db, rp), out var l))
+            {
+                var bufMatched = l.Select(x => x.Point).Where(p => Match(p, meas, min, max)
+                    && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(SeriesKey.From(p).TagsCanonical)));
+                if (requestedFields != null)
+                    bufMatched = bufMatched.Select(p => new Point
+                    {
+                        Measurement = p.Measurement, Tags = p.Tags, TimestampNs = p.TimestampNs,
+                        Fields = p.Fields.Where(f => requestedFields.Contains(f.Key)).ToDictionary(f => f.Key, f => f.Value)
+                    });
+                buffered.AddRange(bufMatched);
+            }
+        }
+        finally { lk.ExitReadLock(); }
+
+        foreach (var point in buffered.OrderBy(x => x.TimestampNs))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return point;
+        }
+
+        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            List<Point> rebuilt;
+            try
+            {
+                if (meas != null || (min.HasValue && max.HasValue) || (fieldFilters != null && fieldFilters.Count > 0) || allowedTagsCanonical != null)
+                {
+                    try
+                    {
+                        var metas = SegmentReader.ReadMetadata(segPath);
+                        if (meas != null && !metas.Any(m => m.Measurement == meas)) continue;
+                        if (min.HasValue && !metas.Any(m => m.MaxTime >= min.Value)) continue;
+                        if (max.HasValue && !metas.Any(m => m.MinTime <= max.Value)) continue;
+                        if (allowedTagsCanonical != null && !metas.Any(m => allowedTagsCanonical.Contains(m.TagsCanonical))) continue;
+                        if (fieldFilters != null && fieldFilters.Count > 0 && !CouldSegmentMatchFieldFilters(metas, meas, allowedTagsCanonical, fieldFilters))
+                            continue;
+                    }
+                    catch { }
+                }
+
+                var cols = SegmentReader.ReadSegment(segPath, requestedFields, meas, min, max, allowedTagsCanonical);
+                var filtered = new List<SegmentColumn>();
+                foreach (var col in cols)
+                {
+                    if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime)) continue;
+                    var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values);
+                    if (ts.Count > 0) filtered.Add(new SegmentColumn(col.Measurement, col.TagsCanonical, col.Field, col.Kind, ts[0], ts[^1], ts, vals, col.Stats));
+                }
+                rebuilt = Rebuild(filtered, min, max).OrderBy(x => x.TimestampNs).ToList();
+            }
+            catch (InvalidDataException) { continue; }
+
+            foreach (var point in rebuilt)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return point;
+            }
+        }
     }
 
     public IReadOnlyList<string> ListMeasurements(string db)
@@ -385,20 +457,26 @@ public sealed class TsdbEngine : IDisposable
     public void DeleteFromMeasurement(string db, string measurement, long? minTime, long? maxTime)
     {
         _tombstones.AddMeasurementDelete(db, measurement, minTime, maxTime);
-        DeleteBuffered(db, GetDefaultRpName(db), measurement, minTime, maxTime, _ => true);
+        foreach (var rp in _manifest.ListRetentionPolicies(db).Select(r => r.Name).DefaultIfEmpty("autogen"))
+            DeleteBuffered(db, rp, measurement, minTime, maxTime, _ => true);
     }
 
     public void DeleteFromMeasurement(string db, string measurement, long? minTime, long? maxTime, Predicate<Point> predicate)
     {
-        var rp = GetDefaultRpName(db);
-        var matches = ReadAllPoints(db, rp, measurement, minTime, maxTime)
-            .Where(p => predicate(p))
-            .GroupBy(p => SeriesKey.From(p).TagsCanonical);
+        foreach (var rp in _manifest.ListRetentionPolicies(db).Select(r => r.Name).DefaultIfEmpty("autogen"))
+        {
+            var matches = ReadAllPoints(db, rp, measurement, minTime, maxTime)
+                .Where(p => predicate(p))
+                .GroupBy(p => SeriesKey.From(p).TagsCanonical);
 
-        foreach (var group in matches)
-            _tombstones.AddSeriesDelete(db, measurement, group.Key, minTime, maxTime);
+            foreach (var group in matches)
+            {
+                foreach (var point in group)
+                    _tombstones.AddSeriesDelete(db, measurement, group.Key, point.TimestampNs, point.TimestampNs);
+            }
 
-        DeleteBuffered(db, rp, measurement, minTime, maxTime, predicate);
+            DeleteBuffered(db, rp, measurement, minTime, maxTime, predicate);
+        }
     }
 
     public void DropSeries(string db, string? measurement, List<string> tagsCanonical)

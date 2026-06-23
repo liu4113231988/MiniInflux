@@ -47,6 +47,13 @@ public sealed class QueryExecutionOutcome
     public required QueryExecutionReport Report { get; init; }
 }
 
+public sealed class QueryChunkedExecutionOutcome
+{
+    public required IEnumerable<QueryResponse> Responses { get; init; }
+    public required QueryExecutionReport Report { get; init; }
+    public bool UsedStreamingRawSelect { get; init; }
+}
+
 public sealed class QueryExecutor
 {
     private readonly int _maxResponseRows;
@@ -71,6 +78,31 @@ public sealed class QueryExecutor
 
     public Task<QueryResponse> ExecuteAsync(TsdbEngine e, string? db, string q, CancellationToken cancellationToken = default)
         => Task.FromResult(ExecuteWithReport(e, db, q, cancellationToken).Response);
+
+    public QueryChunkedExecutionOutcome ExecuteChunkedWithReport(TsdbEngine e, string? db, string q, int chunkSize, CancellationToken cancellationToken = default)
+    {
+        var report = new QueryExecutionReport();
+        var safeChunkSize = Math.Max(1, chunkSize);
+        ParsedQuery? parsed = null;
+        try { parsed = InfluxQlParser.Parse(q); } catch { }
+
+        if (parsed != null && CanStreamRawSelect(parsed))
+        {
+            return new QueryChunkedExecutionOutcome
+            {
+                Responses = ExecuteStreamingRawSelect(e, db, parsed, safeChunkSize, report, cancellationToken),
+                Report = report,
+                UsedStreamingRawSelect = true
+            };
+        }
+
+        return new QueryChunkedExecutionOutcome
+        {
+            Responses = ExecuteBufferedChunks(e, db, q, safeChunkSize, report, cancellationToken),
+            Report = report,
+            UsedStreamingRawSelect = false
+        };
+    }
 
     public QueryExecutionOutcome ExecuteWithReport(TsdbEngine e, string? db, string q, CancellationToken cancellationToken = default)
     {
@@ -137,6 +169,138 @@ public sealed class QueryExecutor
                 Report = report
             };
         }
+    }
+
+    IEnumerable<QueryResponse> ExecuteBufferedChunks(TsdbEngine e, string? db, string q, int chunkSize, QueryExecutionReport report, CancellationToken cancellationToken)
+    {
+        var outcome = ExecuteWithReport(e, db, q, cancellationToken);
+        CopyReport(outcome.Report, report);
+        foreach (var chunk in ChunkResponse(outcome.Response, chunkSize))
+            yield return chunk;
+    }
+
+    IEnumerable<QueryResponse> ExecuteStreamingRawSelect(TsdbEngine e, string? db, ParsedQuery q, int chunkSize, QueryExecutionReport report, CancellationToken cancellationToken)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var timeoutCts = _maxQueryDurationMs > 0 ? new CancellationTokenSource(_maxQueryDurationMs) : null;
+        using var linkedCts = timeoutCts != null
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
+            : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var enumerator = StreamRawSelectChunks(e, db, q, chunkSize, report, linkedCts.Token).GetEnumerator();
+
+        try
+        {
+            while (true)
+            {
+                QueryResponse? current = null;
+                QueryResponse? error = null;
+                var done = false;
+                try
+                {
+                    if (enumerator.MoveNext())
+                        current = enumerator.Current;
+                    else
+                        done = true;
+                }
+                catch (OperationCanceledException) when (_maxQueryDurationMs > 0 && !cancellationToken.IsCancellationRequested)
+                {
+                    report.TimedOut = true;
+                    report.Error = $"query timed out after {_maxQueryDurationMs} ms";
+                    error = ErrorChunk(report.Error);
+                }
+                catch (OperationCanceledException)
+                {
+                    report.Canceled = true;
+                    report.Error = "query canceled";
+                    error = ErrorChunk(report.Error);
+                }
+                catch (Exception ex)
+                {
+                    report.Error = ex.Message;
+                    error = ErrorChunk(ex.Message);
+                }
+
+                if (error != null)
+                {
+                    yield return error;
+                    yield break;
+                }
+
+                if (done)
+                    yield break;
+
+                yield return current!;
+            }
+        }
+        finally
+        {
+            sw.Stop();
+            report.DurationMs = sw.ElapsedMilliseconds;
+        }
+    }
+
+    IEnumerable<QueryResponse> StreamRawSelectChunks(TsdbEngine e, string? db, ParsedQuery q, int chunkSize, QueryExecutionReport report, CancellationToken cancellationToken)
+    {
+        Req(q.SourceDatabase ?? db);
+        var sourceDb = q.SourceDatabase ?? db!;
+        var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);
+        var resultMeasurement = ResolveResultMeasurementName(q);
+        var requestedFields = BuildRequestedFields(q);
+        var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
+        var fields = ResolveRawFields(e, sourceDb, q, requestedFields);
+        var tags = ResolveRawTags(e, sourceDb, q.Measurement);
+        var cols = new List<string> { "time" };
+        cols.AddRange(tags);
+        cols.AddRange(fields);
+
+        var offset = Math.Max(0, q.Offset ?? 0);
+        var rowLimit = EffectiveRowLimit(q);
+        var skipped = 0;
+        var emitted = 0;
+        var scanned = 0;
+        var chunkRows = new List<List<object?>>(chunkSize);
+        long chunkBytes = EstimateRawSeriesShellBytes(resultMeasurement, cols);
+
+        foreach (var point in e.EnumeratePoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            scanned++;
+            EnsureQueryPointLimit(scanned);
+            report.ScannedPoints = scanned;
+            report.EstimatedInputBytes += EstimatePointBytes(point);
+
+            if (!MatchesTagFilters(point, q.TagFilters) || !MatchesFieldFilters(point, q.FieldFilters))
+                continue;
+
+            if (skipped < offset)
+            {
+                skipped++;
+                continue;
+            }
+
+            if (rowLimit.HasValue && emitted >= rowLimit.Value)
+                break;
+
+            var row = BuildRawRow(point, tags, fields);
+            chunkRows.Add(row);
+            emitted++;
+            report.RowsReturned = emitted;
+            var rowBytes = 32 + row.Sum(EstimateObjectBytes);
+            report.EstimatedResultBytes += rowBytes;
+            chunkBytes += rowBytes;
+            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, EstimatePointBytes(point) + chunkBytes);
+            EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+
+            if (chunkRows.Count >= chunkSize)
+            {
+                yield return RawChunk(resultMeasurement, cols, chunkRows);
+                chunkRows = new List<List<object?>>(chunkSize);
+                chunkBytes = EstimateRawSeriesShellBytes(resultMeasurement, cols);
+            }
+        }
+
+        if (chunkRows.Count > 0 || emitted == 0)
+            yield return RawChunk(resultMeasurement, cols, chunkRows);
     }
 
     List<QuerySeries>? Run(TsdbEngine e, string? db, ParsedQuery q, CancellationToken cancellationToken, QueryExecutionReport report)
@@ -1013,44 +1177,30 @@ public sealed class QueryExecutor
 
     static void Delete(TsdbEngine e, string db, ParsedQuery q)
     {
-        if (q.FieldFilters.Count > 0)
-            throw new NotSupportedException("DELETE with field predicates is not supported yet");
-
-        if (q.TagFilters.Count == 0)
+        if (q.TagFilters.Count == 0 && q.FieldFilters.Count == 0)
         {
             e.DeleteFromMeasurement(db, q.Measurement!, q.MinTimeNs, q.MaxTimeNs);
             return;
         }
 
         e.DeleteFromMeasurement(db, q.Measurement!, q.MinTimeNs, q.MaxTimeNs, p =>
-        {
-            foreach (var f in q.TagFilters)
-            {
-                var tagVal = p.Tags.TryGetValue(f.Key, out var v) ? v : null;
-                switch (f.Op)
-                {
-                    case TagOp.Eq: if (tagVal != f.Value) return false; break;
-                    case TagOp.Neq: if (tagVal == f.Value) return false; break;
-                    case TagOp.Regex: if (tagVal == null || !Regex.IsMatch(tagVal, f.Value)) return false; break;
-                    case TagOp.NotRegex: if (tagVal != null && Regex.IsMatch(tagVal, f.Value)) return false; break;
-                }
-            }
-            return true;
-        });
+            MatchesTagFilters(p, q.TagFilters) && MatchesFieldFilters(p, q.FieldFilters));
     }
 
     static void DropSeries(TsdbEngine e, string db, ParsedQuery q)
     {
-        if (q.FieldFilters.Count > 0)
-            throw new NotSupportedException("DROP SERIES with field predicates is not supported");
-
         var measurements = q.Measurement != null ? new[] { q.Measurement } : e.ListMeasurements(db);
         foreach (var measurement in measurements)
         {
-            var points = e.ReadAllPoints(db, e.GetDefaultRpName(db), measurement, q.MinTimeNs, q.MaxTimeNs);
+            var points = e.Meta.ListRetentionPolicies(db)
+                .Select(r => r.Name)
+                .DefaultIfEmpty(e.GetDefaultRpName(db))
+                .SelectMany(rp => e.ReadAllPoints(db, rp, measurement, q.MinTimeNs, q.MaxTimeNs, fieldFilters: q.FieldFilters))
+                .ToList();
             points = ApplyTagFilters(points, q.TagFilters);
+            points = ApplyFieldFilters(points, q.FieldFilters);
             var series = points.Select(p => SeriesKey.From(p).TagsCanonical).Distinct(StringComparer.Ordinal).ToList();
-            if (q.TagFilters.Count == 0 && series.Count == 0)
+            if (q.TagFilters.Count == 0 && q.FieldFilters.Count == 0 && series.Count == 0)
                 series = e.ListSeries(db, measurement).ToList();
             e.DropSeries(db, measurement, series);
         }
@@ -1480,6 +1630,185 @@ public sealed class QueryExecutor
 
     static int CountRows(QueryResponse response) =>
         response.Results.SelectMany(r => r.Series ?? []).Sum(s => s.Values.Count);
+
+    static bool CanStreamRawSelect(ParsedQuery q) =>
+        q.Kind == QueryKind.Select
+        && q.Subquery == null
+        && q.GroupByNs == null
+        && q.GroupByTags.Count == 0
+        && q.Select.All(s => string.IsNullOrEmpty(s.Func))
+        && string.IsNullOrWhiteSpace(q.IntoTarget)
+        && !q.Desc
+        && !string.IsNullOrWhiteSpace(q.Measurement);
+
+    static HashSet<string>? BuildRequestedFields(ParsedQuery q)
+    {
+        HashSet<string>? requestedFields = null;
+        if (q.Select.Count > 0 && !(q.Select.Count == 1 && q.Select[0].Field == "*"))
+            requestedFields = new HashSet<string>(q.Select.Select(x => x.Field), StringComparer.Ordinal);
+        if (requestedFields != null)
+            foreach (var filter in q.FieldFilters)
+                requestedFields.Add(filter.Field);
+        return requestedFields;
+    }
+
+    static List<string> ResolveRawFields(TsdbEngine e, string db, ParsedQuery q, HashSet<string>? requestedFields)
+    {
+        if (requestedFields != null)
+            return q.Select.Select(x => x.Field).Distinct(StringComparer.Ordinal).ToList();
+
+        return e.Schema.GetFields(db, q.Measurement)
+            .Select(x => x.FieldKey)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+    }
+
+    static List<string> ResolveRawTags(TsdbEngine e, string db, string? measurement) =>
+        e.ListSeries(db, measurement)
+            .SelectMany(ParseTagsCanonical)
+            .Select(kv => kv.Key)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+    int? EffectiveRowLimit(ParsedQuery q)
+    {
+        if (_maxResponseRows <= 0)
+            return q.Limit;
+        return Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+    }
+
+    static bool MatchesTagFilters(Point point, List<TagFilter> filters)
+    {
+        if (filters.Count == 0) return true;
+        foreach (var f in filters)
+        {
+            var tagVal = point.Tags.TryGetValue(f.Key, out var v) ? v : null;
+            switch (f.Op)
+            {
+                case TagOp.Eq: if (tagVal != f.Value) return false; break;
+                case TagOp.Neq: if (tagVal == f.Value) return false; break;
+                case TagOp.Regex: if (tagVal == null || !Regex.IsMatch(tagVal, f.Value)) return false; break;
+                case TagOp.NotRegex: if (tagVal != null && Regex.IsMatch(tagVal, f.Value)) return false; break;
+            }
+        }
+        return true;
+    }
+
+    static bool MatchesFieldFilters(Point point, List<FieldFilter> filters)
+    {
+        if (filters.Count == 0) return true;
+        foreach (var f in filters)
+        {
+            if (!point.Fields.TryGetValue(f.Field, out var fv)) return false;
+            var numVal = fv.AsDouble();
+            if (!numVal.HasValue) return false;
+            var ok = f.Op switch
+            {
+                FieldOp.Eq => Math.Abs(numVal.Value - f.Value) < 1e-9,
+                FieldOp.Neq => Math.Abs(numVal.Value - f.Value) >= 1e-9,
+                FieldOp.Gt => numVal.Value > f.Value,
+                FieldOp.Gte => numVal.Value >= f.Value,
+                FieldOp.Lt => numVal.Value < f.Value,
+                FieldOp.Lte => numVal.Value <= f.Value,
+                _ => false
+            };
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    static List<object?> BuildRawRow(Point point, List<string> tags, List<string> fields)
+    {
+        var row = new List<object?> { Time(point.TimestampNs) };
+        foreach (var tag in tags)
+            row.Add(point.Tags.TryGetValue(tag, out var value) ? value : null);
+        foreach (var field in fields)
+            row.Add(point.Fields.TryGetValue(field, out var value) ? value.ToObject() : null);
+        return row;
+    }
+
+    static QueryResponse RawChunk(string measurement, List<string> columns, List<List<object?>> rows) => new()
+    {
+        Results =
+        [
+            new QueryResult
+            {
+                StatementId = 0,
+                Series = [new QuerySeries { Name = measurement, Columns = [.. columns], Values = rows }]
+            }
+        ]
+    };
+
+    static QueryResponse ErrorChunk(string error) => new()
+    {
+        Results = [new QueryResult { StatementId = 0, Error = error }]
+    };
+
+    static IEnumerable<QueryResponse> ChunkResponse(QueryResponse result, int chunkSize)
+    {
+        foreach (var queryResult in result.Results)
+        {
+            if (queryResult.Series == null || queryResult.Series.Count == 0)
+            {
+                yield return new QueryResponse { Results = [new QueryResult { StatementId = queryResult.StatementId, Error = queryResult.Error }] };
+                continue;
+            }
+
+            foreach (var series in queryResult.Series)
+            {
+                if (series.Values.Count == 0)
+                {
+                    yield return new QueryResponse { Results = [new QueryResult { StatementId = queryResult.StatementId, Series = [CloneSeries(series, [])], Error = queryResult.Error }] };
+                    continue;
+                }
+
+                for (int i = 0; i < series.Values.Count; i += chunkSize)
+                {
+                    yield return new QueryResponse
+                    {
+                        Results =
+                        [
+                            new QueryResult
+                            {
+                                StatementId = queryResult.StatementId,
+                                Error = queryResult.Error,
+                                Series = [CloneSeries(series, series.Values.Skip(i).Take(chunkSize).ToList())]
+                            }
+                        ]
+                    };
+                }
+            }
+        }
+    }
+
+    static QuerySeries CloneSeries(QuerySeries series, List<List<object?>> values) => new()
+    {
+        Name = series.Name,
+        Tags = series.Tags == null ? null : new Dictionary<string, string>(series.Tags, StringComparer.Ordinal),
+        Columns = [.. series.Columns],
+        Values = values
+    };
+
+    static long EstimateRawSeriesShellBytes(string measurement, List<string> columns) =>
+        96 + EstimateStringBytes(measurement) + columns.Sum(col => 16 + EstimateStringBytes(col));
+
+    static void CopyReport(QueryExecutionReport source, QueryExecutionReport target)
+    {
+        target.ScannedPoints = source.ScannedPoints;
+        target.RowsReturned = source.RowsReturned;
+        target.DurationMs = source.DurationMs;
+        target.TimedOut = source.TimedOut;
+        target.Canceled = source.Canceled;
+        target.UsedAggregatePushdown = source.UsedAggregatePushdown;
+        target.UsedRegexPushdown = source.UsedRegexPushdown;
+        target.UsedSeriesIndexPushdown = source.UsedSeriesIndexPushdown;
+        target.EstimatedInputBytes = source.EstimatedInputBytes;
+        target.EstimatedResultBytes = source.EstimatedResultBytes;
+        target.PeakEstimatedMemoryBytes = source.PeakEstimatedMemoryBytes;
+        target.Error = source.Error;
+    }
 
     static void Req(string? db)
     {

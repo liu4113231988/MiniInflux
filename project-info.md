@@ -3,19 +3,57 @@
 
 # MiniInflux.Net10 项目状态
 
-MiniInflux.Net10 是一个基于 .NET 10 / ASP.NET Core Minimal API 的轻量级 InfluxDB 1.x 兼容子集时序数据库。当前项目已经不只是最初的 Demo：核心写入、WAL、segment 存储、轻量索引、基础查询、聚合、删除标记、诊断指标和单元测试都已经具备。
+更新时间：2026-06-22
+
+MiniInflux.Net10 是一个基于 .NET 10 / ASP.NET Core Minimal API 的轻量级 InfluxDB 1.x 兼容子集时序数据库。当前项目已经具备单节点时序数据库的完整主链路：HTTP 接口、Line Protocol 写入、写入队列、WAL、segment 存储、schema、manifest/index、shard/retention、compaction、InfluxQL 子集、查询保护、权限、诊断指标、管理 CLI 和回归测试。
 
 当前验证状态：
 
 ```text
-dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo
-结果：81 passed, 0 failed, 0 skipped
-备注：高/中优先级第一轮修复后已无 xUnit1031 analyzer 警告输出。
+dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo --no-restore
+结果：命令退出码 0
+测试用例：源码中共 133 个 [Fact]/[Theory] 测试标记
+备注：本次环境没有打印详细 passed 汇总，因此以退出码和测试标记数量记录。
 ```
 
 ***
 
-# 一、已完成功能
+# 一、项目完整性评估
+
+## 1. 结论
+
+当前项目不再只是 Demo，已经是一个完整可运行的单节点 InfluxDB 1.x 兼容子集。核心数据路径完整，启动恢复、写入持久化、查询执行、删除/压缩、诊断和离线运维都有对应实现。
+
+整体完整性判断：
+
+```text
+主写入链路：完整
+主查询链路：完整
+持久化恢复：完整
+单节点运维：基本完整
+InfluxDB 1.x 兼容性：子集可用，但不是完整替代
+生产级长期运行：具备基础保护，还需要继续打磨边界语义、压测和运维安全性
+```
+
+## 2. 当前最需要注意的文档差异
+
+`README.md` 是当前最接近源码状态的说明；旧版 `project-info.md` 中仍保留了一些已经完成的风险项，例如：
+
+```text
+WAL 仍是文件粒度 checkpoint
+完整多层 LSM compaction 还没有
+查询结果未支持 chunked response
+regex tag predicate 仍只能读点后过滤
+auth 仍是全局用户校验
+backup / restore 缺少元信息校验
+字节级内存限制未接入
+```
+
+这些能力现在都已经至少完成第一版，应从“当前最大风险”中移出。
+
+***
+
+# 二、已完成功能
 
 ## 1. HTTP API
 
@@ -25,13 +63,14 @@ dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo
 GET  /ping
 GET  /health
 GET  /debug/stats
+GET  /debug/benchmark
 GET  /metrics
 POST /write?db=xxx&rp=xxx&precision=...
 GET  /query?db=xxx&q=...
 POST /query
 ```
 
-写入接口支持 gzip body；写入队列满或 series cardinality 超限时会返回 429。
+写入接口支持 gzip body。写入队列满、请求体过大、buffer 超限或 series cardinality 超限时会返回受控错误。
 
 ## 2. Line Protocol 写入
 
@@ -44,9 +83,10 @@ field set
 timestamp
 多行批量写入
 precision: ns, u/us, ms, s, m, h
+首次写入不存在的 db 时自动创建数据库和默认 RP autogen
 ```
 
-同一批次内的 duplicate point 已按 InfluxDB 语义处理：
+同一批次内 duplicate point 已按 InfluxDB 语义处理：
 
 ```text
 same measurement + same tag set + same timestamp
@@ -62,18 +102,19 @@ same measurement + same tag set + same timestamp
 HTTP write -> bounded channel -> batch worker -> TsdbEngine
 ```
 
-配置项包括：
+关键配置：
 
-```json
-{
-  "Write": {
-    "QueueCapacity": 100000,
-    "BatchSize": 10000
-  }
-}
+```text
+Write.QueueCapacity
+Write.BatchSize
+Write.MaxRequestBodyBytes
+Storage.MaxBufferPoints
+Storage.MaxBufferBytes
+Storage.MaxSeriesPerDatabase
+Storage.MaxFieldsPerMeasurement
 ```
 
-## 4. WAL 可靠性基础
+## 4. WAL 可靠性
 
 已实现：
 
@@ -81,14 +122,15 @@ HTTP write -> bounded channel -> batch worker -> TsdbEngine
 WAL append
 WAL replay/recovery
 WAL file rotation
-WAL checkpoint
+record offset checkpoint
 WAL record CRC32
-WAL fsync interval
+WAL fsync interval / group commit
+checkpoint 原子写入
 ```
 
-启动时 `Program.cs` 会调用 `engine.Recover()`，从 WAL 和已有 segment 重建状态。
+启动时会先应用 pending restore，再调用 `engine.Recover()` 从 WAL 和已有 segment 重建状态。
 
-## 5. Segment 存储
+## 5. Segment 存储与压缩
 
 已实现：
 
@@ -104,20 +146,19 @@ segment reader
 进程退出 flush
 ```
 
-## 6. 压缩编码
-
-已实现：
+Segment v3 已支持：
 
 ```text
-timestamp delta-of-delta
+timestamp delta-of-delta / Gorilla
 integer delta + ZigZag + Varint
-double XOR
+double legacy XOR / Gorilla
 bool bit-pack
 string dictionary
 Brotli block compression
+adaptive float codec strategy
 ```
 
-## 7. Schema 管理
+## 6. Schema 管理
 
 已实现 `SchemaRegistry`：
 
@@ -130,7 +171,7 @@ schema 持久化
 
 写入字段类型冲突会返回 400。
 
-## 8. Manifest / 轻量索引
+## 7. Manifest / 索引
 
 已实现 `Manifest`，包含：
 
@@ -142,17 +183,22 @@ segment manifest
 measurement index
 series index
 tag inverted index
+continuous query metadata
 ```
 
-查询已具备基础的：
+查询已具备：
 
 ```text
 time range pushdown
 measurement metadata skip
 projection pushdown / column pruning
+field range predicate skip
+tag-series inverted index pushdown
+regex tag candidate prefilter
+segment 内 measurement/tag/time 列级解压前跳过
 ```
 
-## 9. Shard 与 Retention Policy
+## 8. Shard 与 Retention Policy
 
 已实现：
 
@@ -166,33 +212,41 @@ SHOW RETENTION POLICIES
 retention expiry background cleanup
 ```
 
-## 10. Compaction
+## 9. Compaction
 
-已实现 `Compactor`：
+已实现 `Compactor` 第一版：
 
 ```text
+L0 -> L1 -> L2
+按文件数量触发
+按累计大小触发
 按 shard 合并 segment
-处理 tombstone
+tombstone 应用
 重复点 last-write-wins
 重写合并后的 segment
 后台定时 compaction
+compaction 任务队列和状态指标
 ```
 
-目前属于轻量 L0 合并能力，还不是完整多层 LSM compaction。
+仍可继续增强 overlap-aware compaction policy 和合并时索引重建。
 
-## 11. Tombstone / 删除
+## 10. Tombstone / 删除
 
 已实现：
 
 ```text
 DROP DATABASE
 DROP MEASUREMENT
+DROP SERIES 第一版
+DROP SHARD 第一版
 DELETE FROM measurement WHERE time ...
 tombstone 持久化
 compaction 时清理被删除数据
 ```
 
-## 12. InfluxQL 子集
+当前 `DELETE` / `DROP SERIES` 已支持 field predicate 第一版；更深的兼容性工作主要在复杂谓词组合和 InfluxDB 1.x 行为对照。
+
+## 11. InfluxQL 子集
 
 已实现：
 
@@ -203,21 +257,32 @@ SHOW MEASUREMENTS;
 SHOW FIELD KEYS;
 SHOW TAG KEYS FROM cpu;
 SHOW TAG VALUES FROM cpu WITH KEY = host;
+SHOW SERIES;
+SHOW SERIES CARDINALITY;
+SHOW MEASUREMENT CARDINALITY;
+SHOW TAG VALUES CARDINALITY;
 CREATE RETENTION POLICY rp ON db DURATION 7d REPLICATION 1 DEFAULT;
 ALTER RETENTION POLICY rp ON db DURATION 30d DEFAULT;
 DROP RETENTION POLICY rp ON db;
 SHOW RETENTION POLICIES ON db;
+CREATE CONTINUOUS QUERY ... BEGIN SELECT ... INTO ... END;
+SHOW CONTINUOUS QUERIES;
+DROP CONTINUOUS QUERY ... ON db;
 DROP DATABASE metrics;
 DROP MEASUREMENT cpu;
+DROP SERIES FROM cpu WHERE host = 's1';
+DROP SHARD 1;
 DELETE FROM cpu WHERE time < ...;
 SELECT * FROM cpu LIMIT 10;
 SELECT value,temp FROM cpu WHERE time >= ... AND time <= ...;
 SELECT mean(value),max(temp) FROM cpu GROUP BY time(1m);
+SELECT mean("max") FROM (SELECT max(value) FROM cpu GROUP BY time(10s)) GROUP BY time(1m);
+SELECT mean(value) INTO cpu_1m FROM cpu GROUP BY time(1m),host;
 ```
 
-## 13. WHERE 过滤
+## 12. WHERE / GROUP BY / fill
 
-已支持：
+WHERE 已支持：
 
 ```sql
 WHERE time >= ... AND time <= ...
@@ -229,25 +294,22 @@ WHERE value > 10
 WHERE temp <= 40
 ```
 
-`=` / `!=` tag predicate 已能通过 tag-series inverted index 先缩小候选 series；regex predicate 仍在读取点之后过滤。
-
-## 14. GROUP BY / fill
-
-已支持：
+GROUP BY / fill 已支持：
 
 ```sql
 GROUP BY time(1m)
 GROUP BY host
 GROUP BY time(1m), host
+fill(none)
 fill(null)
 fill(0)
 fill(previous)
 fill(linear)
 ```
 
-`fill(linear)` 已基于前后有效 bucket 对数值聚合列做线性插值。
+同时已支持 `ORDER BY time DESC`、`LIMIT`、`OFFSET`、`SLIMIT`、`SOFFSET` 的基础组合。
 
-## 15. 聚合函数
+## 13. 聚合、序列、采样函数
 
 已实现：
 
@@ -263,40 +325,115 @@ spread
 stddev
 median
 percentile(field, n)
+difference
 derivative
 non_negative_derivative
-difference
-cumulative_sum
 moving_average
+cumulative_sum
+integral
+elapsed
+top
+bottom
+sample
 ```
 
-其中 `derivative`、`difference`、`moving_average` 等高级函数目前是简化实现，更接近按 group 内值计算的基础版本，不是完整 InfluxQL 语义。
+其中 `derivative`、`difference`、`moving_average`、`integral`、`elapsed` 等高级函数仍是兼容子集实现，不追求完整 InfluxQL 所有边角语义。
 
-## 16. 诊断与指标
+## 14. 查询保护与观测
+
+已实现：
+
+```text
+chunked query response
+MaxQueryDurationMs
+MaxQueryPoints
+MaxResponseRows
+MaxQueryMemoryBytes
+query count
+query error count
+query timeout count
+query rows returned
+query scanned points
+query duration buckets
+query memory estimate metrics
+```
+
+## 15. 权限与认证
+
+已实现：
+
+```text
+HTTP Basic 认证
+query 参数认证
+本地 auth store
+密码哈希存储，兼容旧明文记录升级
+query / write / admin 路由授权校验
+CREATE USER
+DROP USER
+GRANT
+REVOKE
+SHOW USERS
+SHOW GRANTS
+```
+
+当前授权粒度到 database 级，后续可扩展到 retention policy / measurement 级。
+
+## 16. Continuous Query
+
+已实现：
+
+```text
+CREATE CONTINUOUS QUERY
+SHOW CONTINUOUS QUERIES
+DROP CONTINUOUS QUERY
+后台定时调度
+GROUP BY time(...) bucket 调度
+SELECT ... INTO ... 自动回写
+执行进度持久化
+RESAMPLE EVERY
+RESAMPLE FOR 第一版
+InitialBackfillDuration
+RecomputeRecentBuckets
+按 CQ 维度导出运行指标
+```
+
+当前限制是 CQ body 必须是 `SELECT ... INTO ...`，并且必须包含 `GROUP BY time(...)`。
+
+## 17. 诊断、日志与配置
 
 已实现：
 
 ```text
 GET /health
 GET /debug/stats
+GET /debug/benchmark
 GET /metrics
+Prometheus text format
+应用日志
+访问日志
+按状态码筛选访问日志
+write tracing
+query logging
+TLS 配置第一版
 ```
 
-`/metrics` 输出 Prometheus text format。
-
-## 17. 并发控制与限制
+## 18. 管理 CLI
 
 已实现：
 
 ```text
-per db/rp ReaderWriterLockSlim
-global lock 管理 buffer/series state
-MaxSeriesPerDatabase
-MaxFieldsPerMeasurement
-bounded write queue
+benchmark
+inspect wal
+inspect segment
+repair
+compact
+backup
+restore
 ```
 
-## 18. AOT 兼容设计
+`backup` / `restore` 已支持备份元信息、文件长度、SHA256 校验和 pending restore 边界。
+
+## 19. AOT 兼容设计
 
 已实现：
 
@@ -309,7 +446,7 @@ Minimal API Slim Builder
 不依赖动态代理
 ```
 
-## 19. 测试体系
+## 20. 测试体系
 
 已有 xUnit 测试工程，覆盖：
 
@@ -324,48 +461,45 @@ SchemaRegistry
 Index / Manifest
 Duplicate point
 Aggregation
+P0/P1/P2 todo 回归项
+Configuration / logging
+Management CLI
+Continuous Query
+AuthStore
+Backup / Restore
+恢复 / 备份 / compaction 故障注入
 ```
 
-当前测试数量：81。
+当前源码中共有 139 个 `[Fact]` / `[Theory]` 测试标记。
 
 ***
 
-# 二、待办文档
+# 三、缺少的比较紧急功能
 
-未完成功能、阶段路线和优先级排序已拆分到 [todo-202606.md](D:\workingfold\MiniInflux\todo-202606.md)。
-
-该待办文档只保留仍未完成事项，并按：
+当前没有发现“阻断项目完整运行”的 P0 主链路缺口。比较紧急的工作主要是生产化和兼容性收敛：
 
 ```text
-P0 高优先级
-P1 中优先级
-P2 低优先级
-路线建议
+1. chunked raw SELECT 已完成边扫描边输出第一版；聚合、GROUP BY、Subquery、SELECT INTO 等复杂查询仍需继续降低物化内存峰值。
+2. SELECT INTO / Subquery / Continuous Query 已可用，但复杂 quoted identifier、跨 db/rp、复杂 GROUP BY 组合仍需补边界测试。
+3. Auth 已到 database 级授权，缺少 RP / measurement 级授权、改密和审计日志。
+4. Compaction 已有 L0/L1/L2，但缺少 overlap-aware policy、合并时索引重建和长期压测。
+5. Backup / restore 已有校验、pending restore 和故障注入回归测试，但还不是在线一致性快照协议。
+6. 内存估算是近似模型，仍需按真实 workload 校准。
+7. Benchmark 已有第一版，缺少远端压测、soak test、多 measurement / 高 tag 基数 workload。
 ```
-
-进行整理，便于后续持续推进。
 
 ***
 
-# 三、当前最大风险
+# 四、阶段判断
 
-当前版本最大风险集中在：
+MiniInflux.Net10 当前已经具备“小型单节点时序数据库”的骨架和可用功能面。下一步最值得优先投入的是：
 
 ```text
-1. checkpoint 仍是 WAL 文件粒度，不是 record offset 粒度
-2. 完整多层 LSM compaction 还没有
-3. block-level aggregation pushdown 还没有接入执行计划
-4. 查询结果仍未支持 chunked response
-5. regex tag predicate 仍主要在读取点之后过滤
-6. auth 仍是全局用户校验，缺少细粒度权限 DDL
-7. backup / restore 还是基础目录复制，缺少在线一致性快照协议
-8. 字节级内存限制仍需基于实际对象大小继续增强
+正确性边界
+大查询内存保护
+长期运行压测
+运维恢复语义
+InfluxDB 1.x 兼容性测试矩阵
 ```
 
-***
-
-# 四、结论
-
-MiniInflux.Net10 当前已经具备“小型单节点时序数据库”的骨架：写入、WAL、segment、schema、manifest、shard、retention、compaction、查询、指标和测试都已经成形。
-
-下一步最值得优先投入的是正确性收敛和查询保护，而不是继续扩新功能。具体拆解、优先级和阶段路线见 [todo-202606.md](D:\workingfold\MiniInflux\todo-202606.md)。
+具体拆解、优先级和阶段路线见 [todo-202606.md](D:\workingfold\MiniInflux\todo-202606.md)。

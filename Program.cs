@@ -219,15 +219,15 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     if (options.Data.QueryLogEnabled)
         runtimeLogger.LogInformation("query db={Db} text={Query}", db ?? "-", q);
 
+    if (chunked)
+    {
+        var chunkOutcome = executor.ExecuteChunkedWithReport(tsdbEngine, db, q, chunkSize ?? 5000, request.HttpContext.RequestAborted);
+        return ChunkedResult(chunkOutcome, metrics, runtimeLogger, db);
+    }
+
     var outcome = executor.ExecuteWithReport(tsdbEngine, db, q, request.HttpContext.RequestAborted);
     metrics.RecordQuery(outcome.Report);
-    if (!string.IsNullOrWhiteSpace(outcome.Response.Results.FirstOrDefault()?.Error))
-        runtimeLogger.LogWarning("query failed db={Db} error={Error}", db ?? "-", outcome.Response.Results.First().Error);
-    else
-        runtimeLogger.LogDebug("query completed db={Db} rows={Rows} scanned={ScannedPoints} duration_ms={DurationMs}",
-            db ?? "-", outcome.Report.RowsReturned, outcome.Report.ScannedPoints, outcome.Report.DurationMs);
-    if (chunked)
-        return ChunkedResult(outcome.Response, chunkSize ?? 5000);
+    LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
     return Results.Json(outcome.Response, AppJsonContext.Default.QueryResponse);
 });
 
@@ -396,65 +396,36 @@ static string Unquote(string value)
     return value.Length >= 2 && value[0] == '"' && value[^1] == '"' ? value[1..^1] : value;
 }
 
-static IResult ChunkedResult(QueryResponse result, int chunkSize)
+static IResult ChunkedResult(QueryChunkedExecutionOutcome outcome, MetricsCollector metrics, ILogger logger, string? db)
 {
-    var safeChunkSize = Math.Max(1, chunkSize);
     return Results.Stream(async stream =>
     {
-        foreach (var chunk in ChunkResponse(result, safeChunkSize))
+        try
         {
-            var bytes = JsonSerializer.SerializeToUtf8Bytes(chunk, AppJsonContext.Default.QueryResponse);
-            await stream.WriteAsync(bytes);
-            await stream.WriteAsync("\n"u8.ToArray());
-            await stream.FlushAsync();
+            foreach (var chunk in outcome.Responses)
+            {
+                var bytes = JsonSerializer.SerializeToUtf8Bytes(chunk, AppJsonContext.Default.QueryResponse);
+                await stream.WriteAsync(bytes);
+                await stream.WriteAsync("\n"u8.ToArray());
+                await stream.FlushAsync();
+            }
+        }
+        finally
+        {
+            metrics.RecordQuery(outcome.Report);
+            LogQueryOutcome(logger, db, outcome.Report, outcome.Report.Error);
         }
     }, "application/x-ndjson; charset=utf-8");
 }
 
-static IEnumerable<QueryResponse> ChunkResponse(QueryResponse result, int chunkSize)
+static void LogQueryOutcome(ILogger logger, string? db, QueryExecutionReport report, string? error)
 {
-    foreach (var queryResult in result.Results)
-    {
-        if (queryResult.Series == null || queryResult.Series.Count == 0)
-        {
-            yield return new QueryResponse { Results = [new QueryResult { StatementId = queryResult.StatementId, Error = queryResult.Error }] };
-            continue;
-        }
-
-        foreach (var series in queryResult.Series)
-        {
-            if (series.Values.Count == 0)
-            {
-                yield return new QueryResponse { Results = [new QueryResult { StatementId = queryResult.StatementId, Series = [CloneSeries(series, [])], Error = queryResult.Error }] };
-                continue;
-            }
-
-            for (int i = 0; i < series.Values.Count; i += chunkSize)
-            {
-                yield return new QueryResponse
-                {
-                    Results =
-                    [
-                        new QueryResult
-                        {
-                            StatementId = queryResult.StatementId,
-                            Error = queryResult.Error,
-                            Series = [CloneSeries(series, series.Values.Skip(i).Take(chunkSize).ToList())]
-                        }
-                    ]
-                };
-            }
-        }
-    }
+    if (!string.IsNullOrWhiteSpace(error))
+        logger.LogWarning("query failed db={Db} error={Error}", db ?? "-", error);
+    else
+        logger.LogDebug("query completed db={Db} rows={Rows} scanned={ScannedPoints} duration_ms={DurationMs}",
+            db ?? "-", report.RowsReturned, report.ScannedPoints, report.DurationMs);
 }
-
-static QuerySeries CloneSeries(QuerySeries series, List<List<object?>> values) => new()
-{
-    Name = series.Name,
-    Tags = series.Tags == null ? null : new Dictionary<string, string>(series.Tags, StringComparer.Ordinal),
-    Columns = [.. series.Columns],
-    Values = values
-};
 
 static bool TryParseBool(string? value) =>
     !string.IsNullOrWhiteSpace(value)
