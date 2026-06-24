@@ -358,6 +358,30 @@ public sealed class Manifest
         }
     }
 
+    public void ReplaceSegmentsInShard(string db, string rp, int shardId, IEnumerable<string> oldSegmentFiles, IEnumerable<string> newSegmentFiles)
+    {
+        lock (_lock)
+        {
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return;
+            if (!dbInfo.RetentionPolicies.TryGetValue(rp, out var rpInfo)) return;
+            var shard = rpInfo.ShardGroups.FirstOrDefault(s => s.Id == shardId);
+            if (shard == null) return;
+
+            var removeNames = new HashSet<string>(
+                oldSegmentFiles.Select(Path.GetFileName).Where(name => !string.IsNullOrWhiteSpace(name))!,
+                StringComparer.OrdinalIgnoreCase);
+            shard.SegmentFiles.RemoveAll(file => removeNames.Contains(file));
+
+            foreach (var file in newSegmentFiles.Select(Path.GetFileName).Where(name => !string.IsNullOrWhiteSpace(name)).Select(name => name!))
+            {
+                if (!shard.SegmentFiles.Contains(file, StringComparer.OrdinalIgnoreCase))
+                    shard.SegmentFiles.Add(file);
+            }
+
+            Save();
+        }
+    }
+
     #endregion
 
     #region Indexes

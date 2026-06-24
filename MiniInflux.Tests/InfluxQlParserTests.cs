@@ -150,6 +150,34 @@ public class InfluxQlParserTests
     }
 
     [Fact]
+    public void Parse_SelectWithQuotedQualifiedSource_ParsesDbRpAndMeasurement()
+    {
+        var query = InfluxQlParser.Parse("SELECT value INTO \"archive db\".\"daily.rp\".\"cpu rollup\" FROM \"metrics db\".\"raw.rp\".\"cpu load\"");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.Equal("metrics db", query.SourceDatabase);
+        Assert.Equal("raw.rp", query.SourceRpName);
+        Assert.Equal("cpu load", query.Measurement);
+        Assert.Equal("\"archive db\".\"daily.rp\".\"cpu rollup\"", query.IntoTarget);
+    }
+
+    [Fact]
+    public void Parse_SelectWhereWithLowercaseAnd_ParsesAllPredicates()
+    {
+        var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE time >= 10 and time < 20 and host = 'server01' and value >= 12");
+
+        Assert.Equal(10, query.MinTimeNs);
+        Assert.Equal(19, query.MaxTimeNs);
+        var tag = Assert.Single(query.TagFilters);
+        Assert.Equal("host", tag.Key);
+        Assert.Equal("server01", tag.Value);
+        var field = Assert.Single(query.FieldFilters);
+        Assert.Equal("value", field.Field);
+        Assert.Equal(FieldOp.Gte, field.Op);
+        Assert.Equal(12, field.Value);
+    }
+
+    [Fact]
     public void Parse_CreateContinuousQuery_ParsesDefinition()
     {
         var query = InfluxQlParser.Parse("CREATE CONTINUOUS QUERY cq_cpu ON metrics RESAMPLE EVERY 10s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");

@@ -356,6 +356,151 @@ public class P1TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task Compactor_OverlapAwarePolicy_MergesOverlappingLowerLevelSegments()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        const long ts = 10_000_000_000L;
+
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(10) },
+                TimestampNs = ts
+            }
+        ]);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(20) },
+                TimestampNs = ts + 1_000_000_000
+            }
+        ]);
+
+        var shardManager = new ShardManager(engine.RootPath, engine.Meta);
+        var compactor = new Compactor(engine.Meta, shardManager, engine.Tombstones, engine.Schema, maxL0Segments: 2, maxL1Segments: 99);
+        Assert.Equal(1, compactor.CompactAll());
+
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(99) },
+                TimestampNs = ts
+            }
+        ]);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(30) },
+                TimestampNs = ts + 2_000_000_000
+            }
+        ]);
+
+        var overlapAware = new Compactor(engine.Meta, shardManager, engine.Tombstones, engine.Schema, maxL0Segments: 2, maxL1Segments: 99);
+        Assert.Equal(1, overlapAware.CompactAll());
+
+        var shard = Assert.Single(engine.Meta.GetShards("testdb", "autogen"));
+        Assert.Single(shard.SegmentFiles);
+        Assert.DoesNotContain(shard.SegmentFiles, file => file.StartsWith("l0-", StringComparison.OrdinalIgnoreCase));
+        Assert.Single(shard.SegmentFiles, file => file.StartsWith("l1-", StringComparison.OrdinalIgnoreCase));
+
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+        Assert.Equal(3, points.Count);
+        Assert.Equal(99.0, points[0].Fields["value"].AsDouble());
+        Assert.Equal(20.0, points[1].Fields["value"].AsDouble());
+        Assert.Equal(30.0, points[2].Fields["value"].AsDouble());
+    }
+
+    [Fact]
+    public async Task Compactor_CompactAll_DrainsMultiLevelBacklogInSingleRun()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        await engine.WriteAsync("testdb", "autogen", [Point("cpu", 1, "server01")]);
+        await engine.WriteAsync("testdb", "autogen", [Point("cpu", 2, "server01")]);
+
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 2,
+            maxL1Segments: 1);
+
+        Assert.Equal(2, compactor.CompactAll());
+
+        var shard = Assert.Single(engine.Meta.GetShards("testdb", "autogen"));
+        Assert.Single(shard.SegmentFiles);
+        Assert.Single(shard.SegmentFiles, file => file.StartsWith("l2-", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Query_ReadOrder_PrefersNewerL0PointsOverOlderCompactedLevels()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        const long ts = 20_000_000_000L;
+
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(10) },
+                TimestampNs = ts
+            }
+        ]);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(11) },
+                TimestampNs = ts + 1_000_000_000
+            }
+        ]);
+
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 2,
+            maxL1Segments: 1);
+        Assert.Equal(2, compactor.CompactAll());
+
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(99) },
+                TimestampNs = ts
+            }
+        ]);
+
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+        Assert.Equal(2, points.Count);
+        Assert.Equal(99.0, points[0].Fields["value"].AsDouble());
+    }
+
+    [Fact]
     public async Task SelectInto_PreservesNanosecondPrecision_AndSupportsQualifiedSourceRp()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);

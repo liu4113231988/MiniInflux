@@ -393,7 +393,7 @@ public static class InfluxQlParser
     static void ParseWhere(string where, out long? min, out long? max, List<TagFilter> tagFilters, List<FieldFilter> fieldFilters)
     {
         min = null; max = null;
-        foreach (var raw in where.Split("AND", StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+        foreach (var raw in SplitTopLevelAndClauses(where))
         {
             var p = raw.Trim();
             if (p.StartsWith("time", StringComparison.OrdinalIgnoreCase))
@@ -478,10 +478,35 @@ public static class InfluxQlParser
         result.Add(s[start..]);
         return result;
     }
-    static string? AfterFrom(string q) { var u = q.ToUpperInvariant(); var i = u.IndexOf(" FROM "); return i < 0 ? null : Unq(q[(i + 6)..].Trim().Split(' ')[0]); }
-    static string? AfterKey(string q) { var u = q.ToUpperInvariant(); var i = u.IndexOf(" KEY "); if (i < 0) return null; var part = q[(i + 5)..].Trim(); if (part.StartsWith('=')) part = part[1..].Trim(); return Unq(part.Trim().Split(' ')[0]); }
-    static string? AfterOn(string q) { var u = q.ToUpperInvariant(); var i = u.IndexOf(" ON "); return i < 0 ? null : Unq(q[(i + 4)..].Trim().Split(' ')[0]); }
-    static string ReadToken(ref string rest) { rest = rest.TrimStart(); int i = 0; while (i < rest.Length && !char.IsWhiteSpace(rest[i])) i++; var t = rest[..i]; rest = rest[i..]; return t; }
+    static string? AfterFrom(string q) { var u = q.ToUpperInvariant(); var i = u.IndexOf(" FROM "); return i < 0 ? null : Unq(ReadToken(q[(i + 6)..].Trim())); }
+    static string? AfterKey(string q) { var u = q.ToUpperInvariant(); var i = u.IndexOf(" KEY "); if (i < 0) return null; var part = q[(i + 5)..].Trim(); if (part.StartsWith('=')) part = part[1..].Trim(); return Unq(ReadToken(part)); }
+    static string? AfterOn(string q) { var u = q.ToUpperInvariant(); var i = u.IndexOf(" ON "); return i < 0 ? null : Unq(ReadToken(q[(i + 4)..].Trim())); }
+    static string ReadToken(ref string rest)
+    {
+        rest = rest.TrimStart();
+        var token = ReadToken(rest);
+        rest = rest[token.Length..];
+        return token;
+    }
+    static string ReadToken(string text)
+    {
+        text = text.TrimStart();
+        int i = 0;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+        while (i < text.Length)
+        {
+            var ch = text[i];
+            if (ch == '\'' && !inDoubleQuote)
+                inSingleQuote = !inSingleQuote;
+            else if (ch == '"' && !inSingleQuote)
+                inDoubleQuote = !inDoubleQuote;
+            else if (!inSingleQuote && !inDoubleQuote && char.IsWhiteSpace(ch))
+                break;
+            i++;
+        }
+        return text[..i];
+    }
     static void ConsumeKeyword(ref string rest, string kw) { rest = rest.TrimStart(); if (rest.StartsWith(kw, StringComparison.OrdinalIgnoreCase)) rest = rest[kw.Length..]; }
     static string Unq(string s) { s = s.Trim(); return s.Length >= 2 && s[0] == '"' && s[^1] == '"' ? s[1..^1] : s; }
     static string NormalizePrivilege(string privilege)
@@ -497,15 +522,37 @@ public static class InfluxQlParser
 
     static (string? Database, string? RetentionPolicy, string Measurement) ParseQualifiedMeasurement(string token)
     {
-        var parts = token.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(Unq)
-            .ToArray();
+        var parts = SplitQualifiedIdentifier(token);
         return parts.Length switch
         {
             3 => (parts[0], parts[1], parts[2]),
             2 => (null, parts[0], parts[1]),
             _ => (null, null, parts[0])
         };
+    }
+    public static string[] SplitQualifiedIdentifier(string text)
+    {
+        var parts = new List<string>();
+        int start = 0;
+        bool inDoubleQuote = false;
+        for (int i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '"')
+                inDoubleQuote = !inDoubleQuote;
+            else if (ch == '.' && !inDoubleQuote)
+            {
+                var segment = text[start..i].Trim();
+                if (segment.Length > 0)
+                    parts.Add(Unq(segment));
+                start = i + 1;
+            }
+        }
+
+        var tail = text[start..].Trim();
+        if (tail.Length > 0)
+            parts.Add(Unq(tail));
+        return parts.ToArray();
     }
     static long ParseTime(string s) { s = s.Trim().Trim('\''); if (long.TryParse(s, out var n)) return n;
         return DateTimeOffset.Parse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal).ToUnixTimeMilliseconds() * 1_000_000; }
@@ -545,11 +592,7 @@ public static class InfluxQlParser
 
     static string ReadSourceToken(string text)
     {
-        text = text.TrimStart();
-        int i = 0;
-        while (i < text.Length && !char.IsWhiteSpace(text[i]))
-            i++;
-        return text[..i];
+        return ReadToken(text);
     }
 
     static int FindMatchingParen(string text, int openIndex)
@@ -575,5 +618,77 @@ public static class InfluxQlParser
         }
 
         return -1;
+    }
+
+    static List<string> SplitTopLevelAndClauses(string text)
+    {
+        var clauses = new List<string>();
+        int depth = 0;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+        bool inRegex = false;
+        int start = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (inRegex)
+            {
+                if (ch == '/' && (i == 0 || text[i - 1] != '\\'))
+                    inRegex = false;
+                continue;
+            }
+
+            if (ch == '\'' && !inDoubleQuote)
+            {
+                inSingleQuote = !inSingleQuote;
+                continue;
+            }
+
+            if (ch == '"' && !inSingleQuote)
+            {
+                inDoubleQuote = !inDoubleQuote;
+                continue;
+            }
+
+            if (inSingleQuote || inDoubleQuote)
+                continue;
+
+            if (ch == '(')
+            {
+                depth++;
+                continue;
+            }
+
+            if (ch == ')')
+            {
+                depth--;
+                continue;
+            }
+
+            if (ch == '/' && i > 0 && (text[i - 1] == '~' || text[i - 1] == '!'))
+            {
+                inRegex = true;
+                continue;
+            }
+
+            if (depth == 0 && i + 3 <= text.Length && text.AsSpan(i, 3).Equals("AND".AsSpan(), StringComparison.OrdinalIgnoreCase))
+            {
+                var leftBoundary = i == 0 || char.IsWhiteSpace(text[i - 1]);
+                var rightBoundary = i + 3 == text.Length || char.IsWhiteSpace(text[i + 3]);
+                if (leftBoundary && rightBoundary)
+                {
+                    var clause = text[start..i].Trim();
+                    if (clause.Length > 0)
+                        clauses.Add(clause);
+                    start = i + 3;
+                    i += 2;
+                }
+            }
+        }
+
+        var tail = text[start..].Trim();
+        if (tail.Length > 0)
+            clauses.Add(tail);
+        return clauses;
     }
 }

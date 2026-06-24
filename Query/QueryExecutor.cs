@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Text.Json.Serialization;
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
 using MiniInflux.Net10.Storage;
@@ -23,6 +24,8 @@ public sealed class QuerySeries
     public Dictionary<string, string>? Tags { get; set; }
     public List<string> Columns { get; set; } = [];
     public List<List<object?>> Values { get; set; } = [];
+    [JsonIgnore]
+    public HashSet<string>? TagColumns { get; set; }
 }
 
 public sealed class QueryExecutionReport
@@ -691,7 +694,16 @@ public sealed class QueryExecutor
         }
 
         EnsureWithinLimit(vals.Count);
-        List<QuerySeries> rawResult = [new() { Name = resultMeasurement, Columns = cols, Values = vals }];
+        List<QuerySeries> rawResult =
+        [
+            new()
+            {
+                Name = resultMeasurement,
+                Columns = cols,
+                Values = vals,
+                TagColumns = new HashSet<string>(tags, StringComparer.Ordinal)
+            }
+        ];
         report.EstimatedResultBytes = EstimateQuerySeriesBytes(rawResult);
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + report.EstimatedResultBytes);
         EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
@@ -863,12 +875,12 @@ public sealed class QueryExecutor
 
     static IntoTarget ParseIntoTarget(string defaultDb, string rawTarget, string fallbackMeasurement)
     {
-        var parts = rawTarget.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var parts = InfluxQlParser.SplitQualifiedIdentifier(rawTarget);
         return parts.Length switch
         {
-            1 => new IntoTarget(defaultDb, "autogen", UnqTarget(parts[0])),
-            2 => new IntoTarget(UnqTarget(parts[0]), "autogen", UnqTarget(parts[1])),
-            3 => new IntoTarget(UnqTarget(parts[0]), UnqTarget(parts[1]), UnqTarget(parts[2])),
+            1 => new IntoTarget(defaultDb, "autogen", parts[0]),
+            2 => new IntoTarget(parts[0], "autogen", parts[1]),
+            3 => new IntoTarget(parts[0], parts[1], parts[2]),
             _ => new IntoTarget(defaultDb, "autogen", string.IsNullOrWhiteSpace(rawTarget) ? fallbackMeasurement : UnqTarget(rawTarget))
         };
     }
@@ -889,6 +901,8 @@ public sealed class QueryExecutor
         foreach (var series in seriesList)
         {
             var tagKeys = new HashSet<string>(series.Tags?.Keys ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+            if (series.TagColumns != null)
+                tagKeys.UnionWith(series.TagColumns);
             foreach (var row in series.Values)
             {
                 if (row.Count == 0)
@@ -948,6 +962,9 @@ public sealed class QueryExecutor
             var seriesTags = series.Tags == null
                 ? new Dictionary<string, string>(StringComparer.Ordinal)
                 : new Dictionary<string, string>(series.Tags, StringComparer.Ordinal);
+            var tagColumns = new HashSet<string>(seriesTags.Keys, StringComparer.Ordinal);
+            if (series.TagColumns != null)
+                tagColumns.UnionWith(series.TagColumns);
 
             foreach (var row in series.Values)
             {
@@ -964,9 +981,9 @@ public sealed class QueryExecutor
                     if (value == null)
                         continue;
 
-                    if (value is string s)
+                    if (tagColumns.Contains(column))
                     {
-                        tags[column] = s;
+                        tags[column] = value.ToString() ?? "";
                         continue;
                     }
 
@@ -1788,7 +1805,8 @@ public sealed class QueryExecutor
         Name = series.Name,
         Tags = series.Tags == null ? null : new Dictionary<string, string>(series.Tags, StringComparer.Ordinal),
         Columns = [.. series.Columns],
-        Values = values
+        Values = values,
+        TagColumns = series.TagColumns == null ? null : new HashSet<string>(series.TagColumns, StringComparer.Ordinal)
     };
 
     static long EstimateRawSeriesShellBytes(string measurement, List<string> columns) =>

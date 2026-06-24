@@ -17,6 +17,7 @@ public sealed class Compactor
     private readonly long _maxL0Bytes;
     private readonly long _maxL1Bytes;
     private readonly int _minFilesPerCompaction;
+    private readonly int _maxPassesPerRun;
     private readonly object _compactionLock = new();
     private long _totalRuns;
     private long _totalTasks;
@@ -27,7 +28,8 @@ public sealed class Compactor
 
     public Compactor(Manifest manifest, ShardManager shardManager, TombstoneStore tombstones,
         SchemaRegistry schema, int maxL0Segments = 10, int maxL1Segments = 4,
-        long maxL0Bytes = 32 * 1024 * 1024, long maxL1Bytes = 128 * 1024 * 1024, int minFilesPerCompaction = 2)
+        long maxL0Bytes = 32 * 1024 * 1024, long maxL1Bytes = 128 * 1024 * 1024,
+        int minFilesPerCompaction = 2, int maxPassesPerRun = 8)
     {
         _manifest = manifest;
         _shardManager = shardManager;
@@ -38,6 +40,7 @@ public sealed class Compactor
         _maxL0Bytes = maxL0Bytes;
         _maxL1Bytes = maxL1Bytes;
         _minFilesPerCompaction = Math.Max(2, minFilesPerCompaction);
+        _maxPassesPerRun = Math.Max(1, maxPassesPerRun);
     }
 
     public int CompactAll()
@@ -46,15 +49,26 @@ public sealed class Compactor
         Interlocked.Exchange(ref _running, 1);
         try
         {
-            var tasks = BuildTasks();
-            Interlocked.Exchange(ref _queuedTasks, tasks.Count);
-            if (tasks.Count == 0) return 0;
-
             int merged = 0;
-            foreach (var task in tasks)
+            for (int pass = 0; pass < _maxPassesPerRun; pass++)
             {
-                if (CompactShard(task.Db, task.Rp, task.Shard, task.Level, task.Files))
-                    merged++;
+                var tasks = BuildTasks();
+                Interlocked.Exchange(ref _queuedTasks, tasks.Count);
+                if (tasks.Count == 0)
+                    break;
+
+                int mergedThisPass = 0;
+                foreach (var task in tasks)
+                {
+                    if (CompactShard(task.Db, task.Rp, task.Shard, task.Level, task.Files))
+                    {
+                        merged++;
+                        mergedThisPass++;
+                    }
+                }
+
+                if (mergedThisPass == 0)
+                    break;
             }
 
             if (merged > 0)
@@ -97,44 +111,87 @@ public sealed class Compactor
                         .Where(File.Exists)
                         .ToList();
 
-                    var l0 = segFiles.Where(f => InferLevel(f) == 0).ToList();
-                    var l0Task = BuildLevelTask(db, rp.Name, shard, 1, l0, _maxL0Segments, _maxL0Bytes);
-                    if (l0Task != null)
-                        tasks.Add(l0Task);
+                    var described = DescribeFiles(segFiles);
+                    var claimed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-                    var l1 = segFiles.Where(f => InferLevel(f) == 1).ToList();
-                    var l1Task = BuildLevelTask(db, rp.Name, shard, 2, l1, _maxL1Segments, _maxL1Bytes);
+                    var l0Task = BuildLevelTask(
+                        db, rp.Name, shard, 1,
+                        described.Where(f => f.Level == 0 && !claimed.Contains(f.Path)).ToList(),
+                        described.Where(f => f.Level == 1 && !claimed.Contains(f.Path)).ToList(),
+                        _maxL0Segments, _maxL0Bytes);
+                    if (l0Task != null)
+                    {
+                        tasks.Add(l0Task);
+                        foreach (var file in l0Task.Files)
+                            claimed.Add(file.Path);
+                    }
+
+                    var l1Task = BuildLevelTask(
+                        db, rp.Name, shard, 2,
+                        described.Where(f => f.Level == 1 && !claimed.Contains(f.Path)).ToList(),
+                        described.Where(f => f.Level == 2 && !claimed.Contains(f.Path)).ToList(),
+                        _maxL1Segments, _maxL1Bytes);
                     if (l1Task != null)
+                    {
                         tasks.Add(l1Task);
+                        foreach (var file in l1Task.Files)
+                            claimed.Add(file.Path);
+                    }
                 }
             }
         }
         return tasks;
     }
 
-    private CompactionTask? BuildLevelTask(string db, string rp, ShardGroupInfo shard, int outputLevel, List<string> segFiles, int segmentThreshold, long byteThreshold)
-    {
-        var requiredFiles = Math.Min(_minFilesPerCompaction, Math.Max(1, segmentThreshold));
-        if (segFiles.Count < requiredFiles)
-            return null;
-
-        var files = segFiles
-            .Select(path => new FileCandidate(path, SafeLength(path), SafeWriteTime(path)))
+    private static List<FileCandidate> DescribeFiles(List<string> segFiles) =>
+        segFiles.Select(DescribeFile)
             .OrderBy(x => x.LastWriteUtc)
             .ThenBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        var totalBytes = files.Sum(f => f.Length);
-        var triggerByCount = files.Count >= segmentThreshold;
+    private static FileCandidate DescribeFile(string path)
+    {
+        long? minTimeNs = null;
+        long? maxTimeNs = null;
+        try
+        {
+            var metadata = SegmentReader.ReadMetadata(path);
+            if (metadata.Count > 0)
+            {
+                minTimeNs = metadata.Min(m => m.MinTime);
+                maxTimeNs = metadata.Max(m => m.MaxTime);
+            }
+        }
+        catch { }
+
+        return new FileCandidate(path, SafeLength(path), SafeWriteTime(path), InferLevel(path), minTimeNs, maxTimeNs);
+    }
+
+    private CompactionTask? BuildLevelTask(
+        string db,
+        string rp,
+        ShardGroupInfo shard,
+        int outputLevel,
+        List<FileCandidate> currentLevelFiles,
+        List<FileCandidate> overlapLevelFiles,
+        int segmentThreshold,
+        long byteThreshold)
+    {
+        var requiredFiles = Math.Min(_minFilesPerCompaction, Math.Max(1, segmentThreshold));
+        if (currentLevelFiles.Count < requiredFiles)
+            return null;
+
+        var totalBytes = currentLevelFiles.Sum(f => f.Length);
+        var triggerByCount = currentLevelFiles.Count >= segmentThreshold;
         var triggerByBytes = byteThreshold > 0 && totalBytes >= byteThreshold;
         if (!triggerByCount && !triggerByBytes)
             return null;
 
-        var selected = new List<string>();
+        var selected = new List<FileCandidate>();
         long selectedBytes = 0;
-        foreach (var file in files)
+        foreach (var file in currentLevelFiles)
         {
-            selected.Add(file.Path);
+            selected.Add(file);
             selectedBytes += file.Length;
 
             if (selected.Count >= requiredFiles && (selected.Count >= segmentThreshold || (byteThreshold > 0 && selectedBytes >= byteThreshold)))
@@ -142,21 +199,49 @@ public sealed class Compactor
         }
 
         if (selected.Count < requiredFiles)
-            selected = files.Take(requiredFiles).Select(f => f.Path).ToList();
+            selected = currentLevelFiles.Take(requiredFiles).ToList();
 
-        return new CompactionTask(db, rp, shard, outputLevel, selected);
+        var includeAllOverlaps = selected.Any(file => !file.MinTimeNs.HasValue || !file.MaxTimeNs.HasValue);
+        if (overlapLevelFiles.Count > 0)
+        {
+            var selectedMinTime = selected.Where(f => f.MinTimeNs.HasValue).Select(f => f.MinTimeNs!.Value).DefaultIfEmpty(long.MinValue).Min();
+            var selectedMaxTime = selected.Where(f => f.MaxTimeNs.HasValue).Select(f => f.MaxTimeNs!.Value).DefaultIfEmpty(long.MaxValue).Max();
+            foreach (var overlap in overlapLevelFiles)
+            {
+                if (includeAllOverlaps || Overlaps(overlap, selectedMinTime, selectedMaxTime))
+                    selected.Add(overlap);
+            }
+        }
+
+        return new CompactionTask(db, rp, shard, outputLevel, selected
+            .GroupBy(f => f.Path, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToList());
     }
 
-    private bool CompactShard(string db, string rp, ShardGroupInfo shard, int outputLevel, List<string> segFiles)
+    private static bool Overlaps(FileCandidate candidate, long minTimeNs, long maxTimeNs)
+    {
+        if (!candidate.MinTimeNs.HasValue || !candidate.MaxTimeNs.HasValue)
+            return true;
+        return candidate.MaxTimeNs.Value >= minTimeNs && candidate.MinTimeNs.Value <= maxTimeNs;
+    }
+
+    private bool CompactShard(string db, string rp, ShardGroupInfo shard, int outputLevel, List<FileCandidate> segFiles)
     {
         if (segFiles.Count == 0) return false;
         Interlocked.Increment(ref _totalTasks);
         Interlocked.Add(ref _totalSegmentsMerged, segFiles.Count);
 
+        var orderedInputs = segFiles
+            .OrderByDescending(f => f.Level)
+            .ThenBy(f => f.LastWriteUtc)
+            .ThenBy(f => f.Path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
         var allColumns = new List<SegmentColumn>();
-        foreach (var f in segFiles)
+        foreach (var file in orderedInputs)
         {
-            try { allColumns.AddRange(SegmentReader.ReadSegment(f)); }
+            try { allColumns.AddRange(SegmentReader.ReadSegment(file.Path)); }
             catch { }
         }
 
@@ -178,22 +263,52 @@ public sealed class Compactor
 
         if (filtered.Count == 0)
         {
-            foreach (var f in segFiles) TryDelete(f);
-            _manifest.RemoveSegmentsFromShard(db, rp, shard.Id, segFiles);
-            return true;
+            return FinalizeCompaction(db, rp, shard.Id, orderedInputs, null);
         }
 
         var merged = MergeColumns(filtered);
         var points = ColumnsToPoints(merged);
         if (points.Count == 0) return false;
 
+        foreach (var group in points.GroupBy(p => p.Measurement))
+            _schema.ValidateAndRegister(db, group.Key, group);
+
         var shardDir = _shardManager.ShardDir(db, rp, shard.Id);
         var mergedPath = Path.Combine(shardDir, $"l{outputLevel}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
         SegmentWriter.WriteSegment(mergedPath, points);
+        _manifest.UpdateIndexes(db, points.Select(p => (p.Measurement, SeriesKey.From(p).TagsCanonical, p.Tags)));
+        return FinalizeCompaction(db, rp, shard.Id, orderedInputs, mergedPath);
+    }
 
-        foreach (var f in segFiles) TryDelete(f);
-        _manifest.RemoveSegmentsFromShard(db, rp, shard.Id, segFiles);
-        _manifest.AddSegmentToShard(db, rp, shard.Id, mergedPath);
+    private bool FinalizeCompaction(string db, string rp, int shardId, List<FileCandidate> sourceFiles, string? mergedPath)
+    {
+        if (!TryStageSourceFiles(sourceFiles, out var stagedMoves))
+        {
+            if (!string.IsNullOrWhiteSpace(mergedPath))
+                TryDelete(mergedPath);
+            return false;
+        }
+
+        try
+        {
+            _manifest.ReplaceSegmentsInShard(
+                db,
+                rp,
+                shardId,
+                sourceFiles.Select(f => f.Path),
+                string.IsNullOrWhiteSpace(mergedPath) ? [] : [mergedPath]);
+        }
+        catch
+        {
+            RollbackStageMoves(stagedMoves);
+            if (!string.IsNullOrWhiteSpace(mergedPath))
+                TryDelete(mergedPath);
+            return false;
+        }
+
+        foreach (var move in stagedMoves)
+            TryDelete(move.StagedPath);
+
         return true;
     }
 
@@ -208,6 +323,41 @@ public sealed class Compactor
     private static void TryDelete(string path)
     {
         try { File.Delete(path); } catch { }
+    }
+
+    private static bool TryStageSourceFiles(List<FileCandidate> sourceFiles, out List<StagedMove> stagedMoves)
+    {
+        stagedMoves = [];
+        foreach (var source in sourceFiles)
+        {
+            var stagedPath = source.Path + $".compacted-{Guid.NewGuid():N}";
+            try
+            {
+                File.Move(source.Path, stagedPath);
+                stagedMoves.Add(new StagedMove(source.Path, stagedPath));
+            }
+            catch
+            {
+                RollbackStageMoves(stagedMoves);
+                stagedMoves = [];
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void RollbackStageMoves(List<StagedMove> stagedMoves)
+    {
+        for (int i = stagedMoves.Count - 1; i >= 0; i--)
+        {
+            try
+            {
+                if (File.Exists(stagedMoves[i].StagedPath))
+                    File.Move(stagedMoves[i].StagedPath, stagedMoves[i].OriginalPath);
+            }
+            catch { }
+        }
     }
 
     private static long SafeLength(string path)
@@ -286,8 +436,9 @@ public sealed class Compactor
         return d;
     }
 
-    private sealed record CompactionTask(string Db, string Rp, ShardGroupInfo Shard, int Level, List<string> Files);
-    private sealed record FileCandidate(string Path, long Length, DateTime LastWriteUtc);
+    private sealed record CompactionTask(string Db, string Rp, ShardGroupInfo Shard, int Level, List<FileCandidate> Files);
+    private sealed record FileCandidate(string Path, long Length, DateTime LastWriteUtc, int Level, long? MinTimeNs, long? MaxTimeNs);
+    private sealed record StagedMove(string OriginalPath, string StagedPath);
 }
 
 public sealed class CompactionStatsSnapshot

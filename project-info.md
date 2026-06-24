@@ -221,14 +221,18 @@ L0 -> L1 -> L2
 按文件数量触发
 按累计大小触发
 按 shard 合并 segment
+overlap-aware compaction
 tombstone 应用
 重复点 last-write-wins
 重写合并后的 segment
+单次 CompactAll 多轮排空 backlog
+staged source segment 切换
+查询时按层级/时间顺序读取 segment，优先保留更新值
 后台定时 compaction
 compaction 任务队列和状态指标
 ```
 
-仍可继续增强 overlap-aware compaction policy 和合并时索引重建。
+当前已经具备短期正式使用所需的 compaction 主链路；后续更值得继续投入的是全量索引重建/校验工具、限速策略和长时间 soak test。
 
 ## 10. Tombstone / 删除
 
@@ -389,6 +393,8 @@ DROP CONTINUOUS QUERY
 后台定时调度
 GROUP BY time(...) bucket 调度
 SELECT ... INTO ... 自动回写
+带已有 WHERE 的 bucket 时间窗口注入
+CQ body 使用子查询第一版
 执行进度持久化
 RESAMPLE EVERY
 RESAMPLE FOR 第一版
@@ -470,7 +476,7 @@ Backup / Restore
 恢复 / 备份 / compaction 故障注入
 ```
 
-当前源码中共有 139 个 `[Fact]` / `[Theory]` 测试标记。
+当前源码中共有 152 个 `[Fact]` / `[Theory]` 测试标记。
 
 ***
 
@@ -480,9 +486,9 @@ Backup / Restore
 
 ```text
 1. chunked raw SELECT 已完成边扫描边输出第一版；聚合、GROUP BY、Subquery、SELECT INTO 等复杂查询仍需继续降低物化内存峰值。
-2. SELECT INTO / Subquery / Continuous Query 已可用，但复杂 quoted identifier、跨 db/rp、复杂 GROUP BY 组合仍需补边界测试。
+2. SELECT INTO / Subquery / Continuous Query 已补到短期可用：quoted db/rp/measurement、subquery string field/tag、CQ 子查询 + WHERE 已有回归；剩余主要是跨 db/rp 权限矩阵和更复杂组合测试。
 3. Auth 已到 database 级授权，缺少 RP / measurement 级授权、改密和审计日志。
-4. Compaction 已有 L0/L1/L2，但缺少 overlap-aware policy、合并时索引重建和长期压测。
+4. Compaction 已补到短期可上线：overlap-aware、多轮排空 backlog、staged 切换和读序修正已具备；后续重点转为长期压测、并发一致性和限速策略。
 5. Backup / restore 已有校验、pending restore 和故障注入回归测试，但还不是在线一致性快照协议。
 6. 内存估算是近似模型，仍需按真实 workload 校准。
 7. Benchmark 已有第一版，缺少远端压测、soak test、多 measurement / 高 tag 基数 workload。

@@ -386,14 +386,8 @@ static bool TryValidateUser(MiniInfluxOptions options, AuthStore authStore, stri
 
 static string? GetIntoTargetDatabase(string? defaultDb, string intoTarget)
 {
-    var parts = intoTarget.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-    return parts.Length >= 2 ? Unquote(parts[0]) : defaultDb;
-}
-
-static string Unquote(string value)
-{
-    value = value.Trim();
-    return value.Length >= 2 && value[0] == '"' && value[^1] == '"' ? value[1..^1] : value;
+    var parts = InfluxQlParser.SplitQualifiedIdentifier(intoTarget);
+    return parts.Length >= 2 ? parts[0] : defaultDb;
 }
 
 static IResult ChunkedResult(QueryChunkedExecutionOutcome outcome, MetricsCollector metrics, ILogger logger, string? db)

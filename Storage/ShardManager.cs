@@ -95,7 +95,11 @@ public sealed class ShardManager
             foreach (var seg in Directory.GetFiles(dir, "*.seg").Order())
                 result.Add((seg, shard));
         }
-        return result;
+        return result
+            .OrderByDescending(x => InferSegmentLevel(x.Item1))
+            .ThenBy(x => SafeWriteTime(x.Item1))
+            .ThenBy(x => x.Item1, StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     /// <summary>
@@ -148,4 +152,18 @@ public sealed class ShardManager
     /// </summary>
     public IReadOnlyList<ShardGroupInfo> GetAllShards(string db, string rp) =>
         _manifest.GetShards(db, rp);
+
+    private static int InferSegmentLevel(string segmentPath)
+    {
+        var name = Path.GetFileName(segmentPath);
+        if (name.StartsWith("l2-", StringComparison.OrdinalIgnoreCase)) return 2;
+        if (name.StartsWith("l1-", StringComparison.OrdinalIgnoreCase)) return 1;
+        return 0;
+    }
+
+    private static DateTime SafeWriteTime(string path)
+    {
+        try { return File.GetLastWriteTimeUtc(path); }
+        catch { return DateTime.MinValue; }
+    }
 }

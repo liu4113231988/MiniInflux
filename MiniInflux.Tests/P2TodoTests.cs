@@ -66,6 +66,58 @@ public class P2TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task SelectInto_SupportsQuotedQualifiedSourceAndTarget()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("metrics db", "raw.rp",
+        [
+            new Point
+            {
+                Measurement = "cpu load",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(42) },
+                TimestampNs = 1_000_000_000L
+            }
+        ]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(
+            engine,
+            "metrics db",
+            "SELECT value INTO \"archive db\".\"daily.rp\".\"cpu rollup\" FROM \"metrics db\".\"raw.rp\".\"cpu load\"");
+
+        Assert.Null(outcome.Response.Results[0].Error);
+        var copied = Assert.Single(engine.ReadAllPoints("archive db", "daily.rp", "cpu rollup", null, null));
+        Assert.Equal("server01", copied.Tags["host"]);
+        Assert.Equal(42, copied.Fields["value"].AsDouble());
+    }
+
+    [Fact]
+    public async Task SelectInto_FromSubquery_PreservesStringFields()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["status"] = FieldValue.FromString("warm") },
+                TimestampNs = 1_000_000_000L
+            }
+        ]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(
+            engine,
+            "testdb",
+            "SELECT status INTO cpu_status_copy FROM (SELECT host,status FROM cpu)");
+
+        Assert.Null(outcome.Response.Results[0].Error);
+        var copied = Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu_status_copy", null, null));
+        Assert.Equal("server01", copied.Tags["host"]);
+        Assert.Equal("warm", copied.Fields["status"].String);
+    }
+
+    [Fact]
     public async Task ContinuousQuery_Ddl_CanCreateShowAndDrop()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
@@ -371,6 +423,52 @@ public class P2TodoTests : IDisposable
         var show = await executor.ExecuteAsync(engine, "testdb", "SHOW CONTINUOUS QUERIES");
         var row = Assert.Single(Assert.Single(show.Results[0].Series!).Values);
         Assert.Equal(2, row[5]);
+    }
+
+    [Fact]
+    public async Task ContinuousQueryRunner_SupportsSubqueryBodyAndExistingWhereClause()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        const long outerBucketNs = 20_000_000_000L;
+        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var bucketStart = (nowNs / outerBucketNs) * outerBucketNs - outerBucketNs;
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "server01", 10, bucketStart + 1_000_000_000L),
+            Point("cpu", "server01", 20, bucketStart + 5_000_000_000L),
+            Point("cpu", "server01", 30, bucketStart + 11_000_000_000L),
+            Point("cpu", "server01", 50, bucketStart + 15_000_000_000L),
+            Point("cpu", "server02", 999, bucketStart + 2_000_000_000L)
+        ]);
+
+        var executor = new QueryExecutor();
+        await executor.ExecuteAsync(
+            engine,
+            "testdb",
+            "CREATE CONTINUOUS QUERY cq_cpu ON testdb BEGIN SELECT mean(max_value) INTO cpu_rollup FROM (SELECT max(value) FROM cpu WHERE host = 'server01' GROUP BY time(10s),host) GROUP BY time(20s),host END");
+
+        using var loggerFactory = LoggerFactory.Create(builder => { });
+        var runner = new ContinuousQueryRunner(
+            engine,
+            executor,
+            new MiniInfluxOptions
+            {
+                ContinuousQuery = new ContinuousQueryOptions
+                {
+                    Enabled = true,
+                    MaxCatchUpRunsPerCycle = 4
+                }
+            },
+            new MetricsCollector(engine),
+            loggerFactory.CreateLogger<ContinuousQueryRunner>());
+
+        var executed = await runner.ExecuteDueQueriesAsync();
+
+        Assert.Equal(1, executed);
+        var rollup = Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu_rollup", null, null));
+        Assert.Equal(bucketStart, rollup.TimestampNs);
+        Assert.Equal("server01", rollup.Tags["host"]);
+        Assert.Equal(35.0, rollup.Fields["mean_max_value"].AsDouble());
     }
 
     private static Point Point(string measurement, string host, double value, long timestampNs) => new()
