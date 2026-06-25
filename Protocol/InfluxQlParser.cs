@@ -9,7 +9,7 @@ public enum QueryKind
     CreateContinuousQuery, ShowContinuousQueries, DropContinuousQuery,
     DropDatabase, DropMeasurement, DropSeries, DropShard, Delete,
     ShowSeries, ShowSeriesCardinality, ShowMeasurementCardinality, ShowTagValuesCardinality,
-    CreateUser, GrantPrivilege, RevokePrivilege, ShowUsers, ShowGrants, DropUser
+    CreateUser, AlterUser, GrantPrivilege, RevokePrivilege, ShowUsers, ShowGrants, DropUser
 }
 
 public enum TagOp { Eq, Neq, Regex, NotRegex }
@@ -81,6 +81,8 @@ public static class InfluxQlParser
             return new() { Kind = QueryKind.DropShard, Limit = int.Parse(q["DROP SHARD ".Length..].Trim(), CultureInfo.InvariantCulture) };
         if (q.StartsWith("DELETE FROM ", StringComparison.OrdinalIgnoreCase)) return ParseDelete(q);
         if (q.StartsWith("CREATE USER ", StringComparison.OrdinalIgnoreCase)) return ParseCreateUser(q);
+        if (q.StartsWith("ALTER USER ", StringComparison.OrdinalIgnoreCase)) return ParseAlterUser(q);
+        if (q.StartsWith("SET PASSWORD FOR ", StringComparison.OrdinalIgnoreCase)) return ParseSetPassword(q);
         if (q.StartsWith("GRANT ", StringComparison.OrdinalIgnoreCase)) return ParseGrant(q);
         if (q.StartsWith("REVOKE ", StringComparison.OrdinalIgnoreCase)) return ParseRevoke(q);
         if (q.StartsWith("SHOW USERS", StringComparison.OrdinalIgnoreCase)) return new() { Kind = QueryKind.ShowUsers };
@@ -349,6 +351,27 @@ public static class InfluxQlParser
         throw new FormatException("CREATE USER requires quoted password");
     }
 
+    static ParsedQuery ParseAlterUser(string q)
+    {
+        var rest = q["ALTER USER ".Length..].Trim();
+        var user = ReadToken(ref rest);
+        ConsumeKeyword(ref rest, "WITH");
+        ConsumeKeyword(ref rest, "PASSWORD");
+        var password = ParseQuotedPassword(rest.TrimStart(), "ALTER USER requires quoted password");
+        return new() { Kind = QueryKind.AlterUser, UserName = Unq(user), Password = password };
+    }
+
+    static ParsedQuery ParseSetPassword(string q)
+    {
+        var rest = q["SET PASSWORD FOR ".Length..].Trim();
+        var user = ReadToken(ref rest);
+        rest = rest.TrimStart();
+        if (rest.StartsWith("="))
+            rest = rest[1..].TrimStart();
+        var password = ParseQuotedPassword(rest, "SET PASSWORD FOR requires quoted password");
+        return new() { Kind = QueryKind.AlterUser, UserName = Unq(user), Password = password };
+    }
+
     static ParsedQuery ParseGrant(string q)
     {
         var rest = q["GRANT ".Length..].Trim();
@@ -377,6 +400,19 @@ public static class InfluxQlParser
             Kind = QueryKind.RevokePrivilege,
             Grant = new GrantPrivilege(Unq(user), Unq(scope), privilege)
         };
+    }
+
+    static string ParseQuotedPassword(string password, string errorMessage)
+    {
+        if (password.StartsWith('\''))
+        {
+            var end = password.IndexOf('\'', 1);
+            if (end < 1)
+                throw new FormatException(errorMessage);
+            return password[1..end];
+        }
+
+        throw new FormatException(errorMessage);
     }
 
     static void ParseGroupBy(string text, out long? gbNs, List<string> tags)

@@ -373,6 +373,7 @@ query 参数认证
 密码哈希存储，兼容旧明文记录升级
 query / write / admin 路由授权校验
 CREATE USER
+ALTER USER / SET PASSWORD
 DROP USER
 GRANT
 REVOKE
@@ -380,7 +381,7 @@ SHOW USERS
 SHOW GRANTS
 ```
 
-当前授权粒度到 database 级，后续可扩展到 retention policy / measurement 级。
+当前已支持 database / retention policy / measurement 级授权，以及用户改密；后续仍值得补权限变更审计和 auth store 损坏恢复策略。
 
 ## 16. Continuous Query
 
@@ -476,7 +477,7 @@ Backup / Restore
 恢复 / 备份 / compaction 故障注入
 ```
 
-当前源码中共有 152 个 `[Fact]` / `[Theory]` 测试标记。
+当前源码中共有 153 个 `[Fact]` / `[Theory]` 测试标记。
 
 ***
 
@@ -487,7 +488,7 @@ Backup / Restore
 ```text
 1. chunked raw SELECT 已完成边扫描边输出第一版；聚合、GROUP BY、Subquery、SELECT INTO 等复杂查询仍需继续降低物化内存峰值。
 2. SELECT INTO / Subquery / Continuous Query 已补到短期可用：quoted db/rp/measurement、subquery string field/tag、CQ 子查询 + WHERE 已有回归；剩余主要是跨 db/rp 权限矩阵和更复杂组合测试。
-3. Auth 已到 database 级授权，缺少 RP / measurement 级授权、改密和审计日志。
+3. Auth 已补到短期可用：RP / measurement 级授权和改密已具备；剩余主要是审计日志、损坏恢复策略和更完整的跨 db 权限矩阵。
 4. Compaction 已补到短期可上线：overlap-aware、多轮排空 backlog、staged 切换和读序修正已具备；后续重点转为长期压测、并发一致性和限速策略。
 5. Backup / restore 已有校验、pending restore 和故障注入回归测试，但还不是在线一致性快照协议。
 6. 内存估算是近似模型，仍需按真实 workload 校准。

@@ -2,6 +2,7 @@ using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
 using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
@@ -123,7 +124,7 @@ app.MapGet("/health", () => Results.Ok(new { name = "miniinflux", message = "rea
 
 app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, out _, out var authResult))
+    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
         return authResult;
     var stats = metrics.CollectStats();
     return Results.Json(stats, AppJsonContext.Default.DebugStats);
@@ -131,7 +132,7 @@ app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
 
 app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, out _, out var authResult))
+    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
         return authResult;
     var text = metrics.FormatPrometheus();
     return Results.Text(text, "text/plain; version=0.0.4; charset=utf-8");
@@ -139,8 +140,6 @@ app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
 
 app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQueue writeQueue, MetricsCollector metrics, string db, string? rp, string? precision) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Write, db, out _, out var authResult))
-        return authResult;
     if (string.IsNullOrWhiteSpace(db)) return Results.BadRequest(new ErrorResponse("missing required parameter db"));
     if (request.ContentLength > options.Write.MaxRequestBodyBytes)
         return Results.StatusCode(413);
@@ -158,6 +157,8 @@ app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQu
     try
     {
         var points = LineProtocolParser.ParseMany(body, TimestampPrecision.Parse(precision));
+        if (!EnsureWriteAuthorized(request, options, authStore, db, rp ?? "autogen", points, out var authResult))
+            return authResult;
 
         try
         {
@@ -233,7 +234,7 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
 
 app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string path) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, out _, out var authResult))
+    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
         return authResult;
     tsdbEngine.FlushAll();
     BackupManager.CreateBackup(tsdbEngine.RootPath, path);
@@ -243,7 +244,7 @@ app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string
 
 app.MapPost("/admin/restore", (HttpRequest request, TsdbEngine tsdbEngine, string path) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, out _, out var authResult))
+    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
         return authResult;
     try
     {
@@ -260,7 +261,7 @@ app.MapPost("/admin/restore", (HttpRequest request, TsdbEngine tsdbEngine, strin
 
 app.MapGet("/debug/benchmark", (HttpRequest request, TsdbEngine tsdbEngine) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, out _, out var authResult))
+    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
         return authResult;
     var sw = System.Diagnostics.Stopwatch.StartNew();
     var dbCount = tsdbEngine.ListDatabases().Count;
@@ -286,50 +287,39 @@ static bool EnsureQueryAuthorized(HttpRequest request, MiniInfluxOptions options
 {
     result = Results.Unauthorized();
     if (parsed == null)
-        return EnsureAuthorized(request, options, authStore, AuthPermission.Read, db, out _, out result);
+        return EnsureAuthorized(request, options, authStore, AuthPermission.Read, db, null, null, out _, out result);
 
-    if (parsed.Kind is QueryKind.ShowUsers or QueryKind.ShowGrants or QueryKind.CreateUser or QueryKind.GrantPrivilege or QueryKind.RevokePrivilege or QueryKind.DropUser
+    if (parsed.Kind is QueryKind.ShowUsers or QueryKind.ShowGrants or QueryKind.CreateUser or QueryKind.AlterUser or QueryKind.GrantPrivilege or QueryKind.RevokePrivilege or QueryKind.DropUser
         or QueryKind.CreateDatabase or QueryKind.DropDatabase or QueryKind.CreateRetentionPolicy or QueryKind.AlterRetentionPolicy
         or QueryKind.DropRetentionPolicy or QueryKind.CreateContinuousQuery or QueryKind.ShowContinuousQueries
         or QueryKind.DropContinuousQuery or QueryKind.DropShard)
     {
-        return EnsureAuthorized(request, options, authStore, AuthPermission.Admin, parsed.Database ?? db, out _, out result);
+        return EnsureAuthorized(request, options, authStore, AuthPermission.Admin, parsed.Database ?? db, null, null, out _, out result);
     }
 
     if (parsed.Kind is QueryKind.DropMeasurement or QueryKind.DropSeries or QueryKind.Delete)
-        return EnsureAuthorized(request, options, authStore, AuthPermission.Write, db, out _, out result);
+        return EnsureAuthorized(request, options, authStore, AuthPermission.Write, db, null, parsed.Measurement, out _, out result);
 
     if (parsed.Kind == QueryKind.Select)
     {
-        var sourceDb = parsed.SourceDatabase ?? db;
-        if (!EnsureAuthorized(request, options, authStore, AuthPermission.Read, sourceDb, out _, out result))
+        if (!TryAuthenticateOrAllowAnonymous(request, options, authStore, out var identity, out result))
             return false;
-        if (!string.IsNullOrWhiteSpace(parsed.IntoTarget))
+        if (!EnsureSelectAuthorized(identity, authStore, parsed, db))
         {
-            var targetDb = GetIntoTargetDatabase(db, parsed.IntoTarget!);
-            if (!EnsureAuthorized(request, options, authStore, AuthPermission.Write, targetDb, out _, out result))
-                return false;
+            result = Results.Json(new ErrorResponse("forbidden"), AppJsonContext.Default.ErrorResponse, statusCode: 403);
+            return false;
         }
         return true;
     }
 
-    return EnsureAuthorized(request, options, authStore, AuthPermission.Read, db, out _, out result);
+    return EnsureAuthorized(request, options, authStore, AuthPermission.Read, db, null, parsed.Measurement, out _, out result);
 }
 
-static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, AuthStore authStore, AuthPermission permission, string? db, out AuthIdentity? identity, out IResult result)
+static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, AuthStore authStore, AuthPermission permission, string? db, string? rp, string? measurement, out AuthIdentity? identity, out IResult result)
 {
     result = Results.Unauthorized();
-    if (!options.Auth.Enabled)
-    {
-        identity = new AuthIdentity("anonymous", true, new Dictionary<string, string>(StringComparer.Ordinal));
-        return true;
-    }
-
-    if (!TryAuthenticate(request, options, authStore, out identity))
-    {
-        result = Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
+    if (!TryAuthenticateOrAllowAnonymous(request, options, authStore, out identity, out result))
         return false;
-    }
 
     if (permission == AuthPermission.Admin)
     {
@@ -338,10 +328,26 @@ static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, Aut
         return false;
     }
 
-    if (string.IsNullOrWhiteSpace(db) || authStore.IsAuthorized(identity, db!, permission))
+    if (string.IsNullOrWhiteSpace(db) || authStore.IsAuthorized(identity, db!, rp, measurement, permission))
         return true;
 
     result = Results.Json(new ErrorResponse("forbidden"), AppJsonContext.Default.ErrorResponse, statusCode: 403);
+    return false;
+}
+
+static bool TryAuthenticateOrAllowAnonymous(HttpRequest request, MiniInfluxOptions options, AuthStore authStore, out AuthIdentity? identity, out IResult result)
+{
+    result = Results.Unauthorized();
+    if (!options.Auth.Enabled)
+    {
+        identity = new AuthIdentity("anonymous", true, new Dictionary<string, string>(StringComparer.Ordinal));
+        return true;
+    }
+
+    if (TryAuthenticate(request, options, authStore, out identity))
+        return true;
+
+    result = Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
     return false;
 }
 
@@ -384,12 +390,62 @@ static bool TryValidateUser(MiniInfluxOptions options, AuthStore authStore, stri
     return authStore.Validate(user, password, out identity);
 }
 
-static string? GetIntoTargetDatabase(string? defaultDb, string intoTarget)
+static (string? Database, string? RetentionPolicy, string? Measurement) ParseIntoTargetScope(string? defaultDb, string intoTarget)
 {
     var parts = InfluxQlParser.SplitQualifiedIdentifier(intoTarget);
-    return parts.Length >= 2 ? parts[0] : defaultDb;
+    return parts.Length switch
+    {
+        1 => (defaultDb, "autogen", parts[0]),
+        2 => (parts[0], "autogen", parts[1]),
+        3 => (parts[0], parts[1], parts[2]),
+        _ => (defaultDb, "autogen", null)
+    };
 }
 
+static bool EnsureWriteAuthorized(HttpRequest request, MiniInfluxOptions options, AuthStore authStore, string db, string rp, IReadOnlyList<Point> points, out IResult result)
+{
+    result = Results.Unauthorized();
+    if (!TryAuthenticateOrAllowAnonymous(request, options, authStore, out var identity, out result))
+        return false;
+
+    var measurements = points.Select(p => p.Measurement).Distinct(StringComparer.Ordinal).ToList();
+    foreach (var measurement in measurements)
+    {
+        if (!authStore.IsAuthorized(identity, db, rp, measurement, AuthPermission.Write))
+        {
+            result = Results.Json(new ErrorResponse("forbidden"), AppJsonContext.Default.ErrorResponse, statusCode: 403);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool EnsureSelectAuthorized(AuthIdentity? identity, AuthStore authStore, ParsedQuery query, string? defaultDb)
+{
+    if (query.Subquery != null && !EnsureSelectAuthorized(identity, authStore, query.Subquery, defaultDb))
+        return false;
+
+    if (query.Subquery == null)
+    {
+        var sourceDb = query.SourceDatabase ?? defaultDb;
+        if (!string.IsNullOrWhiteSpace(sourceDb))
+        {
+            var sourceRp = query.SourceRpName ?? "autogen";
+            if (!authStore.IsAuthorized(identity, sourceDb!, sourceRp, query.Measurement, AuthPermission.Read))
+                return false;
+        }
+    }
+
+    if (!string.IsNullOrWhiteSpace(query.IntoTarget))
+    {
+        var target = ParseIntoTargetScope(defaultDb, query.IntoTarget!);
+        if (!string.IsNullOrWhiteSpace(target.Database) && !authStore.IsAuthorized(identity, target.Database!, target.RetentionPolicy, target.Measurement, AuthPermission.Write))
+            return false;
+    }
+
+    return true;
+}
 static IResult ChunkedResult(QueryChunkedExecutionOutcome outcome, MetricsCollector metrics, ILogger logger, string? db)
 {
     return Results.Stream(async stream =>

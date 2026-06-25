@@ -198,6 +198,16 @@ public class P1TodoTests : IDisposable
         Assert.Equal(QueryKind.ShowGrants, showGrants.Kind);
         Assert.Equal("readonly", showGrants.UserName);
 
+        var alterUser = InfluxQlParser.Parse("ALTER USER readonly WITH PASSWORD '456'");
+        Assert.Equal(QueryKind.AlterUser, alterUser.Kind);
+        Assert.Equal("readonly", alterUser.UserName);
+        Assert.Equal("456", alterUser.Password);
+
+        var setPassword = InfluxQlParser.Parse("SET PASSWORD FOR readonly = '789'");
+        Assert.Equal(QueryKind.AlterUser, setPassword.Kind);
+        Assert.Equal("readonly", setPassword.UserName);
+        Assert.Equal("789", setPassword.Password);
+
         var qualified = InfluxQlParser.Parse("SELECT value INTO cpu_copy FROM metrics.archive.cpu");
         Assert.Equal("metrics", qualified.SourceDatabase);
         Assert.Equal("archive", qualified.SourceRpName);
@@ -228,6 +238,31 @@ public class P1TodoTests : IDisposable
 
         store.DropUser("readonly");
         Assert.Empty(store.ListUsers());
+    }
+
+    [Fact]
+    public void AuthStore_SupportsRpAndMeasurementScopedAuthorization_AndPasswordRotation()
+    {
+        var authRoot = Path.Combine(_testDir, "auth");
+        var store = new AuthStore(authRoot);
+
+        store.CreateUser("writer", "123", false);
+        store.Grant("writer", "metrics.autogen.cpu", "WRITE");
+        store.Grant("writer", "metrics.archive", "READ");
+
+        Assert.True(store.Validate("writer", "123", out var identity));
+        Assert.NotNull(identity);
+        Assert.True(store.IsAuthorized(identity, "metrics", "autogen", "cpu", AuthPermission.Write));
+        Assert.True(store.IsAuthorized(identity, "metrics", "autogen", "cpu", AuthPermission.Read));
+        Assert.False(store.IsAuthorized(identity, "metrics", "autogen", "mem", AuthPermission.Write));
+        Assert.True(store.IsAuthorized(identity, "metrics", "archive", "disk", AuthPermission.Read));
+        Assert.False(store.IsAuthorized(identity, "metrics", "archive", "disk", AuthPermission.Write));
+
+        store.SetPassword("writer", "456");
+        Assert.False(store.Validate("writer", "123", out _));
+        Assert.True(store.Validate("writer", "456", out var rotatedIdentity));
+        Assert.NotNull(rotatedIdentity);
+        Assert.True(store.IsAuthorized(rotatedIdentity, "metrics", "autogen", "cpu", AuthPermission.Write));
     }
 
     [Fact]

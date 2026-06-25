@@ -36,7 +36,7 @@
   - `MaxRequestBodyBytes`、`MaxBufferPoints`、`MaxBufferBytes`
 - 权限与认证
   - HTTP Basic / query 参数认证
-  - `CREATE USER` / `DROP USER` / `GRANT` / `REVOKE` / `SHOW USERS` / `SHOW GRANTS`
+  - `CREATE USER` / `ALTER USER` / `SET PASSWORD FOR` / `DROP USER` / `GRANT` / `REVOKE` / `SHOW USERS` / `SHOW GRANTS`
 - WAL + Segment 存储
 - Segment v3 列编码：时间戳 `delta-of-delta/Gorilla`、浮点 `legacy XOR/Gorilla`、整数 delta、bool bit-pack、string 字典
 - 自适应浮点压缩策略：在 `legacy_raw`、`legacy_brotli`、`gorilla_raw` 之间按体积/速度折中选择

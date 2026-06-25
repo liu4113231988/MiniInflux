@@ -44,6 +44,17 @@ public sealed class AuthStore
         }
     }
 
+    public void SetPassword(string userName, string password)
+    {
+        lock (_lock)
+        {
+            if (!_data.Users.TryGetValue(userName, out var user))
+                throw new InvalidOperationException($"user not found: {userName}");
+            user.Password = HashPassword(password);
+            Save();
+        }
+    }
+
     public IReadOnlyList<AuthUserRecord> ListUsers()
     {
         lock (_lock) return _data.Users.Values.OrderBy(x => x.UserName, StringComparer.Ordinal).ToList();
@@ -102,10 +113,13 @@ public sealed class AuthStore
     }
 
     public bool IsAuthorized(AuthIdentity? identity, string db, AuthPermission permission)
+        => IsAuthorized(identity, db, null, null, permission);
+
+    public bool IsAuthorized(AuthIdentity? identity, string db, string? rp, string? measurement, AuthPermission permission)
     {
         if (identity == null) return false;
         if (identity.IsAdmin) return true;
-        if (!TryResolveGrant(identity.Grants, db, out var grant)) return false;
+        if (!TryResolveGrant(identity.Grants, db, rp, measurement, out var grant)) return false;
         return permission switch
         {
             AuthPermission.Read => grant is "READ" or "WRITE" or "ALL",
@@ -118,11 +132,28 @@ public sealed class AuthStore
     private static AuthIdentity ToIdentity(AuthUserRecord user) => new(user.UserName, user.IsAdmin,
         new Dictionary<string, string>(user.Grants, StringComparer.Ordinal));
 
-    private static bool TryResolveGrant(Dictionary<string, string> grants, string db, out string grant)
+    private static bool TryResolveGrant(Dictionary<string, string> grants, string db, string? rp, string? measurement, out string grant)
     {
-        if (grants.TryGetValue(db, out grant!))
-            return true;
-        return grants.TryGetValue($"{db}.*", out grant!);
+        foreach (var scope in EnumerateScopes(db, rp, measurement))
+        {
+            if (grants.TryGetValue(scope, out grant!))
+                return true;
+        }
+
+        grant = "";
+        return false;
+    }
+
+    private static IEnumerable<string> EnumerateScopes(string db, string? rp, string? measurement)
+    {
+        if (!string.IsNullOrWhiteSpace(rp) && !string.IsNullOrWhiteSpace(measurement))
+            yield return $"{db}.{rp}.{measurement}";
+        if (!string.IsNullOrWhiteSpace(rp) && !string.IsNullOrWhiteSpace(measurement))
+            yield return $"{db}.{rp}.*";
+        if (!string.IsNullOrWhiteSpace(rp))
+            yield return $"{db}.{rp}";
+        yield return $"{db}.*";
+        yield return db;
     }
 
     private static bool VerifyPassword(AuthUserRecord user, string password, ref bool upgraded)

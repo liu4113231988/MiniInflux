@@ -335,6 +335,7 @@ public sealed class QueryExecutor
             QueryKind.Delete => DeleteResult(e, db, q),
             QueryKind.Select => Select(e, db, q, cancellationToken, report),
             QueryKind.CreateUser => CreateUser(q),
+            QueryKind.AlterUser => AlterUser(q),
             QueryKind.GrantPrivilege => GrantPrivilege(q),
             QueryKind.RevokePrivilege => RevokePrivilege(q),
             QueryKind.ShowUsers => ShowUsers(),
@@ -552,6 +553,12 @@ public sealed class QueryExecutor
     {
         var grant = q.Grant ?? throw new InvalidOperationException("missing grant");
         RequireAuthStore().Grant(grant.UserName, grant.Database, grant.Privilege);
+        return null;
+    }
+
+    List<QuerySeries>? AlterUser(ParsedQuery q)
+    {
+        RequireAuthStore().SetPassword(q.UserName!, q.Password!);
         return null;
     }
 
