@@ -2,6 +2,7 @@ using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
 using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
+using System.Collections.Concurrent;
 
 namespace MiniInflux.Tests;
 
@@ -175,94 +176,26 @@ public class P1TodoTests : IDisposable
     }
 
     [Fact]
-    public void Parser_ParsesSelectIntoAndAuthDdl()
+    public void Parser_ParsesSelectInto_AndRejectsUserManagementDdl()
     {
         var select = InfluxQlParser.Parse("SELECT value INTO archive.cpu FROM cpu");
         Assert.Equal(QueryKind.Select, select.Kind);
         Assert.Equal("archive.cpu", select.IntoTarget);
         Assert.Equal("cpu", select.Measurement);
 
-        var create = InfluxQlParser.Parse("CREATE USER readonly WITH PASSWORD '123'");
-        Assert.Equal(QueryKind.CreateUser, create.Kind);
-        Assert.Equal("readonly", create.UserName);
-        Assert.Equal("123", create.Password);
-
-        var grant = InfluxQlParser.Parse("GRANT READ ON metrics TO readonly");
-        Assert.Equal(QueryKind.GrantPrivilege, grant.Kind);
-        Assert.Equal("metrics", grant.Grant!.Database);
-
-        var revoke = InfluxQlParser.Parse("REVOKE READ ON metrics FROM readonly");
-        Assert.Equal(QueryKind.RevokePrivilege, revoke.Kind);
-
-        var showGrants = InfluxQlParser.Parse("SHOW GRANTS FOR readonly");
-        Assert.Equal(QueryKind.ShowGrants, showGrants.Kind);
-        Assert.Equal("readonly", showGrants.UserName);
-
-        var alterUser = InfluxQlParser.Parse("ALTER USER readonly WITH PASSWORD '456'");
-        Assert.Equal(QueryKind.AlterUser, alterUser.Kind);
-        Assert.Equal("readonly", alterUser.UserName);
-        Assert.Equal("456", alterUser.Password);
-
-        var setPassword = InfluxQlParser.Parse("SET PASSWORD FOR readonly = '789'");
-        Assert.Equal(QueryKind.AlterUser, setPassword.Kind);
-        Assert.Equal("readonly", setPassword.UserName);
-        Assert.Equal("789", setPassword.Password);
+        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse("CREATE USER readonly WITH PASSWORD '123'"));
+        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse("ALTER USER readonly WITH PASSWORD '456'"));
+        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse("SET PASSWORD FOR readonly = '789'"));
+        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse("GRANT READ ON metrics TO readonly"));
+        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse("REVOKE READ ON metrics FROM readonly"));
+        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse("SHOW USERS"));
+        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse("SHOW GRANTS FOR readonly"));
+        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse("DROP USER readonly"));
 
         var qualified = InfluxQlParser.Parse("SELECT value INTO cpu_copy FROM metrics.archive.cpu");
         Assert.Equal("metrics", qualified.SourceDatabase);
         Assert.Equal("archive", qualified.SourceRpName);
         Assert.Equal("cpu", qualified.Measurement);
-    }
-
-    [Fact]
-    public void AuthStore_SupportsCrudAndGrant()
-    {
-        var authRoot = Path.Combine(_testDir, "auth");
-        var store = new AuthStore(authRoot);
-
-        store.CreateUser("readonly", "123", false);
-        store.Grant("readonly", "metrics", "READ");
-
-        Assert.True(store.Validate("readonly", "123", out var identity));
-        Assert.NotNull(identity);
-        Assert.True(store.IsAuthorized(identity, "metrics", AuthPermission.Read));
-        Assert.False(store.IsAuthorized(identity, "metrics", AuthPermission.Write));
-
-        var users = store.ListUsers();
-        Assert.Single(users);
-        Assert.Equal("readonly", users[0].UserName);
-        Assert.StartsWith("sha256:", users[0].Password, StringComparison.Ordinal);
-
-        store.Revoke("readonly", "metrics", "READ");
-        Assert.False(store.IsAuthorized(store.Find("readonly"), "metrics", AuthPermission.Read));
-
-        store.DropUser("readonly");
-        Assert.Empty(store.ListUsers());
-    }
-
-    [Fact]
-    public void AuthStore_SupportsRpAndMeasurementScopedAuthorization_AndPasswordRotation()
-    {
-        var authRoot = Path.Combine(_testDir, "auth");
-        var store = new AuthStore(authRoot);
-
-        store.CreateUser("writer", "123", false);
-        store.Grant("writer", "metrics.autogen.cpu", "WRITE");
-        store.Grant("writer", "metrics.archive", "READ");
-
-        Assert.True(store.Validate("writer", "123", out var identity));
-        Assert.NotNull(identity);
-        Assert.True(store.IsAuthorized(identity, "metrics", "autogen", "cpu", AuthPermission.Write));
-        Assert.True(store.IsAuthorized(identity, "metrics", "autogen", "cpu", AuthPermission.Read));
-        Assert.False(store.IsAuthorized(identity, "metrics", "autogen", "mem", AuthPermission.Write));
-        Assert.True(store.IsAuthorized(identity, "metrics", "archive", "disk", AuthPermission.Read));
-        Assert.False(store.IsAuthorized(identity, "metrics", "archive", "disk", AuthPermission.Write));
-
-        store.SetPassword("writer", "456");
-        Assert.False(store.Validate("writer", "123", out _));
-        Assert.True(store.Validate("writer", "456", out var rotatedIdentity));
-        Assert.NotNull(rotatedIdentity);
-        Assert.True(store.IsAuthorized(rotatedIdentity, "metrics", "autogen", "cpu", AuthPermission.Write));
     }
 
     [Fact]
@@ -577,11 +510,290 @@ public class P1TodoTests : IDisposable
         Assert.True(stats.MemoryBufferBytes >= 0);
     }
 
+    [Fact]
+    public async Task ComplexGroupByQuery_TracksIntermediateMemory_AndRejectsTightLimit()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        var points = new List<Point>();
+        for (var hostIndex = 0; hostIndex < 4; hostIndex++)
+        {
+            for (var bucketIndex = 0; bucketIndex < 6; bucketIndex++)
+            {
+                points.Add(new Point
+                {
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string> { ["host"] = $"server{hostIndex:00}" },
+                    Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(bucketIndex + hostIndex) },
+                    TimestampNs = bucketIndex * 10_000_000_000L + hostIndex
+                });
+            }
+        }
+
+        await engine.WriteAsync("testdb", "autogen", points);
+
+        const string query = "SELECT mean(value),max(value),count(value) FROM cpu GROUP BY time(10s),host";
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb", query);
+
+        Assert.Null(outcome.Response.Results[0].Error);
+        Assert.True(outcome.Report.EstimatedInputBytes > 0);
+        Assert.True(outcome.Report.EstimatedResultBytes > 0);
+        Assert.True(outcome.Report.PeakEstimatedMemoryBytes > outcome.Report.EstimatedInputBytes);
+
+        var limited = new QueryExecutor(maxQueryMemoryBytes: outcome.Report.PeakEstimatedMemoryBytes - 1)
+            .ExecuteWithReport(engine, "testdb", query);
+
+        Assert.Contains("query memory limit exceeded", limited.Response.Results[0].Error);
+    }
+
+    [Fact]
+    public async Task SubqueryAggregation_TracksMaterializationPeak_AndRejectsTightLimit()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        var points = new List<Point>();
+        for (var hostIndex = 0; hostIndex < 3; hostIndex++)
+        {
+            for (var bucketIndex = 0; bucketIndex < 6; bucketIndex++)
+            {
+                points.Add(new Point
+                {
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string> { ["host"] = $"server{hostIndex:00}" },
+                    Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble((hostIndex + 1) * (bucketIndex + 1)) },
+                    TimestampNs = bucketIndex * 10_000_000_000L + hostIndex
+                });
+            }
+        }
+
+        await engine.WriteAsync("testdb", "autogen", points);
+
+        const string query = "SELECT mean(max_value) FROM (SELECT max(value) FROM cpu GROUP BY time(10s),host) GROUP BY host";
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb", query);
+
+        Assert.Null(outcome.Response.Results[0].Error);
+        Assert.True(outcome.Report.EstimatedInputBytes > 0);
+        Assert.True(outcome.Report.PeakEstimatedMemoryBytes > outcome.Report.EstimatedInputBytes);
+
+        var limited = new QueryExecutor(maxQueryMemoryBytes: outcome.Report.PeakEstimatedMemoryBytes - 1)
+            .ExecuteWithReport(engine, "testdb", query);
+
+        Assert.Contains("query memory limit exceeded", limited.Response.Results[0].Error);
+    }
+
+    [Fact]
+    public async Task SelectInto_GroupByQuery_AccountsForWriteBackMaterialization()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        var points = new List<Point>();
+        for (var hostIndex = 0; hostIndex < 3; hostIndex++)
+        {
+            for (var bucketIndex = 0; bucketIndex < 5; bucketIndex++)
+            {
+                points.Add(new Point
+                {
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string> { ["host"] = $"server{hostIndex:00}" },
+                    Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(hostIndex + bucketIndex + 1) },
+                    TimestampNs = bucketIndex * 10_000_000_000L + hostIndex
+                });
+            }
+        }
+
+        await engine.WriteAsync("testdb", "autogen", points);
+
+        const string query = "SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host";
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb", query);
+
+        Assert.Null(outcome.Response.Results[0].Error);
+        Assert.True(outcome.Report.PeakEstimatedMemoryBytes > outcome.Report.EstimatedInputBytes + outcome.Report.EstimatedResultBytes);
+
+        var limited = new QueryExecutor(maxQueryMemoryBytes: outcome.Report.PeakEstimatedMemoryBytes - 1)
+            .ExecuteWithReport(engine, "testdb", query);
+
+        Assert.Contains("query memory limit exceeded", limited.Response.Results[0].Error);
+    }
+
+    [Fact]
+    public async Task Compactor_CanRunConcurrentlyWithQueries_WithoutErrors()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        var executor = new QueryExecutor();
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 2,
+            maxL1Segments: 2);
+
+        for (var i = 0; i < 12; i++)
+            await engine.WriteAsync("testdb", "autogen", [PointWithTimestamp("cpu", i, "server01", i)]);
+
+        var queryErrors = new ConcurrentQueue<string>();
+
+        var writer = Task.Run(async () =>
+        {
+            for (var i = 12; i < 40; i++)
+            {
+                await engine.WriteAsync("testdb", "autogen", [PointWithTimestamp("cpu", i, "server01", i)]);
+                if (i % 4 == 0)
+                    await Task.Yield();
+            }
+        });
+
+        var reader = Task.Run(() =>
+        {
+            for (var i = 0; i < 40; i++)
+            {
+                var outcome = executor.ExecuteWithReport(engine, "testdb", "SELECT max(value),count(value) FROM cpu");
+                if (!string.IsNullOrWhiteSpace(outcome.Response.Results[0].Error))
+                    queryErrors.Enqueue(outcome.Response.Results[0].Error!);
+            }
+        });
+
+        var compacting = Task.Run(() =>
+        {
+            for (var i = 0; i < 20; i++)
+            {
+                compactor.CompactAll();
+                Thread.Sleep(2);
+            }
+        });
+
+        await Task.WhenAll(writer, reader, compacting);
+        compactor.CompactAll();
+
+        Assert.Empty(queryErrors);
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+        Assert.Equal(40, points.Count);
+        Assert.Equal(39.0, points[^1].Fields["value"].AsDouble());
+    }
+
+    [Fact]
+    public async Task Compactor_Soak_WriteDeleteCompact_PreservesExpectedVisibleDataset()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 2,
+            maxL1Segments: 2);
+        var expected = new SortedDictionary<long, double>();
+
+        for (var i = 0; i < 36; i++)
+        {
+            await engine.WriteAsync("testdb", "autogen", [PointWithTimestamp("cpu", i, "server01", i)]);
+            expected[i] = i;
+
+            if (i > 0 && i % 4 == 0)
+            {
+                var overwriteTs = i - 1;
+                var overwriteValue = 1000 + i;
+                await engine.WriteAsync("testdb", "autogen", [PointWithTimestamp("cpu", overwriteValue, "server01", overwriteTs)]);
+                expected[overwriteTs] = overwriteValue;
+            }
+
+            if (i > 2 && i % 5 == 0)
+            {
+                var deleteTs = i - 2;
+                engine.DeleteFromMeasurement("testdb", "cpu", deleteTs, deleteTs);
+                expected.Remove(deleteTs);
+            }
+
+            if (i % 3 == 0)
+                compactor.CompactAll();
+        }
+
+        compactor.CompactAll();
+        compactor.CompactAll();
+
+        var actual = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+
+        Assert.Equal(expected.Count, actual.Count);
+        Assert.Equal(expected.Keys, actual.Select(p => p.TimestampNs));
+        foreach (var point in actual)
+            Assert.Equal(expected[point.TimestampNs], point.Fields["value"].AsDouble());
+    }
+
+    [Fact]
+    public async Task Compactor_CanRunConcurrentlyWithDeletesAndQueries_WithoutLeakingDeletedPoints()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        var executor = new QueryExecutor();
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 2,
+            maxL1Segments: 2);
+
+        for (var i = 0; i < 50; i++)
+            await engine.WriteAsync("testdb", "autogen", [PointWithTimestamp("cpu", i, "server01", i)]);
+
+        var deleted = Enumerable.Range(0, 50).Where(i => i % 2 == 0).Select(i => (long)i).ToHashSet();
+        var queryErrors = new ConcurrentQueue<string>();
+
+        var deleter = Task.Run(() =>
+        {
+            foreach (var timestamp in deleted)
+            {
+                engine.DeleteFromMeasurement("testdb", "cpu", timestamp, timestamp);
+                Thread.Sleep(1);
+            }
+        });
+
+        var reader = Task.Run(() =>
+        {
+            for (var i = 0; i < 50; i++)
+            {
+                var outcome = executor.ExecuteWithReport(engine, "testdb", "SELECT value FROM cpu");
+                if (!string.IsNullOrWhiteSpace(outcome.Response.Results[0].Error))
+                    queryErrors.Enqueue(outcome.Response.Results[0].Error!);
+            }
+        });
+
+        var compacting = Task.Run(() =>
+        {
+            for (var i = 0; i < 25; i++)
+            {
+                compactor.CompactAll();
+                Thread.Sleep(1);
+            }
+        });
+
+        await Task.WhenAll(deleter, reader, compacting);
+        compactor.CompactAll();
+        compactor.CompactAll();
+
+        Assert.Empty(queryErrors);
+        var remaining = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+
+        Assert.Equal(25, remaining.Count);
+        Assert.DoesNotContain(remaining, point => deleted.Contains(point.TimestampNs));
+        Assert.Equal(Enumerable.Range(0, 50).Where(i => i % 2 == 1).Select(i => (long)i), remaining.Select(p => p.TimestampNs));
+    }
+
     private static Point Point(string measurement, double value, string host) => new()
     {
         Measurement = measurement,
         Tags = new Dictionary<string, string> { ["host"] = host },
         Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(value) },
         TimestampNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000 + (long)(value * 1_000_000)
+    };
+
+    private static Point PointWithTimestamp(string measurement, double value, string host, long timestampNs) => new()
+    {
+        Measurement = measurement,
+        Tags = new Dictionary<string, string> { ["host"] = host },
+        Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(value) },
+        TimestampNs = timestampNs
     };
 }

@@ -1,6 +1,9 @@
+using System.Globalization;
 using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
+using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
@@ -46,6 +49,11 @@ if (!options.Http.Enabled)
     return;
 }
 
+if (options.Auth.Enabled && (string.IsNullOrWhiteSpace(options.Auth.Username) || string.IsNullOrEmpty(options.Auth.Password)))
+    throw new InvalidOperationException("Auth.Username and Auth.Password are required when Auth.Enabled is true.");
+
+var authenticationGuard = new AuthenticationGuard(options.Auth);
+
 builder.WebHost.UseUrls(options.Urls);
 if (options.Tls.Enabled && !string.IsNullOrWhiteSpace(options.Tls.CertPath))
 {
@@ -71,16 +79,13 @@ var engine = new TsdbEngine(
     options.Storage.MaxFieldsPerMeasurement,
     maxBufferPoints: options.Storage.MaxBufferPoints,
     maxBufferBytes: options.Storage.MaxBufferBytes);
-var authStore = new AuthStore(options.DataPath);
 
 builder.Services.AddSingleton(engine);
-builder.Services.AddSingleton(authStore);
 builder.Services.AddSingleton(new QueryExecutor(
     options.Storage.MaxResponseRows,
     options.Storage.MaxQueryPoints,
     options.Storage.MaxQueryDurationMs,
-    options.Storage.MaxQueryMemoryBytes,
-    authStore));
+    options.Storage.MaxQueryMemoryBytes));
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton<MetricsCollector>();
 builder.Services.AddSingleton(new AccessLogWriter(options.Http.AccessLogPath));
@@ -91,6 +96,9 @@ builder.Services.AddHostedService<ContinuousQueryHostedService>();
 var app = builder.Build();
 var runtimeLogger = app.Logger;
 var accessLogWriter = app.Services.GetRequiredService<AccessLogWriter>();
+var webRoot = Path.Combine(app.Environment.ContentRootPath, "wwwroot");
+var adminIndexPath = Path.Combine(webRoot, "admin", "index.html");
+var adminAssetsRoot = Path.GetFullPath(Path.Combine(webRoot, "admin", "assets"));
 
 engine.Recover();
 runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {BindAddress}, auth {AuthEnabled}, log level {LogLevel}",
@@ -118,13 +126,59 @@ app.Use(async (context, next) =>
     }
 });
 
+app.Use(async (context, next) =>
+{
+    if (!context.Request.Path.StartsWithSegments("/admin/api", out var remainingPath))
+    {
+        await next();
+        return;
+    }
+
+    context.Response.Headers.CacheControl = "no-store";
+    if (remainingPath.Equals("/session", StringComparison.OrdinalIgnoreCase))
+    {
+        await next();
+        return;
+    }
+
+    if (!options.Auth.Enabled)
+    {
+        await next();
+        return;
+    }
+
+    var attempt = authenticationGuard.Evaluate(context.Request);
+    AuditAuthenticationAttempt(runtimeLogger, context.Request, attempt, options.Auth);
+    if (!attempt.Authenticated)
+    {
+        if (attempt.IsRateLimited)
+            ApplyRetryAfterHeader(context.Response, attempt);
+        await Results.Json(
+            new ErrorResponse(attempt.IsRateLimited ? BuildRateLimitMessage(attempt) : "unauthorized"),
+            AppJsonContext.Default.ErrorResponse,
+            statusCode: attempt.IsRateLimited ? 429 : 401).ExecuteAsync(context);
+        return;
+    }
+
+    await next();
+});
+
+app.UseDefaultFiles(new DefaultFilesOptions
+{
+    FileProvider = new PhysicalFileProvider(webRoot)
+});
+app.UseStaticFiles(new StaticFileOptions
+{
+    FileProvider = new PhysicalFileProvider(webRoot)
+});
+
 app.MapGet("/ping", () => Results.NoContent());
 
 app.MapGet("/health", () => Results.Ok(new { name = "miniinflux", message = "ready", status = "pass" }));
 
 app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
     var stats = metrics.CollectStats();
     return Results.Json(stats, AppJsonContext.Default.DebugStats);
@@ -132,7 +186,7 @@ app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
 
 app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
     var text = metrics.FormatPrometheus();
     return Results.Text(text, "text/plain; version=0.0.4; charset=utf-8");
@@ -157,8 +211,8 @@ app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQu
     try
     {
         var points = LineProtocolParser.ParseMany(body, TimestampPrecision.Parse(precision));
-        if (!EnsureWriteAuthorized(request, options, authStore, db, rp ?? "autogen", points, out var authResult))
-            return authResult;
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
 
         try
         {
@@ -211,10 +265,7 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     if (string.IsNullOrWhiteSpace(q))
         return Results.BadRequest(new ErrorResponse("missing required parameter q"));
 
-    ParsedQuery? parsed = null;
-    try { parsed = InfluxQlParser.Parse(q); } catch { }
-
-    if (!EnsureQueryAuthorized(request, options, authStore, db, parsed, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
 
     if (options.Data.QueryLogEnabled)
@@ -234,8 +285,8 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
 
 app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string path) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
-        return authResult;
+        if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+            return authResult;
     tsdbEngine.FlushAll();
     BackupManager.CreateBackup(tsdbEngine.RootPath, path);
     runtimeLogger.LogInformation("backup created path={Path}", Path.GetFullPath(path));
@@ -244,7 +295,7 @@ app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string
 
 app.MapPost("/admin/restore", (HttpRequest request, TsdbEngine tsdbEngine, string path) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
     try
     {
@@ -261,7 +312,7 @@ app.MapPost("/admin/restore", (HttpRequest request, TsdbEngine tsdbEngine, strin
 
 app.MapGet("/debug/benchmark", (HttpRequest request, TsdbEngine tsdbEngine) =>
 {
-    if (!EnsureAuthorized(request, options, authStore, AuthPermission.Admin, null, null, null, out _, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
     var sw = System.Diagnostics.Stopwatch.StartNew();
     var dbCount = tsdbEngine.ListDatabases().Count;
@@ -271,180 +322,311 @@ app.MapGet("/debug/benchmark", (HttpRequest request, TsdbEngine tsdbEngine) =>
     return Results.Ok(new BenchmarkSnapshot(dbCount, buffered, bufferedBytes, sw.Elapsed.TotalMilliseconds));
 });
 
+var adminApi = app.MapGroup("/admin/api");
+
+adminApi.MapGet("/session", (HttpRequest request) =>
+{
+    if (!options.Auth.Enabled)
+    {
+        return Results.Json(new AdminSessionResponse
+        {
+            RequiresAuthentication = false,
+            Authenticated = true,
+            UserName = null
+        }, AppJsonContext.Default.AdminSessionResponse);
+    }
+
+    var attempt = authenticationGuard.Evaluate(request);
+    AuditAuthenticationAttempt(runtimeLogger, request, attempt, options.Auth);
+    return Results.Json(new AdminSessionResponse
+    {
+        RequiresAuthentication = true,
+        Authenticated = attempt.Authenticated,
+        UserName = attempt.Authenticated ? options.Auth.Username : null,
+        RateLimited = attempt.IsRateLimited,
+        RetryAfterSeconds = attempt.RetryAfterSeconds > 0 ? attempt.RetryAfterSeconds : null
+    }, AppJsonContext.Default.AdminSessionResponse);
+});
+
+adminApi.MapGet("/overview", (HttpRequest request, MetricsCollector metrics) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    var databases = engine.ListDatabases();
+    var payload = new AdminOverviewResponse
+    {
+        DataPath = Path.GetFullPath(options.DataPath),
+        HttpBindAddress = options.Http.BindAddress,
+        AuthEnabled = options.Auth.Enabled,
+        TlsEnabled = options.Tls.Enabled,
+        RestorePending = Directory.Exists(options.DataPath + ".restore-pending"),
+        RestorePreviousExists = Directory.Exists(options.DataPath + ".restore-previous"),
+        DatabaseCount = databases.Count,
+        ContinuousQueryCount = engine.Meta.ListContinuousQueries().Count,
+        Stats = metrics.CollectStats()
+    };
+    return Results.Json(payload, AppJsonContext.Default.AdminOverviewResponse);
+});
+
+adminApi.MapGet("/databases", (HttpRequest request) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    var payload = engine.ListDatabases()
+        .Select(db =>
+        {
+            var rpSummaries = engine.Meta.ListRetentionPolicies(db)
+                .OrderBy(rp => rp.Name, StringComparer.Ordinal)
+                .Select(rp =>
+                {
+                    var shards = engine.Meta.GetShards(db, rp.Name);
+                    return new AdminRetentionPolicySummary
+                    {
+                        Name = rp.Name,
+                        DurationNs = rp.DurationNs,
+                        IsDefault = rp.IsDefault,
+                        ShardCount = shards.Count,
+                        SegmentCount = shards.Sum(shard => shard.SegmentFiles.Count)
+                    };
+                })
+                .ToList();
+
+            return new AdminDatabaseSummary
+            {
+                Name = db,
+                DefaultRetentionPolicy = engine.GetDefaultRpName(db),
+                MeasurementCount = engine.ListMeasurements(db).Count,
+                SeriesCardinality = engine.GetSeriesCardinality(db),
+                ShardCount = rpSummaries.Sum(rp => rp.ShardCount),
+                SegmentCount = rpSummaries.Sum(rp => rp.SegmentCount),
+                RetentionPolicies = rpSummaries
+            };
+        })
+        .OrderBy(db => db.Name, StringComparer.Ordinal)
+        .ToList();
+
+    return Results.Json(payload, AppJsonContext.Default.ListAdminDatabaseSummary);
+});
+
+adminApi.MapGet("/continuous-queries", (HttpRequest request) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    var payload = engine.Meta.ListContinuousQueries()
+        .Select(cq => new AdminContinuousQuerySummary
+        {
+            Database = cq.Database,
+            Name = cq.Name,
+            QueryText = cq.QueryText,
+            EveryNs = cq.EveryNs,
+            ForNs = cq.ForNs,
+            RecomputeRecentBuckets = cq.RecomputeRecentBuckets,
+            LastCompletedBucketStartNs = cq.LastCompletedBucketStartNs == long.MinValue ? null : cq.LastCompletedBucketStartNs
+        })
+        .ToList();
+
+    return Results.Json(payload, AppJsonContext.Default.ListAdminContinuousQuerySummary);
+});
+
+adminApi.MapPost("/backup", async (HttpRequest request) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    var payload = await ReadJsonAsync(request, AppJsonContext.Default.BackupPathRequest);
+    if (payload == null || string.IsNullOrWhiteSpace(payload.Path))
+        return Results.BadRequest(new ErrorResponse("path is required"));
+
+    try
+    {
+        engine.FlushAll();
+        BackupManager.CreateBackup(engine.RootPath, payload.Path.Trim());
+        runtimeLogger.LogInformation("admin ui backup created path={Path}", Path.GetFullPath(payload.Path.Trim()));
+        return Results.Json(new AdminMessage("backup completed"), AppJsonContext.Default.AdminMessage);
+    }
+    catch (Exception ex)
+    {
+        runtimeLogger.LogWarning(ex, "admin ui backup failed path={Path}", payload.Path.Trim());
+        return Results.BadRequest(new ErrorResponse(ex.Message));
+    }
+});
+
+adminApi.MapPost("/restore", async (HttpRequest request) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    var payload = await ReadJsonAsync(request, AppJsonContext.Default.BackupPathRequest);
+    if (payload == null || string.IsNullOrWhiteSpace(payload.Path))
+        return Results.BadRequest(new ErrorResponse("path is required"));
+
+    try
+    {
+        BackupManager.PrepareRestore(payload.Path.Trim(), engine.RootPath);
+        runtimeLogger.LogInformation("admin ui restore prepared path={Path}", Path.GetFullPath(payload.Path.Trim()));
+        return Results.Json(new AdminMessage("restore prepared; restart required"), AppJsonContext.Default.AdminMessage);
+    }
+    catch (Exception ex)
+    {
+        runtimeLogger.LogWarning(ex, "admin ui restore prepare failed path={Path}", payload.Path.Trim());
+        return Results.BadRequest(new ErrorResponse(ex.Message));
+    }
+});
+
+adminApi.MapPost("/maintenance/flush", (HttpRequest request) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    engine.FlushAll();
+    return Results.Json(new MaintenanceResult { Message = "flush completed" }, AppJsonContext.Default.MaintenanceResult);
+});
+
+adminApi.MapPost("/maintenance/compact", (HttpRequest request) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    engine.FlushAll();
+    var merged = engine.CompactNow();
+    var stats = engine.GetCompactionStats();
+    runtimeLogger.LogInformation("admin ui compaction run merged={Merged}", merged);
+    return Results.Json(new MaintenanceResult
+    {
+        Message = "compaction completed",
+        CompactionTasksMerged = merged,
+        Compaction = stats
+    }, AppJsonContext.Default.MaintenanceResult);
+});
+
+adminApi.MapPost("/maintenance/cq/run", async (HttpRequest request, ContinuousQueryRunner runner) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    var executed = await runner.ExecuteDueQueriesAsync(request.HttpContext.RequestAborted);
+    runtimeLogger.LogInformation("admin ui continuous query cycle executed={Executed}", executed);
+    return Results.Json(new MaintenanceResult
+    {
+        Message = "continuous query cycle completed",
+        ContinuousQueriesExecuted = executed
+    }, AppJsonContext.Default.MaintenanceResult);
+});
+
+app.MapGet("/admin", () => File.Exists(adminIndexPath)
+    ? Results.File(adminIndexPath, "text/html; charset=utf-8")
+    : Results.NotFound());
+
+app.MapGet("/admin/assets/{**assetPath}", (string? assetPath, HttpResponse response) =>
+{
+    if (string.IsNullOrWhiteSpace(assetPath))
+        return Results.NotFound();
+
+    var candidatePath = Path.GetFullPath(Path.Combine(
+        adminAssetsRoot,
+        assetPath.Replace('/', Path.DirectorySeparatorChar)));
+    var assetsPrefix = adminAssetsRoot.EndsWith(Path.DirectorySeparatorChar)
+        ? adminAssetsRoot
+        : adminAssetsRoot + Path.DirectorySeparatorChar;
+
+    if (!candidatePath.StartsWith(assetsPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(candidatePath))
+        return Results.NotFound();
+
+    response.Headers.CacheControl = "public,max-age=31536000,immutable";
+    return Results.File(candidatePath, GetAdminAssetContentType(candidatePath));
+});
+
+app.MapGet("/admin/{**path}", (string? path) =>
+{
+    if (string.Equals(path, "api", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(path, "api/", StringComparison.OrdinalIgnoreCase)
+        || path?.StartsWith("api/", StringComparison.OrdinalIgnoreCase) == true)
+        return Results.NotFound();
+    if (!string.IsNullOrWhiteSpace(path) && Path.HasExtension(path))
+        return Results.NotFound();
+    return File.Exists(adminIndexPath)
+        ? Results.File(adminIndexPath, "text/html; charset=utf-8")
+        : Results.NotFound();
+});
+
 app.Lifetime.ApplicationStopping.Register(() =>
 {
     runtimeLogger.LogInformation("MiniInflux shutting down");
-    accessLogWriter.Dispose();
-    var wq = app.Services.GetRequiredService<WriteQueue>();
-    wq.Dispose();
-    var eng = app.Services.GetRequiredService<TsdbEngine>();
-    eng.Dispose();
 });
 
 app.Run();
 
-static bool EnsureQueryAuthorized(HttpRequest request, MiniInfluxOptions options, AuthStore authStore, string? db, ParsedQuery? parsed, out IResult result)
+static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, AuthenticationGuard authenticationGuard, ILogger logger, out IResult result)
 {
-    result = Results.Unauthorized();
-    if (parsed == null)
-        return EnsureAuthorized(request, options, authStore, AuthPermission.Read, db, null, null, out _, out result);
-
-    if (parsed.Kind is QueryKind.ShowUsers or QueryKind.ShowGrants or QueryKind.CreateUser or QueryKind.AlterUser or QueryKind.GrantPrivilege or QueryKind.RevokePrivilege or QueryKind.DropUser
-        or QueryKind.CreateDatabase or QueryKind.DropDatabase or QueryKind.CreateRetentionPolicy or QueryKind.AlterRetentionPolicy
-        or QueryKind.DropRetentionPolicy or QueryKind.CreateContinuousQuery or QueryKind.ShowContinuousQueries
-        or QueryKind.DropContinuousQuery or QueryKind.DropShard)
-    {
-        return EnsureAuthorized(request, options, authStore, AuthPermission.Admin, parsed.Database ?? db, null, null, out _, out result);
-    }
-
-    if (parsed.Kind is QueryKind.DropMeasurement or QueryKind.DropSeries or QueryKind.Delete)
-        return EnsureAuthorized(request, options, authStore, AuthPermission.Write, db, null, parsed.Measurement, out _, out result);
-
-    if (parsed.Kind == QueryKind.Select)
-    {
-        if (!TryAuthenticateOrAllowAnonymous(request, options, authStore, out var identity, out result))
-            return false;
-        if (!EnsureSelectAuthorized(identity, authStore, parsed, db))
-        {
-            result = Results.Json(new ErrorResponse("forbidden"), AppJsonContext.Default.ErrorResponse, statusCode: 403);
-            return false;
-        }
-        return true;
-    }
-
-    return EnsureAuthorized(request, options, authStore, AuthPermission.Read, db, null, parsed.Measurement, out _, out result);
-}
-
-static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, AuthStore authStore, AuthPermission permission, string? db, string? rp, string? measurement, out AuthIdentity? identity, out IResult result)
-{
-    result = Results.Unauthorized();
-    if (!TryAuthenticateOrAllowAnonymous(request, options, authStore, out identity, out result))
-        return false;
-
-    if (permission == AuthPermission.Admin)
-    {
-        if (identity!.IsAdmin) return true;
-        result = Results.Json(new ErrorResponse("forbidden"), AppJsonContext.Default.ErrorResponse, statusCode: 403);
-        return false;
-    }
-
-    if (string.IsNullOrWhiteSpace(db) || authStore.IsAuthorized(identity, db!, rp, measurement, permission))
-        return true;
-
-    result = Results.Json(new ErrorResponse("forbidden"), AppJsonContext.Default.ErrorResponse, statusCode: 403);
-    return false;
-}
-
-static bool TryAuthenticateOrAllowAnonymous(HttpRequest request, MiniInfluxOptions options, AuthStore authStore, out AuthIdentity? identity, out IResult result)
-{
-    result = Results.Unauthorized();
     if (!options.Auth.Enabled)
     {
-        identity = new AuthIdentity("anonymous", true, new Dictionary<string, string>(StringComparer.Ordinal));
+        result = Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
         return true;
     }
 
-    if (TryAuthenticate(request, options, authStore, out identity))
+    var attempt = authenticationGuard.Evaluate(request);
+    AuditAuthenticationAttempt(logger, request, attempt, options.Auth);
+    if (attempt.Authenticated)
+    {
+        result = Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
         return true;
+    }
+
+    if (attempt.IsRateLimited)
+    {
+        ApplyRetryAfterHeader(request.HttpContext.Response, attempt);
+        result = Results.Json(new ErrorResponse(BuildRateLimitMessage(attempt)), AppJsonContext.Default.ErrorResponse, statusCode: 429);
+        return false;
+    }
 
     result = Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
     return false;
 }
 
-static bool TryAuthenticate(HttpRequest request, MiniInfluxOptions options, AuthStore authStore, out AuthIdentity? identity)
+static void AuditAuthenticationAttempt(ILogger logger, HttpRequest request, AuthenticationAttempt attempt, AuthOptions options)
 {
-    identity = null;
-    var user = request.Query["u"].ToString();
-    var pass = request.Query["p"].ToString();
-    if (TryValidateUser(options, authStore, user, pass, out identity))
-        return true;
+    if (!options.AuditFailures)
+        return;
 
-    var auth = request.Headers.Authorization.ToString();
-    if (auth.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+    if (attempt.Status == AuthenticationAttemptStatus.InvalidCredentials)
     {
-        try
-        {
-            var raw = Encoding.UTF8.GetString(Convert.FromBase64String(auth["Basic ".Length..].Trim()));
-            var i = raw.IndexOf(':');
-            if (i > 0 && TryValidateUser(options, authStore, raw[..i], raw[(i + 1)..], out identity))
-                return true;
-        }
-        catch { }
+        logger.LogWarning(
+            "authentication failed client={ClientId} path={Path} method={Method} source={Source} user={UserName} failures={FailureCount}/{MaxFailedAttempts}",
+            attempt.ClientId,
+            request.Path,
+            request.Method,
+            attempt.CredentialSource,
+            attempt.PresentedUserName ?? "-",
+            attempt.FailureCount,
+            attempt.MaxFailedAttempts);
     }
-
-    return false;
+    else if (attempt.Status == AuthenticationAttemptStatus.RateLimited)
+    {
+        logger.LogWarning(
+            "authentication rate limited client={ClientId} path={Path} method={Method} source={Source} user={UserName} retry_after_s={RetryAfterSeconds}",
+            attempt.ClientId,
+            request.Path,
+            request.Method,
+            attempt.CredentialSource,
+            attempt.PresentedUserName ?? "-",
+            attempt.RetryAfterSeconds);
+    }
 }
 
-static bool TryValidateUser(MiniInfluxOptions options, AuthStore authStore, string user, string password, out AuthIdentity? identity)
+static void ApplyRetryAfterHeader(HttpResponse response, AuthenticationAttempt attempt)
 {
-    identity = null;
-    if (string.IsNullOrWhiteSpace(user))
-        return false;
-
-    if (options.Auth.Users.TryGetValue(user, out var expected) && expected == password)
-    {
-        identity = new AuthIdentity(user, true, new Dictionary<string, string>(StringComparer.Ordinal));
-        return true;
-    }
-
-    return authStore.Validate(user, password, out identity);
+    if (attempt.RetryAfterSeconds > 0)
+        response.Headers.RetryAfter = attempt.RetryAfterSeconds.ToString(CultureInfo.InvariantCulture);
 }
 
-static (string? Database, string? RetentionPolicy, string? Measurement) ParseIntoTargetScope(string? defaultDb, string intoTarget)
+static string BuildRateLimitMessage(AuthenticationAttempt attempt)
 {
-    var parts = InfluxQlParser.SplitQualifiedIdentifier(intoTarget);
-    return parts.Length switch
-    {
-        1 => (defaultDb, "autogen", parts[0]),
-        2 => (parts[0], "autogen", parts[1]),
-        3 => (parts[0], parts[1], parts[2]),
-        _ => (defaultDb, "autogen", null)
-    };
-}
-
-static bool EnsureWriteAuthorized(HttpRequest request, MiniInfluxOptions options, AuthStore authStore, string db, string rp, IReadOnlyList<Point> points, out IResult result)
-{
-    result = Results.Unauthorized();
-    if (!TryAuthenticateOrAllowAnonymous(request, options, authStore, out var identity, out result))
-        return false;
-
-    var measurements = points.Select(p => p.Measurement).Distinct(StringComparer.Ordinal).ToList();
-    foreach (var measurement in measurements)
-    {
-        if (!authStore.IsAuthorized(identity, db, rp, measurement, AuthPermission.Write))
-        {
-            result = Results.Json(new ErrorResponse("forbidden"), AppJsonContext.Default.ErrorResponse, statusCode: 403);
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static bool EnsureSelectAuthorized(AuthIdentity? identity, AuthStore authStore, ParsedQuery query, string? defaultDb)
-{
-    if (query.Subquery != null && !EnsureSelectAuthorized(identity, authStore, query.Subquery, defaultDb))
-        return false;
-
-    if (query.Subquery == null)
-    {
-        var sourceDb = query.SourceDatabase ?? defaultDb;
-        if (!string.IsNullOrWhiteSpace(sourceDb))
-        {
-            var sourceRp = query.SourceRpName ?? "autogen";
-            if (!authStore.IsAuthorized(identity, sourceDb!, sourceRp, query.Measurement, AuthPermission.Read))
-                return false;
-        }
-    }
-
-    if (!string.IsNullOrWhiteSpace(query.IntoTarget))
-    {
-        var target = ParseIntoTargetScope(defaultDb, query.IntoTarget!);
-        if (!string.IsNullOrWhiteSpace(target.Database) && !authStore.IsAuthorized(identity, target.Database!, target.RetentionPolicy, target.Measurement, AuthPermission.Write))
-            return false;
-    }
-
-    return true;
+    return attempt.RetryAfterSeconds > 0
+        ? $"too many authentication failures; retry after {attempt.RetryAfterSeconds}s"
+        : "too many authentication failures; retry later";
 }
 static IResult ChunkedResult(QueryChunkedExecutionOutcome outcome, MetricsCollector metrics, ILogger logger, string? db)
 {
@@ -488,6 +670,31 @@ static int? ParseChunkSize(string? value) =>
 static LogLevel ParseLogLevel(string? value) =>
     Enum.TryParse<LogLevel>(value, true, out var parsed) ? parsed : LogLevel.Information;
 
-public sealed record ErrorResponse(string Error);
-public sealed record AdminMessage(string Message);
+static async Task<T?> ReadJsonAsync<T>(HttpRequest request, JsonTypeInfo<T> typeInfo)
+{
+    if (request.ContentLength == 0)
+        return default;
+    return await JsonSerializer.DeserializeAsync(request.Body, typeInfo, request.HttpContext.RequestAborted);
+}
+
+static string GetAdminAssetContentType(string path)
+{
+    return Path.GetExtension(path).ToLowerInvariant() switch
+    {
+        ".css" => "text/css; charset=utf-8",
+        ".js" => "text/javascript; charset=utf-8",
+        ".json" => "application/json; charset=utf-8",
+        ".svg" => "image/svg+xml",
+        ".png" => "image/png",
+        ".jpg" or ".jpeg" => "image/jpeg",
+        ".webp" => "image/webp",
+        ".ico" => "image/x-icon",
+        ".woff" => "font/woff",
+        ".woff2" => "font/woff2",
+        _ => "application/octet-stream"
+    };
+}
+
+public sealed record ErrorResponse([property: System.Text.Json.Serialization.JsonPropertyName("error")] string Error);
+public sealed record AdminMessage([property: System.Text.Json.Serialization.JsonPropertyName("message")] string Message);
 public sealed record BenchmarkSnapshot(int DatabaseCount, long BufferedPoints, long BufferedBytes, double MetadataScanMs);

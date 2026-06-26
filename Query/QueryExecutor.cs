@@ -63,20 +63,16 @@ public sealed class QueryExecutor
     private readonly int _maxQueryPoints;
     private readonly int _maxQueryDurationMs;
     private readonly long _maxQueryMemoryBytes;
-    private readonly AuthStore? _authStore;
-
     public QueryExecutor(
         int maxResponseRows = 100_000,
         int maxQueryPoints = 1_000_000,
         int maxQueryDurationMs = 0,
-        long maxQueryMemoryBytes = 0,
-        AuthStore? authStore = null)
+        long maxQueryMemoryBytes = 0)
     {
         _maxResponseRows = maxResponseRows;
         _maxQueryPoints = maxQueryPoints;
         _maxQueryDurationMs = maxQueryDurationMs;
         _maxQueryMemoryBytes = maxQueryMemoryBytes;
-        _authStore = authStore;
     }
 
     public Task<QueryResponse> ExecuteAsync(TsdbEngine e, string? db, string q, CancellationToken cancellationToken = default)
@@ -334,13 +330,6 @@ public sealed class QueryExecutor
             QueryKind.DropShard => DropShard(e, q),
             QueryKind.Delete => DeleteResult(e, db, q),
             QueryKind.Select => Select(e, db, q, cancellationToken, report),
-            QueryKind.CreateUser => CreateUser(q),
-            QueryKind.AlterUser => AlterUser(q),
-            QueryKind.GrantPrivilege => GrantPrivilege(q),
-            QueryKind.RevokePrivilege => RevokePrivilege(q),
-            QueryKind.ShowUsers => ShowUsers(),
-            QueryKind.ShowGrants => ShowGrants(q),
-            QueryKind.DropUser => DropUser(q),
             _ => throw new NotSupportedException()
         };
     }
@@ -543,62 +532,6 @@ public sealed class QueryExecutor
         return null;
     }
 
-    List<QuerySeries>? CreateUser(ParsedQuery q)
-    {
-        RequireAuthStore().CreateUser(q.UserName!, q.Password!, q.IsAdmin ?? false);
-        return null;
-    }
-
-    List<QuerySeries>? GrantPrivilege(ParsedQuery q)
-    {
-        var grant = q.Grant ?? throw new InvalidOperationException("missing grant");
-        RequireAuthStore().Grant(grant.UserName, grant.Database, grant.Privilege);
-        return null;
-    }
-
-    List<QuerySeries>? AlterUser(ParsedQuery q)
-    {
-        RequireAuthStore().SetPassword(q.UserName!, q.Password!);
-        return null;
-    }
-
-    List<QuerySeries>? RevokePrivilege(ParsedQuery q)
-    {
-        var grant = q.Grant ?? throw new InvalidOperationException("missing revoke");
-        RequireAuthStore().Revoke(grant.UserName, grant.Database, grant.Privilege);
-        return null;
-    }
-
-    List<QuerySeries>? ShowUsers()
-    {
-        var users = RequireAuthStore().ListUsers();
-        return [new()
-        {
-            Name = "users",
-            Columns = ["user", "admin", "grants"],
-            Values = users.Select(u => new List<object?> { u.UserName, u.IsAdmin, FormatGrants(u.Grants) }).ToList()
-        }];
-    }
-
-    List<QuerySeries>? ShowGrants(ParsedQuery q)
-    {
-        var user = RequireAuthStore().Find(q.UserName!) ?? throw new InvalidOperationException($"user not found: {q.UserName}");
-        return [new()
-        {
-            Name = "grants",
-            Columns = ["user", "scope", "privilege"],
-            Values = user.Grants.OrderBy(kv => kv.Key, StringComparer.Ordinal)
-                .Select(kv => new List<object?> { user.UserName, kv.Key, kv.Value })
-                .ToList()
-        }];
-    }
-
-    List<QuerySeries>? DropUser(ParsedQuery q)
-    {
-        RequireAuthStore().DropUser(q.UserName!);
-        return null;
-    }
-
     List<QuerySeries> Select(TsdbEngine e, string? db, ParsedQuery q, CancellationToken cancellationToken, QueryExecutionReport report)
     {
         Req(q.SourceDatabase ?? db);
@@ -618,9 +551,10 @@ public sealed class QueryExecutor
             var innerSeries = Run(e, db, q.Subquery, cancellationToken, report) ?? [];
             pts = MaterializeSubqueryPoints(innerSeries);
             EnsureQueryPointLimit(pts.Count);
-            var subqueryBytes = EstimatePointsBytes(pts);
-            report.EstimatedInputBytes = Math.Max(report.EstimatedInputBytes, subqueryBytes);
-            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, subqueryBytes);
+            var materializedPointBytes = EstimatePointsBytes(pts);
+            var innerSeriesBytes = EstimateQuerySeriesBytes(innerSeries);
+            report.EstimatedInputBytes = Math.Max(report.EstimatedInputBytes, materializedPointBytes);
+            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, innerSeriesBytes + materializedPointBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
         }
         else
@@ -638,7 +572,12 @@ public sealed class QueryExecutor
                     report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, resultBytes);
                     EnsureQueryMemoryLimit(resultBytes);
                     if (!string.IsNullOrWhiteSpace(q.IntoTarget))
+                    {
+                        var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, pushedDown);
+                        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, resultBytes + selectIntoBytes);
+                        EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
                         ExecuteSelectInto(e, sourceDb, q, pushedDown);
+                    }
                     return pushedDown;
                 }
             }
@@ -657,25 +596,47 @@ public sealed class QueryExecutor
         pts = ApplyFieldFilters(pts, q.FieldFilters);
         if (q.Desc) pts = pts.OrderByDescending(x => x.TimestampNs).ToList();
 
+        var filteredInputBytes = EstimatePointsBytes(pts);
+        report.EstimatedInputBytes = Math.Max(report.EstimatedInputBytes, filteredInputBytes);
+        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes);
+
         if (q.GroupByNs.HasValue || q.GroupByTags.Count > 0)
         {
+            var groupingStateBytes = EstimateGroupingStateBytes(pts, q.GroupByTags, q.GroupByNs);
+            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + groupingStateBytes);
+            EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+
             var aggregateResult = AggGroupBy(pts, q, cancellationToken, resultMeasurement);
             report.EstimatedResultBytes = EstimateQuerySeriesBytes(aggregateResult);
-            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + report.EstimatedResultBytes);
+            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + groupingStateBytes + report.EstimatedResultBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
             if (!string.IsNullOrWhiteSpace(q.IntoTarget))
+            {
+                var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, aggregateResult);
+                report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + groupingStateBytes + report.EstimatedResultBytes + selectIntoBytes);
+                EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
                 ExecuteSelectInto(e, sourceDb, q, aggregateResult);
+            }
             return aggregateResult;
         }
 
         if (q.Select.Any(s => s.Func != ""))
         {
+            var functionStateBytes = EstimateFunctionStateBytes(pts, q.Select.Where(s => s.Func != "").ToList());
+            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + functionStateBytes);
+            EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+
             var functionResult = SelectFunctions(pts, q, cancellationToken, resultMeasurement);
             report.EstimatedResultBytes = EstimateQuerySeriesBytes(functionResult);
-            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + report.EstimatedResultBytes);
+            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + functionStateBytes + report.EstimatedResultBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
             if (!string.IsNullOrWhiteSpace(q.IntoTarget))
+            {
+                var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, functionResult);
+                report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + functionStateBytes + report.EstimatedResultBytes + selectIntoBytes);
+                EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
                 ExecuteSelectInto(e, sourceDb, q, functionResult);
+            }
             return functionResult;
         }
 
@@ -712,10 +673,15 @@ public sealed class QueryExecutor
             }
         ];
         report.EstimatedResultBytes = EstimateQuerySeriesBytes(rawResult);
-        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + report.EstimatedResultBytes);
+        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + report.EstimatedResultBytes);
         EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
         if (!string.IsNullOrWhiteSpace(q.IntoTarget))
+        {
+            var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, rawResult);
+            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + report.EstimatedResultBytes + selectIntoBytes);
+            EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
             ExecuteSelectInto(e, sourceDb, q, rawResult);
+        }
         return rawResult;
     }
 
@@ -880,6 +846,13 @@ public sealed class QueryExecutor
         e.WriteAsync(target.Database, target.RetentionPolicy, points).GetAwaiter().GetResult();
     }
 
+    long EstimateSelectIntoPointBytes(TsdbEngine e, string defaultDb, ParsedQuery q, List<QuerySeries> seriesList)
+    {
+        var target = ParseIntoTarget(defaultDb, q.IntoTarget!, q.Measurement ?? "result");
+        var knownFields = new HashSet<string>(e.ListFieldKeys(q.SourceDatabase ?? defaultDb, q.Measurement).Select(f => f.Field), StringComparer.OrdinalIgnoreCase);
+        return EstimateConvertedPointBytes(target.Measurement, seriesList, q, knownFields);
+    }
+
     static IntoTarget ParseIntoTarget(string defaultDb, string rawTarget, string fallbackMeasurement)
     {
         var parts = InfluxQlParser.SplitQualifiedIdentifier(rawTarget);
@@ -958,6 +931,70 @@ public sealed class QueryExecutor
             }
         }
         return points;
+    }
+
+    static long EstimateConvertedPointBytes(string measurement, List<QuerySeries> seriesList, ParsedQuery query, HashSet<string> knownFields)
+    {
+        var selectedColumns = new HashSet<string>(
+            query.Select.Select(s => s.Func == "" ? s.Field : s.Alias),
+            StringComparer.OrdinalIgnoreCase);
+
+        long total = 0;
+        foreach (var series in seriesList)
+        {
+            var tagKeys = new HashSet<string>(series.Tags?.Keys ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+            if (series.TagColumns != null)
+                tagKeys.UnionWith(series.TagColumns);
+
+            foreach (var row in series.Values)
+            {
+                if (row.Count == 0)
+                    continue;
+
+                var tags = series.Tags == null
+                    ? new Dictionary<string, string>(StringComparer.Ordinal)
+                    : new Dictionary<string, string>(series.Tags, StringComparer.Ordinal);
+                var fields = new Dictionary<string, FieldValue>(StringComparer.Ordinal);
+
+                for (int i = 0; i < series.Columns.Count && i < row.Count; i++)
+                {
+                    var column = series.Columns[i];
+                    if (string.Equals(column, "time", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var value = row[i];
+                    if (value == null)
+                        continue;
+
+                    if (tagKeys.Contains(column))
+                    {
+                        tags[column] = value.ToString() ?? "";
+                        continue;
+                    }
+
+                    if (ShouldTreatAsTag(query, selectedColumns, knownFields, column, value))
+                    {
+                        tags[column] = value.ToString() ?? "";
+                        continue;
+                    }
+
+                    fields[column] = ToFieldValue(value);
+                }
+
+                if (fields.Count == 0)
+                    continue;
+
+                total += EstimatePointBytes(new Point
+                {
+                    Measurement = measurement,
+                    Tags = tags,
+                    Fields = fields,
+                    TimestampNs = 0
+                });
+            }
+        }
+
+        return total;
     }
 
     static List<Point> MaterializeSubqueryPoints(List<QuerySeries> seriesList)
@@ -1064,6 +1101,61 @@ public sealed class QueryExecutor
 
     static long EstimatePointsBytes(List<Point> points) => points.Sum(EstimatePointBytes);
 
+    static long EstimateGroupingStateBytes(List<Point> points, List<string> groupByTags, long? groupByNs)
+    {
+        if (points.Count == 0)
+            return 0;
+
+        var groups = new Dictionary<(string TagKey, long? BucketTime), int>();
+        foreach (var point in points)
+        {
+            var tagKey = groupByTags.Count == 0
+                ? string.Empty
+                : string.Join("|", groupByTags.Select(tag => point.Tags.TryGetValue(tag, out var value) ? value : ""));
+            long? bucketTime = groupByNs.HasValue ? point.TimestampNs / groupByNs.Value * groupByNs.Value : null;
+            var key = (tagKey, bucketTime);
+            groups.TryGetValue(key, out var count);
+            groups[key] = count + 1;
+        }
+
+        long size = 0;
+        foreach (var group in groups)
+            size += 112 + EstimateStringBytes(group.Key.TagKey) + 16 + group.Value * 8L;
+        return size;
+    }
+
+    static long EstimateFunctionStateBytes(List<Point> points, List<SelectItem> items)
+    {
+        long timelineBytes = 0;
+        long maxInputWindowBytes = 0;
+        var allTimesUpperBound = new HashSet<long>();
+
+        foreach (var item in items)
+        {
+            var matchingCount = CountMatchingNumericPoints(points, item.Field);
+            if (matchingCount == 0)
+                continue;
+
+            var outputCount = EstimateFunctionOutputCount(matchingCount, item);
+            timelineBytes += EstimateTimelineBytes(outputCount);
+            maxInputWindowBytes = Math.Max(maxInputWindowBytes, EstimateFunctionInputBytes(matchingCount));
+
+            foreach (var point in points)
+            {
+                if (item.Field == "*")
+                {
+                    allTimesUpperBound.Add(point.TimestampNs);
+                    continue;
+                }
+
+                if (point.Fields.TryGetValue(item.Field, out var value) && value.AsDouble().HasValue)
+                    allTimesUpperBound.Add(point.TimestampNs);
+            }
+        }
+
+        return timelineBytes + maxInputWindowBytes + allTimesUpperBound.Count * 8L;
+    }
+
     static long EstimatePointBytes(Point point)
     {
         long size = 96 + EstimateStringBytes(point.Measurement) + 8;
@@ -1108,6 +1200,35 @@ public sealed class QueryExecutor
     };
 
     static long EstimateStringBytes(string? value) => string.IsNullOrEmpty(value) ? 0 : 24 + value.Length * 2L;
+
+    static int CountMatchingNumericPoints(List<Point> points, string field)
+    {
+        if (field == "*")
+            return points.Count;
+
+        return points.Count(point =>
+            point.Fields.TryGetValue(field, out var value)
+            && value.AsDouble().HasValue);
+    }
+
+    static int EstimateFunctionOutputCount(int matchingCount, SelectItem item)
+    {
+        if (matchingCount <= 0)
+            return 0;
+
+        return item.Func switch
+        {
+            "difference" or "derivative" or "non_negative_derivative" or "integral" or "elapsed" => Math.Max(0, matchingCount - 1),
+            "moving_average" => Math.Max(0, matchingCount - Math.Max(1, (int)item.Param) + 1),
+            "cumulative_sum" => matchingCount,
+            "top" or "bottom" or "sample" => Math.Min(matchingCount, Math.Max(1, (int)item.Param)),
+            _ => 1
+        };
+    }
+
+    static long EstimateFunctionInputBytes(int matchingCount) => 96 + matchingCount * 40L;
+
+    static long EstimateTimelineBytes(int outputCount) => 96 + outputCount * 48L;
 
     static void ApplyFill(Dictionary<string, QuerySeries> seriesMap, ParsedQuery q, long step, List<SelectItem> items)
     {
@@ -1644,13 +1765,6 @@ public sealed class QueryExecutor
         var count = stats.Sum(s => s.Count) + bufferValues.Count;
         return count == 0 ? null : sum / count;
     }
-
-    AuthStore RequireAuthStore() => _authStore ?? throw new InvalidOperationException("auth store is not configured");
-
-    static string FormatGrants(Dictionary<string, string> grants) =>
-        grants.Count == 0
-            ? ""
-            : string.Join(",", grants.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => $"{kv.Key}:{kv.Value}"));
 
     static int CountRows(QueryResponse response) =>
         response.Results.SelectMany(r => r.Series ?? []).Sum(s => s.Values.Count);

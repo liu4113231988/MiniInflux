@@ -17,16 +17,13 @@ public sealed class MiniInfluxOptions
 
     public static MiniInfluxOptions Load(IConfiguration config)
     {
-        var authUsers = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var child in config.GetSection("Auth:Users").GetChildren())
-            if (!string.IsNullOrEmpty(child.Key) && child.Value != null) authUsers[child.Key] = child.Value;
-
         var dataDir = ReadString(config, "Data:Dir")
             ?? config["MiniInflux:DataPath"]
             ?? Environment.GetEnvironmentVariable("MINI_INFLUX_DATA")
             ?? "./data";
 
         var httpEnabled = ReadBool(config, true, "Http:Enabled");
+        var authEnabled = ReadBool(config, false, "Auth:Enabled", "Http:AuthEnabled");
         var bindAddress = ReadString(config, "Http:BindAddress");
         var urls = !string.IsNullOrWhiteSpace(bindAddress)
             ? BuildUrlFromBindAddress(bindAddress!)
@@ -46,7 +43,7 @@ public sealed class MiniInfluxOptions
             {
                 Enabled = httpEnabled,
                 BindAddress = bindAddress ?? "0.0.0.0:8086",
-                AuthEnabled = ReadBool(config, ReadBool(config, false, "Auth:Enabled"), "Http:AuthEnabled"),
+                AuthEnabled = authEnabled,
                 LogEnabled = ReadBool(config, true, "Http:LogEnabled"),
                 SuppressWriteLog = ReadBool(config, false, "Http:SuppressWriteLog"),
                 AccessLogPath = ReadString(config, "Http:AccessLogPath"),
@@ -95,8 +92,13 @@ public sealed class MiniInfluxOptions
             },
             Auth = new AuthOptions
             {
-                Enabled = ReadBool(config, false, "Auth:Enabled", "Http:AuthEnabled"),
-                Users = authUsers
+                Enabled = authEnabled,
+                Username = ReadString(config, "Auth:Username", "admin")!,
+                Password = ReadString(config, "Auth:Password", "")!,
+                AuditFailures = ReadBool(config, true, "Auth:AuditFailures"),
+                MaxFailedAttempts = Math.Max(0, ReadInt(config, 5, "Auth:MaxFailedAttempts")),
+                FailureWindowMs = Math.Max(1000, ReadInt(config, 60_000, "Auth:FailureWindowMs")),
+                LockoutMs = Math.Max(0, ReadInt(config, 300_000, "Auth:LockoutMs"))
             },
             Tls = new TlsOptions
             {
@@ -257,7 +259,12 @@ public sealed class StorageOptions
 public sealed class AuthOptions
 {
     public bool Enabled { get; init; }
-    public Dictionary<string, string> Users { get; init; } = new(StringComparer.Ordinal);
+    public string Username { get; init; } = "admin";
+    public string Password { get; init; } = "";
+    public bool AuditFailures { get; init; } = true;
+    public int MaxFailedAttempts { get; init; } = 5;
+    public int FailureWindowMs { get; init; } = 60_000;
+    public int LockoutMs { get; init; } = 300_000;
 }
 
 public sealed class TlsOptions

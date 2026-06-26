@@ -3,7 +3,7 @@
 
 # MiniInflux.Net10 项目状态
 
-更新时间：2026-06-22
+更新时间：2026-06-26
 
 MiniInflux.Net10 是一个基于 .NET 10 / ASP.NET Core Minimal API 的轻量级 InfluxDB 1.x 兼容子集时序数据库。当前项目已经具备单节点时序数据库的完整主链路：HTTP 接口、Line Protocol 写入、写入队列、WAL、segment 存储、schema、manifest/index、shard/retention、compaction、InfluxQL 子集、查询保护、权限、诊断指标、管理 CLI 和回归测试。
 
@@ -12,7 +12,7 @@ MiniInflux.Net10 是一个基于 .NET 10 / ASP.NET Core Minimal API 的轻量级
 ```text
 dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo --no-restore
 结果：命令退出码 0
-测试用例：源码中共 133 个 [Fact]/[Theory] 测试标记
+测试用例：源码中共 161 个 [Fact]/[Theory] 测试标记
 备注：本次环境没有打印详细 passed 汇总，因此以退出码和测试标记数量记录。
 ```
 
@@ -369,19 +369,16 @@ query memory estimate metrics
 ```text
 HTTP Basic 认证
 query 参数认证
-本地 auth store
-密码哈希存储，兼容旧明文记录升级
-query / write / admin 路由授权校验
-CREATE USER
-ALTER USER / SET PASSWORD
-DROP USER
-GRANT
-REVOKE
-SHOW USERS
-SHOW GRANTS
+配置文件单一超级管理员
+Auth.Enabled 认证总开关，Http.AuthEnabled 作为旧配置兼容回退
+Auth.Username / Auth.Password 唯一凭据
+登录失败审计日志
+按客户端地址的失败限流与临时锁定
+query / write / admin / diagnostics 路由统一认证
+管理台登录与会话状态
 ```
 
-当前已支持 database / retention policy / measurement 级授权，以及用户改密；后续仍值得补权限变更审计和 auth store 损坏恢复策略。
+系统不再维护数据目录用户仓库，不支持运行时用户 CRUD、改密或 database / RP / measurement 级授权。旧 `meta/auth.json` 不再读取。
 
 ## 16. Continuous Query
 
@@ -472,12 +469,12 @@ P0/P1/P2 todo 回归项
 Configuration / logging
 Management CLI
 Continuous Query
-AuthStore
+配置文件单一超级管理员认证
 Backup / Restore
 恢复 / 备份 / compaction 故障注入
 ```
 
-当前源码中共有 153 个 `[Fact]` / `[Theory]` 测试标记。
+当前源码中共有 161 个 `[Fact]` / `[Theory]` 测试标记。
 
 ***
 
@@ -486,10 +483,10 @@ Backup / Restore
 当前没有发现“阻断项目完整运行”的 P0 主链路缺口。比较紧急的工作主要是生产化和兼容性收敛：
 
 ```text
-1. chunked raw SELECT 已完成边扫描边输出第一版；聚合、GROUP BY、Subquery、SELECT INTO 等复杂查询仍需继续降低物化内存峰值。
-2. SELECT INTO / Subquery / Continuous Query 已补到短期可用：quoted db/rp/measurement、subquery string field/tag、CQ 子查询 + WHERE 已有回归；剩余主要是跨 db/rp 权限矩阵和更复杂组合测试。
-3. Auth 已补到短期可用：RP / measurement 级授权和改密已具备；剩余主要是审计日志、损坏恢复策略和更完整的跨 db 权限矩阵。
-4. Compaction 已补到短期可上线：overlap-aware、多轮排空 backlog、staged 切换和读序修正已具备；后续重点转为长期压测、并发一致性和限速策略。
+1. chunked raw SELECT 已完成边扫描边输出第一版；GROUP BY / 函数 / 子查询 / SELECT INTO 回写阶段的峰值估算已补强，但复杂查询仍需继续降低物化内存峰值。
+2. SELECT INTO / Subquery / Continuous Query 已补到短期可用：quoted db/rp/measurement、subquery string field/tag、CQ 子查询 + WHERE 已有回归；剩余主要是更复杂组合测试。
+3. Auth 已补齐单一超级管理员模型、失败审计和基础限流；后续主要是外部 secret provider 和凭据轮换。
+4. Compaction 已补到短期可上线：overlap-aware、多轮排空 backlog、staged 切换、读序修正，以及并发查询/并发删除/混合删改 soak 回归已具备；后续重点转为更长期压测和限速策略。
 5. Backup / restore 已有校验、pending restore 和故障注入回归测试，但还不是在线一致性快照协议。
 6. 内存估算是近似模型，仍需按真实 workload 校准。
 7. Benchmark 已有第一版，缺少远端压测、soak test、多 measurement / 高 tag 基数 workload。

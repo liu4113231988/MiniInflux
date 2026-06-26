@@ -8,8 +8,7 @@ public enum QueryKind
     CreateRetentionPolicy, AlterRetentionPolicy, DropRetentionPolicy, ShowRetentionPolicies,
     CreateContinuousQuery, ShowContinuousQueries, DropContinuousQuery,
     DropDatabase, DropMeasurement, DropSeries, DropShard, Delete,
-    ShowSeries, ShowSeriesCardinality, ShowMeasurementCardinality, ShowTagValuesCardinality,
-    CreateUser, AlterUser, GrantPrivilege, RevokePrivilege, ShowUsers, ShowGrants, DropUser
+    ShowSeries, ShowSeriesCardinality, ShowMeasurementCardinality, ShowTagValuesCardinality
 }
 
 public enum TagOp { Eq, Neq, Regex, NotRegex }
@@ -19,8 +18,6 @@ public enum FillMode { None, Null, Zero, Previous, Linear }
 public sealed record SelectItem(string Func, string Field, string Alias, double Param = 0, long? UnitNs = null);
 public sealed record TagFilter(string Key, string Value, TagOp Op);
 public sealed record FieldFilter(string Field, double Value, FieldOp Op);
-public sealed record GrantPrivilege(string UserName, string Database, string Privilege);
-
 public sealed class ParsedQuery
 {
     public required QueryKind Kind { get; init; }
@@ -52,10 +49,6 @@ public sealed class ParsedQuery
     public long? ContinuousQueryForNs { get; init; }
     public int? ContinuousQueryRecomputeRecentBuckets { get; init; }
     public string? IntoTarget { get; init; }
-    public string? UserName { get; init; }
-    public string? Password { get; init; }
-    public bool? IsAdmin { get; init; }
-    public GrantPrivilege? Grant { get; init; }
 }
 
 public static class InfluxQlParser
@@ -80,15 +73,6 @@ public static class InfluxQlParser
         if (q.StartsWith("DROP SHARD ", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.DropShard, Limit = int.Parse(q["DROP SHARD ".Length..].Trim(), CultureInfo.InvariantCulture) };
         if (q.StartsWith("DELETE FROM ", StringComparison.OrdinalIgnoreCase)) return ParseDelete(q);
-        if (q.StartsWith("CREATE USER ", StringComparison.OrdinalIgnoreCase)) return ParseCreateUser(q);
-        if (q.StartsWith("ALTER USER ", StringComparison.OrdinalIgnoreCase)) return ParseAlterUser(q);
-        if (q.StartsWith("SET PASSWORD FOR ", StringComparison.OrdinalIgnoreCase)) return ParseSetPassword(q);
-        if (q.StartsWith("GRANT ", StringComparison.OrdinalIgnoreCase)) return ParseGrant(q);
-        if (q.StartsWith("REVOKE ", StringComparison.OrdinalIgnoreCase)) return ParseRevoke(q);
-        if (q.StartsWith("SHOW USERS", StringComparison.OrdinalIgnoreCase)) return new() { Kind = QueryKind.ShowUsers };
-        if (q.StartsWith("SHOW GRANTS FOR ", StringComparison.OrdinalIgnoreCase))
-            return new() { Kind = QueryKind.ShowGrants, UserName = Unq(q["SHOW GRANTS FOR ".Length..].Trim()) };
-        if (q.StartsWith("DROP USER ", StringComparison.OrdinalIgnoreCase)) return new() { Kind = QueryKind.DropUser, UserName = Unq(q["DROP USER ".Length..].Trim()) };
         if (q.StartsWith("CREATE DATABASE ", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.CreateDatabase, Database = Unq(q[16..].Trim()) };
         if (q.Equals("SHOW DATABASES", StringComparison.OrdinalIgnoreCase))
@@ -330,91 +314,6 @@ public static class InfluxQlParser
             GroupByTags = groupByTags, Fill = fill, TagFilters = tagFilters, FieldFilters = fieldFilters, IntoTarget = intoTarget };
     }
 
-    static ParsedQuery ParseCreateUser(string q)
-    {
-        var rest = q["CREATE USER ".Length..].Trim();
-        var user = ReadToken(ref rest);
-        ConsumeKeyword(ref rest, "WITH");
-        ConsumeKeyword(ref rest, "PASSWORD");
-        var password = rest.TrimStart();
-        var admin = false;
-        if (password.StartsWith('\''))
-        {
-            var end = password.IndexOf('\'', 1);
-            if (end < 1) throw new FormatException("CREATE USER requires quoted password");
-            var pwd = password[1..end];
-            var tail = password[(end + 1)..].Trim();
-            if (tail.StartsWith("WITH ALL PRIVILEGES", StringComparison.OrdinalIgnoreCase))
-                admin = true;
-            return new() { Kind = QueryKind.CreateUser, UserName = Unq(user), Password = pwd, IsAdmin = admin };
-        }
-        throw new FormatException("CREATE USER requires quoted password");
-    }
-
-    static ParsedQuery ParseAlterUser(string q)
-    {
-        var rest = q["ALTER USER ".Length..].Trim();
-        var user = ReadToken(ref rest);
-        ConsumeKeyword(ref rest, "WITH");
-        ConsumeKeyword(ref rest, "PASSWORD");
-        var password = ParseQuotedPassword(rest.TrimStart(), "ALTER USER requires quoted password");
-        return new() { Kind = QueryKind.AlterUser, UserName = Unq(user), Password = password };
-    }
-
-    static ParsedQuery ParseSetPassword(string q)
-    {
-        var rest = q["SET PASSWORD FOR ".Length..].Trim();
-        var user = ReadToken(ref rest);
-        rest = rest.TrimStart();
-        if (rest.StartsWith("="))
-            rest = rest[1..].TrimStart();
-        var password = ParseQuotedPassword(rest, "SET PASSWORD FOR requires quoted password");
-        return new() { Kind = QueryKind.AlterUser, UserName = Unq(user), Password = password };
-    }
-
-    static ParsedQuery ParseGrant(string q)
-    {
-        var rest = q["GRANT ".Length..].Trim();
-        var privilege = NormalizePrivilege(ReadToken(ref rest));
-        ConsumeKeyword(ref rest, "ON");
-        var scope = ReadToken(ref rest);
-        ConsumeKeyword(ref rest, "TO");
-        var user = ReadToken(ref rest);
-        return new()
-        {
-            Kind = QueryKind.GrantPrivilege,
-            Grant = new GrantPrivilege(Unq(user), Unq(scope), privilege)
-        };
-    }
-
-    static ParsedQuery ParseRevoke(string q)
-    {
-        var rest = q["REVOKE ".Length..].Trim();
-        var privilege = NormalizePrivilege(ReadToken(ref rest));
-        ConsumeKeyword(ref rest, "ON");
-        var scope = ReadToken(ref rest);
-        ConsumeKeyword(ref rest, "FROM");
-        var user = ReadToken(ref rest);
-        return new()
-        {
-            Kind = QueryKind.RevokePrivilege,
-            Grant = new GrantPrivilege(Unq(user), Unq(scope), privilege)
-        };
-    }
-
-    static string ParseQuotedPassword(string password, string errorMessage)
-    {
-        if (password.StartsWith('\''))
-        {
-            var end = password.IndexOf('\'', 1);
-            if (end < 1)
-                throw new FormatException(errorMessage);
-            return password[1..end];
-        }
-
-        throw new FormatException(errorMessage);
-    }
-
     static void ParseGroupBy(string text, out long? gbNs, List<string> tags)
     {
         gbNs = null;
@@ -545,17 +444,6 @@ public static class InfluxQlParser
     }
     static void ConsumeKeyword(ref string rest, string kw) { rest = rest.TrimStart(); if (rest.StartsWith(kw, StringComparison.OrdinalIgnoreCase)) rest = rest[kw.Length..]; }
     static string Unq(string s) { s = s.Trim(); return s.Length >= 2 && s[0] == '"' && s[^1] == '"' ? s[1..^1] : s; }
-    static string NormalizePrivilege(string privilege)
-    {
-        privilege = privilege.Trim().ToUpperInvariant();
-        return privilege switch
-        {
-            "ALL" => "ALL",
-            "WRITE" => "WRITE",
-            _ => "READ"
-        };
-    }
-
     static (string? Database, string? RetentionPolicy, string Measurement) ParseQualifiedMeasurement(string token)
     {
         var parts = SplitQualifiedIdentifier(token);

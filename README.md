@@ -36,7 +36,8 @@
   - `MaxRequestBodyBytes`、`MaxBufferPoints`、`MaxBufferBytes`
 - 权限与认证
   - HTTP Basic / query 参数认证
-  - `CREATE USER` / `ALTER USER` / `SET PASSWORD FOR` / `DROP USER` / `GRANT` / `REVOKE` / `SHOW USERS` / `SHOW GRANTS`
+  - 配置文件中的单一超级管理员账号
+  - 不支持运行时创建用户、改密或细粒度授权
 - WAL + Segment 存储
 - Segment v3 列编码：时间戳 `delta-of-delta/Gorilla`、浮点 `legacy XOR/Gorilla`、整数 delta、bool bit-pack、string 字典
 - 自适应浮点压缩策略：在 `legacy_raw`、`legacy_brotli`、`gorilla_raw` 之间按体积/速度折中选择
@@ -79,6 +80,15 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
     "AccessLogStatusFilters": [],
     "WriteTracing": false
   },
+  "Auth": {
+    "Enabled": false,
+    "Username": "admin",
+    "Password": "change-this-password",
+    "AuditFailures": true,
+    "MaxFailedAttempts": 5,
+    "FailureWindowMs": 60000,
+    "LockoutMs": 300000
+  },
   "Logging": {
     "Level": "Information",
     "ConsoleEnabled": true,
@@ -101,7 +111,14 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 - `Data.QueryLogEnabled`：是否记录查询语句
 - `Http.Enabled`：是否启用 HTTP 服务；关闭后仍可使用管理 CLI
 - `Http.BindAddress`：监听地址，会自动映射成 ASP.NET Core 使用的 `Urls`
-- `Http.AuthEnabled`：HTTP 认证总开关，同时回填到现有 `Auth.Enabled`
+- `Auth.Enabled`：认证总开关，启用后 `/write`、`/query`、诊断接口和管理台均要求认证
+- `Http.AuthEnabled`：旧版兼容开关；仅在未配置 `Auth.Enabled` 时作为回退
+- `Auth.Username`：唯一超级管理员用户名
+- `Auth.Password`：唯一超级管理员密码；启用认证时不能为空
+- `Auth.AuditFailures`：是否记录认证失败和限流审计日志
+- `Auth.MaxFailedAttempts`：单个客户端地址在窗口期内允许的最大失败次数，`0` 表示关闭限流
+- `Auth.FailureWindowMs`：失败计数窗口，默认 `60000`
+- `Auth.LockoutMs`：触发限流后的锁定时长，默认 `300000`
 - `Http.LogEnabled`：是否启用访问日志
 - `Http.SuppressWriteLog`：是否抑制 `/write` 请求访问日志
 - `Http.AccessLogPath`：访问日志文件路径；留空时写到应用 logger
@@ -120,6 +137,46 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 环境变量兼容：
 
 - `MINI_INFLUX_DATA` 可继续覆盖数据目录
+
+## 单一超级管理员认证
+
+MiniInflux 使用配置驱动的单一超级管理员模型，不维护数据库内用户表，也不读取数据目录中的旧 `meta/auth.json`。
+
+启用认证：
+
+```json
+{
+  "Auth": {
+    "Enabled": true,
+    "Username": "admin",
+    "Password": "replace-with-a-strong-password"
+  }
+}
+```
+
+启用后，`/write`、`/query`、诊断接口和 `/admin` 管理台均使用同一账号认证。支持 InfluxDB 1.x 客户端常用的两种传递方式：
+
+```bash
+curl -u admin:replace-with-a-strong-password \
+  "http://localhost:8086/query?q=SHOW%20DATABASES"
+
+curl -G http://localhost:8086/query \
+  --data-urlencode "u=admin" \
+  --data-urlencode "p=replace-with-a-strong-password" \
+  --data-urlencode "q=SHOW DATABASES"
+```
+
+账号或密码修改后需要重启服务。`CREATE USER`、`ALTER USER`、`DROP USER`、`GRANT`、`REVOKE`、`SHOW USERS` 和 `SHOW GRANTS` 不受支持。
+
+当同一客户端地址在 `Auth.FailureWindowMs` 窗口内连续失败达到 `Auth.MaxFailedAttempts` 后，系统会在 `Auth.LockoutMs` 内拒绝新的认证尝试，并在日志中记录失败与锁定事件。管理台登录页会直接提示剩余等待时间。
+
+生产环境建议使用 ASP.NET Core 标准环境变量覆盖明文配置：
+
+```text
+Auth__Enabled=true
+Auth__Username=admin
+Auth__Password=<strong-password>
+```
 
 ## 日志示例
 

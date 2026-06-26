@@ -34,6 +34,14 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
             ["Http:AccessLogPath"] = "./logs/access.log",
             ["Http:AccessLogStatusFilters:0"] = "4xx",
             ["Http:WriteTracing"] = "true",
+            ["Http:AuthEnabled"] = "true",
+            ["Auth:Enabled"] = "true",
+            ["Auth:Username"] = "root",
+            ["Auth:Password"] = "secret",
+            ["Auth:AuditFailures"] = "false",
+            ["Auth:MaxFailedAttempts"] = "3",
+            ["Auth:FailureWindowMs"] = "15000",
+            ["Auth:LockoutMs"] = "45000",
             ["Logging:Level"] = "Debug",
             ["Logging:ConsoleEnabled"] = "false",
             ["Logging:FileEnabled"] = "true",
@@ -52,9 +60,57 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
         Assert.Equal("http://0.0.0.0:18086", options.Urls);
         Assert.True(options.Http.SuppressWriteLog);
         Assert.Single(options.Http.AccessLogStatusFilters);
+        Assert.True(options.Auth.Enabled);
+        Assert.Equal("root", options.Auth.Username);
+        Assert.Equal("secret", options.Auth.Password);
+        Assert.False(options.Auth.AuditFailures);
+        Assert.Equal(3, options.Auth.MaxFailedAttempts);
+        Assert.Equal(15_000, options.Auth.FailureWindowMs);
+        Assert.Equal(45_000, options.Auth.LockoutMs);
         Assert.Equal("Debug", options.Logging.Level);
         Assert.True(options.Logging.FileEnabled);
         Assert.False(options.Logging.ConsoleEnabled);
+    }
+
+    [Fact]
+    public void MiniInfluxOptions_PrefersAuthEnabledOverLegacyHttpAuthEnabled()
+    {
+        var settings = new Dictionary<string, string?>
+        {
+            ["Http:AuthEnabled"] = "false",
+            ["Auth:Enabled"] = "true",
+            ["Auth:Username"] = "admin",
+            ["Auth:Password"] = "secret"
+        };
+
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(settings)
+            .Build();
+
+        var options = MiniInfluxOptions.Load(configuration);
+
+        Assert.True(options.Auth.Enabled);
+        Assert.True(options.Http.AuthEnabled);
+    }
+
+    [Fact]
+    public void MiniInfluxOptions_StillSupportsLegacyHttpAuthEnabled()
+    {
+        var settings = new Dictionary<string, string?>
+        {
+            ["Http:AuthEnabled"] = "true",
+            ["Auth:Username"] = "admin",
+            ["Auth:Password"] = "secret"
+        };
+
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(settings)
+            .Build();
+
+        var options = MiniInfluxOptions.Load(configuration);
+
+        Assert.True(options.Auth.Enabled);
+        Assert.True(options.Http.AuthEnabled);
     }
 
     [Fact]
