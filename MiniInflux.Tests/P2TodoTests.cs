@@ -406,6 +406,104 @@ public class P2TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task ContinuousQueryRunner_WhenForExceedsEvery_UsesSlidingWindowEndingAtExecutionTime()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        const long everyNs = 10_000_000_000L;
+        const long forNs = 30_000_000_000L;
+        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var latestClosedWindowStart = (nowNs / everyNs) * everyNs - everyNs;
+        var oldestBucketStart = latestClosedWindowStart - 2 * everyNs;
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "server01", 10, oldestBucketStart + 1_000_000_000L),
+            Point("cpu", "server01", 20, oldestBucketStart + everyNs + 1_000_000_000L),
+            Point("cpu", "server01", 30, latestClosedWindowStart + 1_000_000_000L)
+        ]);
+
+        var executor = new QueryExecutor();
+        await executor.ExecuteAsync(
+            engine,
+            "testdb",
+            "CREATE CONTINUOUS QUERY cq_cpu_window ON testdb RESAMPLE EVERY 10s FOR 30s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");
+        engine.Meta.UpdateContinuousQueryProgress("testdb", "cq_cpu_window", latestClosedWindowStart - everyNs);
+
+        using var loggerFactory = LoggerFactory.Create(builder => { });
+        var runner = new ContinuousQueryRunner(
+            engine,
+            executor,
+            new MiniInfluxOptions
+            {
+                ContinuousQuery = new ContinuousQueryOptions
+                {
+                    Enabled = true,
+                    MaxCatchUpRunsPerCycle = 1
+                }
+            },
+            new MetricsCollector(engine),
+            loggerFactory.CreateLogger<ContinuousQueryRunner>());
+
+        var executed = await runner.ExecuteDueQueriesAsync();
+
+        Assert.Equal(1, executed);
+        var rollups = engine.ReadAllPoints("testdb", "autogen", "cpu_rollup", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+        Assert.Equal(3, rollups.Count);
+        Assert.Equal(oldestBucketStart, rollups[0].TimestampNs);
+        Assert.Equal(10.0, rollups[0].Fields["mean_value"].AsDouble());
+        Assert.Equal(oldestBucketStart + everyNs, rollups[1].TimestampNs);
+        Assert.Equal(20.0, rollups[1].Fields["mean_value"].AsDouble());
+        Assert.Equal(latestClosedWindowStart, rollups[2].TimestampNs);
+        Assert.Equal(30.0, rollups[2].Fields["mean_value"].AsDouble());
+    }
+
+    [Fact]
+    public async Task ContinuousQueryRunner_WhenEveryIsSmallerThanGroupBy_UsesCurrentGroupBucketWithoutFor()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        const long everyNs = 10_000_000_000L;
+        const long groupByNs = 20_000_000_000L;
+        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var latestClosedWindowStart = (nowNs / everyNs) * everyNs - everyNs;
+        var expectedBucketStart = ((latestClosedWindowStart + everyNs - 1) / groupByNs) * groupByNs;
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "server01", 10, expectedBucketStart + 1_000_000_000L),
+            Point("cpu", "server01", 30, expectedBucketStart + 11_000_000_000L)
+        ]);
+
+        var executor = new QueryExecutor();
+        await executor.ExecuteAsync(
+            engine,
+            "testdb",
+            "CREATE CONTINUOUS QUERY cq_cpu_hour_bucket ON testdb RESAMPLE EVERY 10s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(20s),host END");
+        engine.Meta.UpdateContinuousQueryProgress("testdb", "cq_cpu_hour_bucket", latestClosedWindowStart - everyNs);
+
+        using var loggerFactory = LoggerFactory.Create(builder => { });
+        var runner = new ContinuousQueryRunner(
+            engine,
+            executor,
+            new MiniInfluxOptions
+            {
+                ContinuousQuery = new ContinuousQueryOptions
+                {
+                    Enabled = true,
+                    MaxCatchUpRunsPerCycle = 1
+                }
+            },
+            new MetricsCollector(engine),
+            loggerFactory.CreateLogger<ContinuousQueryRunner>());
+
+        var executed = await runner.ExecuteDueQueriesAsync();
+
+        Assert.Equal(1, executed);
+        var rollup = Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu_rollup", null, null));
+        Assert.Equal(expectedBucketStart, rollup.TimestampNs);
+        Assert.Equal(20.0, rollup.Fields["mean_value"].AsDouble());
+    }
+
+    [Fact]
     public async Task ContinuousQueryRunner_UsesConfiguredInitialBackfillWindow_WhenForIsAbsent()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);

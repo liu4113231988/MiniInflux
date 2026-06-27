@@ -315,7 +315,7 @@ DROP CONTINUOUS QUERY cq_cpu_1m ON metrics
 
 - CQ body 需要是 `SELECT ... INTO ...`
 - CQ body 需要包含 `GROUP BY time(...)`
-- 已支持基础 `RESAMPLE FOR` 窗口，但还不是完整 InfluxDB 全语义
+- 已对齐常用 `RESAMPLE` 语义：`FOR >= EVERY`、`FOR >= GROUP BY time(...)`，且 `EVERY < GROUP BY` 时会按当前 `GROUP BY` bucket 重算
 - 未显式声明 `FOR` 时，会回退到 `ContinuousQuery.InitialBackfillDuration`
 - 可通过 `ContinuousQuery.RecomputeRecentBuckets` 对最近已关闭 bucket 做受控重算
 - 已暴露 CQ 运行指标到 `/debug/stats` 与 `/metrics`

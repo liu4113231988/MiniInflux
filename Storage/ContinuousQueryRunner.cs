@@ -59,6 +59,7 @@ public sealed class ContinuousQueryRunner
             return 0;
         }
 
+        var groupByNs = parsed.GroupByNs.Value;
         var everyNs = cq.EveryNs > 0 ? cq.EveryNs : parsed.GroupByNs.Value;
         var effectiveForNs = cq.ForNs > 0 ? cq.ForNs : _options.ContinuousQuery.InitialBackfillDurationNs;
         var latestClosedBucketStart = (nowNs / everyNs) * everyNs - everyNs;
@@ -105,7 +106,8 @@ public sealed class ContinuousQueryRunner
         foreach (var pending in pendingBuckets)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var boundedQuery = InjectTimeWindow(cq.QueryText, pending.BucketStartNs, pending.BucketStartNs + everyNs);
+            var (windowStartNs, windowEndExclusiveNs) = ResolveExecutionWindow(pending.BucketStartNs, everyNs, groupByNs, cq.ForNs);
+            var boundedQuery = InjectTimeWindow(cq.QueryText, windowStartNs, windowEndExclusiveNs);
             var outcome = _executor.ExecuteWithReport(_engine, cq.Database, boundedQuery, cancellationToken);
             var error = outcome.Response.Results.FirstOrDefault()?.Error;
             if (!string.IsNullOrWhiteSpace(error))
@@ -158,6 +160,26 @@ public sealed class ContinuousQueryRunner
 
         var backfillSpan = Math.Max(0, forNs - everyNs);
         return latestClosedBucketStart - backfillSpan;
+    }
+
+    private static (long WindowStartNs, long WindowEndExclusiveNs) ResolveExecutionWindow(
+        long executionBucketStartNs,
+        long everyNs,
+        long groupByNs,
+        long explicitForNs)
+    {
+        var executionEndExclusiveNs = executionBucketStartNs + everyNs;
+        if (explicitForNs > 0)
+            return (executionEndExclusiveNs - explicitForNs, executionEndExclusiveNs);
+
+        if (everyNs < groupByNs)
+        {
+            var referenceTimeNs = executionEndExclusiveNs - 1;
+            var bucketStartNs = (referenceTimeNs / groupByNs) * groupByNs;
+            return (bucketStartNs, bucketStartNs + groupByNs);
+        }
+
+        return (executionBucketStartNs, executionEndExclusiveNs);
     }
 
     internal static string InjectTimeWindow(string queryText, long bucketStartNs, long bucketEndExclusiveNs)
