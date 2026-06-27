@@ -72,6 +72,93 @@ public sealed class P2ManagementCliTests : IDisposable
     }
 
     [Fact]
+    public async Task InspectManifest_ReportsShardAndMeasurementSummary()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 12.5, "server01", 1)]);
+            engine.FlushAll();
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "manifest", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("databases=1", stdout.ToString());
+        Assert.Contains("measurement db=testdb name=cpu series=1", stdout.ToString());
+        Assert.Contains("shard db=testdb rp=autogen", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task InspectSchema_ReportsFieldKinds()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen",
+            [
+                new Point
+                {
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                    Fields = new Dictionary<string, FieldValue>
+                    {
+                        ["value"] = FieldValue.FromDouble(12.5),
+                        ["ok"] = FieldValue.FromBoolean(true)
+                    },
+                    TimestampNs = 1
+                }
+            ]);
+            engine.FlushAll();
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "schema", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("measurement db=testdb name=cpu fields=2", stdout.ToString());
+        Assert.Contains("field db=testdb measurement=cpu name=ok kind=Boolean", stdout.ToString());
+        Assert.Contains("field db=testdb measurement=cpu name=value kind=Float", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public void InspectTombstone_ReportsEntries()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var tombstones = new TombstoneStore(dataPath);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 1, maxTime: 10);
+        tombstones.AddSeriesDelete("testdb", "mem", "host=server01", minTime: 20, maxTime: 30);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "tombstone", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("tombstones=2", stdout.ToString());
+        Assert.Contains("database name=testdb tombstones=2", stdout.ToString());
+        Assert.Contains("tombstone db=testdb measurement=cpu tags=* min_time_ns=1 max_time_ns=10", stdout.ToString());
+        Assert.Contains("tombstone db=testdb measurement=mem tags=host=server01 min_time_ns=20 max_time_ns=30", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
     public async Task Compact_CommandMergesSegments()
     {
         var dataPath = Path.Combine(_testDir, "data");
@@ -97,6 +184,122 @@ public sealed class P2ManagementCliTests : IDisposable
         Assert.Contains("compaction_tasks_merged=", stdout.ToString());
         Assert.Contains(shard.SegmentFiles, file => file.StartsWith("l", StringComparison.OrdinalIgnoreCase));
         Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task ValidateDataDir_ReportsHealthyDirectory()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 3, "server01", 1)]);
+            engine.FlushAll();
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["validate", "data-dir", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("issues=0", stdout.ToString());
+        Assert.Contains("manifest_segment_files=1", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task ValidateDataDir_FailsWhenManifestReferencesMissingSegment()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        string segmentPath;
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 5, "server01", 1)]);
+            engine.FlushAll();
+            var shard = Assert.Single(engine.Meta.GetShards("testdb", "autogen"));
+            segmentPath = Path.Combine(dataPath, "db", "testdb", "autogen", "shards", shard.Id.ToString("D6"), shard.SegmentFiles[0]);
+        }
+
+        File.Delete(segmentPath);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["validate", "data-dir", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("issue code=segment_missing_on_disk", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task BackupVerify_CommandReportsVerifiedBackup()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var backupPath = Path.Combine(_testDir, "backup");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1000, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 7, "server01", 1)]);
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        Assert.Equal(
+            0,
+            ManagementCli.TryRun(["backup", "--data", dataPath, "--path", backupPath], CreateOptions(dataPath), stdout, stderr));
+
+        stdout.GetStringBuilder().Clear();
+        stderr.GetStringBuilder().Clear();
+
+        var exitCode = ManagementCli.TryRun(
+            ["backup", "verify", "--path", backupPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("verified=true", stdout.ToString());
+        Assert.Contains("files=", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task BackupVerify_CommandFailsForTamperedBackup()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var backupPath = Path.Combine(_testDir, "backup");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1000, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 7, "server01", 1)]);
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        Assert.Equal(
+            0,
+            ManagementCli.TryRun(["backup", "--data", dataPath, "--path", backupPath], CreateOptions(dataPath), stdout, stderr));
+
+        var tamperedFile = Directory.GetFiles(backupPath, "*.json", SearchOption.AllDirectories)
+            .First(path => !string.Equals(Path.GetFileName(path), "backup.metadata.json", StringComparison.OrdinalIgnoreCase));
+        File.AppendAllText(tamperedFile, "tampered");
+
+        stdout.GetStringBuilder().Clear();
+        stderr.GetStringBuilder().Clear();
+
+        var exitCode = ManagementCli.TryRun(
+            ["backup", "verify", "--path", backupPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+        Assert.Equal(1, exitCode);
+        Assert.Contains("backup verification failed:", stderr.ToString());
+        Assert.Contains("checksum mismatch", stderr.ToString());
     }
 
     [Fact]

@@ -3,7 +3,7 @@
 
 # MiniInflux.Net10 项目状态
 
-更新时间：2026-06-26
+更新时间：2026-06-27
 
 MiniInflux.Net10 是一个基于 .NET 10 / ASP.NET Core Minimal API 的轻量级 InfluxDB 1.x 兼容子集时序数据库。当前项目已经具备单节点时序数据库的完整主链路：HTTP 接口、Line Protocol 写入、写入队列、WAL、segment 存储、schema、manifest/index、shard/retention、compaction、InfluxQL 子集、查询保护、权限、诊断指标、管理 CLI 和回归测试。
 
@@ -12,7 +12,7 @@ MiniInflux.Net10 是一个基于 .NET 10 / ASP.NET Core Minimal API 的轻量级
 ```text
 dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo --no-restore
 结果：命令退出码 0
-测试用例：源码中共 161 个 [Fact]/[Theory] 测试标记
+测试用例：源码中共 168 个 [Fact]/[Theory] 测试标记
 备注：本次环境没有打印详细 passed 汇总，因此以退出码和测试标记数量记录。
 ```
 
@@ -429,13 +429,18 @@ TLS 配置第一版
 benchmark
 inspect wal
 inspect segment
+inspect manifest
+inspect schema
+inspect tombstone
+validate data-dir
 repair
 compact
 backup
+backup verify
 restore
 ```
 
-`backup` / `restore` 已支持备份元信息、文件长度、SHA256 校验和 pending restore 边界。
+`backup` / `restore` 已支持备份元信息、文件长度、SHA256 校验和 pending restore 边界；`backup verify` 可离线校验备份完整性；`inspect manifest` / `inspect schema` / `inspect tombstone` / `validate data-dir` 可用于离线查看 manifest、schema、删除标记以及检查 manifest / segment / schema / tombstone 的基本一致性。
 
 ## 19. AOT 兼容设计
 
@@ -474,7 +479,7 @@ Backup / Restore
 恢复 / 备份 / compaction 故障注入
 ```
 
-当前源码中共有 161 个 `[Fact]` / `[Theory]` 测试标记。
+当前源码中共有 168 个 `[Fact]` / `[Theory]` 测试标记。
 
 ***
 

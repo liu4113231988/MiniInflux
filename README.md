@@ -41,7 +41,7 @@
 - WAL + Segment 存储
 - Segment v3 列编码：时间戳 `delta-of-delta/Gorilla`、浮点 `legacy XOR/Gorilla`、整数 delta、bool bit-pack、string 字典
 - 自适应浮点压缩策略：在 `legacy_raw`、`legacy_brotli`、`gorilla_raw` 之间按体积/速度折中选择
-- 管理 CLI：`benchmark`、`inspect`、`repair`、`compact`、`backup`、`restore`
+- 管理 CLI：`benchmark`、`inspect`、`validate`、`repair`、`compact`、`backup`、`restore`
 - Native AOT 友好：无动态代理、JSON Source Generator
 
 ## 运行
@@ -323,9 +323,14 @@ DROP CONTINUOUS QUERY cq_cpu_1m ON metrics
 dotnet run -- benchmark --points 10000 --concurrency 1 --format text
 dotnet run -- inspect wal --data ./data
 dotnet run -- inspect segment --path ./data/db/metrics/autogen/shards/000001/xxx.seg
+dotnet run -- inspect manifest --data ./data
+dotnet run -- inspect schema --data ./data
+dotnet run -- inspect tombstone --data ./data
+dotnet run -- validate data-dir --data ./data
 dotnet run -- repair --data ./data
 dotnet run -- compact --data ./data
 dotnet run -- backup --data ./data --path ./backup
+dotnet run -- backup verify --path ./backup
 dotnet run -- restore --data ./data --path ./backup
 ```
 
@@ -335,8 +340,13 @@ dotnet run -- restore --data ./data --path ./backup
 - `benchmark` 还会输出 `CodecComparison` 与 `FloatStrategyBenchmarks`，用于比较 `legacy` 和 `Gorilla` 在规则时间序列上的体积、编码耗时、解码耗时，以及 `adaptive` 策略在不同 workload 下的最终选择。
 - `inspect wal` 用于查看 WAL 文件数量、checkpoint 位置和可回放记录数。
 - `inspect segment` 用于查看 segment 元数据、列数、时间范围、字段统计和 codec 选择。
+- `inspect manifest` 用于离线查看数据库 / RP / shard / measurement / CQ 的 manifest 摘要。
+- `inspect schema` 用于查看 field schema，支持按 `--db`、`--measurement` 过滤。
+- `inspect tombstone` 用于查看 delete tombstone 摘要和明细，支持按 `--db` 过滤。
+- `validate data-dir` 用于检查 manifest、schema、tombstone 与磁盘 segment 的基本一致性，并提示缺失文件、孤儿 segment、临时文件和 restore 残留目录。
 - `repair` 会离线执行恢复流程并刷新 WAL/内存状态。
 - `compact` 会离线触发 compaction。
+- `backup verify` 会离线校验备份元数据、文件长度和 SHA256。
 - `backup` / `restore` 使用带元数据校验的备份恢复流程。
 
 ## Benchmark 输出重点
