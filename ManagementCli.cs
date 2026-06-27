@@ -80,6 +80,47 @@ public static class ManagementCli
         var minTime = metadata.Count == 0 ? 0 : metadata.Min(m => m.MinTime);
         var maxTime = metadata.Count == 0 ? 0 : metadata.Max(m => m.MaxTime);
         var totalPoints = metadata.Sum(m => m.PointCount);
+        var format = ParseTextOrJsonFormat(args);
+
+        if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+        {
+            var result = new CliInspectSegmentResult
+            {
+                Path = Path.GetFullPath(segmentPath),
+                FileBytes = fileInfo.Length,
+                Columns = metadata.Count,
+                Measurements = measurements.ToList(),
+                MinTimeNs = minTime,
+                MaxTimeNs = maxTime,
+                TotalPoints = totalPoints,
+                ColumnEntries = metadata
+                    .OrderBy(m => m.Measurement, StringComparer.Ordinal)
+                    .ThenBy(m => m.TagsCanonical, StringComparer.Ordinal)
+                    .ThenBy(m => m.Field, StringComparer.Ordinal)
+                    .Select(entry => new CliSegmentColumnSummary
+                    {
+                        Measurement = entry.Measurement,
+                        Tags = entry.TagsCanonical,
+                        Field = entry.Field,
+                        Kind = entry.Kind.ToString(),
+                        Points = entry.PointCount,
+                        MinTimeNs = entry.MinTime,
+                        MaxTimeNs = entry.MaxTime,
+                        Stats = entry.Stats == null
+                            ? null
+                            : new CliNumericStatsSummary
+                            {
+                                Min = entry.Stats.Min,
+                                Max = entry.Stats.Max,
+                                Sum = entry.Stats.Sum,
+                                Count = entry.Stats.Count
+                            }
+                    })
+                    .ToList()
+            };
+            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectSegmentResult));
+            return 0;
+        }
 
         output.WriteLine($"path={Path.GetFullPath(segmentPath)}");
         output.WriteLine($"file_bytes={fileInfo.Length}");
@@ -121,6 +162,26 @@ public static class ManagementCli
             .Select(path => new FileInfo(path))
             .OrderBy(info => info.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
+        var format = ParseTextOrJsonFormat(args);
+
+        if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+        {
+            var result = new CliInspectWalResult
+            {
+                Path = Path.GetFullPath(walPath),
+                Checkpoint = $"{wal.CheckpointPosition.FileId}:{wal.CheckpointPosition.Offset}",
+                CurrentPosition = $"{wal.CurrentPosition.FileId}:{wal.CurrentPosition.Offset}",
+                WalFiles = files.Count,
+                ReplayRecords = records.Count,
+                Files = files.Select(file => new CliWalFileSummary
+                {
+                    Name = file.Name,
+                    Bytes = file.Length
+                }).ToList()
+            };
+            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectWalResult));
+            return 0;
+        }
 
         output.WriteLine($"path={Path.GetFullPath(walPath)}");
         output.WriteLine($"checkpoint={wal.CheckpointPosition.FileId}:{wal.CheckpointPosition.Offset}");
@@ -151,6 +212,88 @@ public static class ManagementCli
         var measurementCount = databases.Sum(kv => kv.Value.SeriesIndex.Count);
         var seriesCount = databases.Sum(kv => kv.Value.SeriesIndex.Values.Sum(series => series.Count));
         var cqCount = databases.Sum(kv => kv.Value.ContinuousQueries.Count);
+        var format = ParseTextOrJsonFormat(args);
+
+        if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+        {
+            var result = new CliInspectManifestResult
+            {
+                Path = Path.GetFullPath(manifestPath),
+                Databases = databases.Count,
+                RetentionPolicies = rpCount,
+                ShardGroups = shardCount,
+                SegmentFiles = segmentCount,
+                Measurements = measurementCount,
+                Series = seriesCount,
+                ContinuousQueries = cqCount,
+                DatabaseEntries = databases.Select(kv =>
+                {
+                    var dbName = kv.Key;
+                    var dbInfo = kv.Value;
+                    return new CliManifestDatabaseSummary
+                    {
+                        Name = dbName,
+                        RetentionPolicies = dbInfo.RetentionPolicies.Count,
+                        ShardGroups = dbInfo.RetentionPolicies.Values.Sum(rp => rp.ShardGroups.Count),
+                        SegmentFiles = dbInfo.RetentionPolicies.Values.Sum(rp => rp.ShardGroups.Sum(shard => shard.SegmentFiles.Count)),
+                        Measurements = dbInfo.SeriesIndex.Count,
+                        Series = dbInfo.SeriesIndex.Values.Sum(series => series.Count),
+                        ContinuousQueries = dbInfo.ContinuousQueries.Count,
+                        RetentionPolicyEntries = dbInfo.RetentionPolicies.Values
+                            .OrderBy(rp => rp.Name, StringComparer.Ordinal)
+                            .Select(rp => new CliManifestRetentionPolicySummary
+                            {
+                                Database = dbName,
+                                Name = rp.Name,
+                                DurationNs = rp.DurationNs,
+                                Replication = rp.Replication,
+                                IsDefault = rp.IsDefault,
+                                ShardGroups = rp.ShardGroups.Count,
+                                ShardEntries = rp.ShardGroups
+                                    .OrderBy(shard => shard.Id)
+                                    .Select(shard => new CliManifestShardSummary
+                                    {
+                                        Database = dbName,
+                                        RetentionPolicy = rp.Name,
+                                        Id = shard.Id,
+                                        StartTimeNs = shard.StartTimeNs,
+                                        EndTimeNs = shard.EndTimeNs,
+                                        Segments = shard.SegmentFiles.Count,
+                                        Files = shard.SegmentFiles.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList()
+                                    })
+                                    .ToList()
+                            })
+                            .ToList(),
+                        MeasurementEntries = dbInfo.SeriesIndex
+                            .OrderBy(measurement => measurement.Key, StringComparer.Ordinal)
+                            .Select(measurement => new CliManifestMeasurementSummary
+                            {
+                                Database = dbName,
+                                Name = measurement.Key,
+                                Series = measurement.Value.Count,
+                                TagKeys = dbInfo.TagIndex.TryGetValue(measurement.Key, out var tagMap)
+                                    ? tagMap.Keys.OrderBy(key => key, StringComparer.Ordinal).ToList()
+                                    : []
+                            })
+                            .ToList(),
+                        ContinuousQueryEntries = dbInfo.ContinuousQueries.Values
+                            .OrderBy(query => query.Name, StringComparer.Ordinal)
+                            .Select(cq => new CliManifestContinuousQuerySummary
+                            {
+                                Database = dbName,
+                                Name = cq.Name,
+                                EveryNs = cq.EveryNs,
+                                ForNs = cq.ForNs,
+                                RecomputeRecentBuckets = cq.RecomputeRecentBuckets,
+                                LastCompletedBucketStartNs = cq.LastCompletedBucketStartNs
+                            })
+                            .ToList()
+                    };
+                }).ToList()
+            };
+            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectManifestResult));
+            return 0;
+        }
 
         output.WriteLine($"path={Path.GetFullPath(manifestPath)}");
         output.WriteLine($"databases={databases.Count}");
@@ -219,6 +362,38 @@ public static class ManagementCli
             .ThenBy(entry => entry.Measurement, StringComparer.Ordinal)
             .ThenBy(entry => entry.Field, StringComparer.Ordinal)
             .ToList();
+        var format = ParseTextOrJsonFormat(args);
+
+        if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+        {
+            var result = new CliInspectSchemaResult
+            {
+                Path = Path.GetFullPath(schemaPath),
+                Entries = filteredEntries.Count,
+                Databases = filteredEntries.Select(entry => entry.Db).Distinct(StringComparer.Ordinal).Count(),
+                Measurements = filteredEntries.Select(entry => $"{entry.Db}|{entry.Measurement}").Distinct(StringComparer.Ordinal).Count(),
+                MeasurementEntries = filteredEntries
+                    .GroupBy(entry => new { entry.Db, entry.Measurement })
+                    .Select(group => new CliSchemaMeasurementSummary
+                    {
+                        Database = group.Key.Db,
+                        Name = group.Key.Measurement,
+                        Fields = group.Count()
+                    })
+                    .OrderBy(entry => entry.Database, StringComparer.Ordinal)
+                    .ThenBy(entry => entry.Name, StringComparer.Ordinal)
+                    .ToList(),
+                FieldEntries = filteredEntries.Select(entry => new CliSchemaFieldSummary
+                {
+                    Database = entry.Db,
+                    Measurement = entry.Measurement,
+                    Name = entry.Field,
+                    Kind = ((FieldKind)entry.Kind).ToString()
+                }).ToList()
+            };
+            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectSchemaResult));
+            return 0;
+        }
 
         output.WriteLine($"path={Path.GetFullPath(schemaPath)}");
         output.WriteLine($"entries={filteredEntries.Count}");
@@ -257,6 +432,45 @@ public static class ManagementCli
                 return WriteError(error, $"tombstone file is invalid: {Path.GetFileName(file)}: {tombstoneError}");
 
             summaries.AddRange(tombstones!.Select(tombstone => (dbName, tombstone)));
+        }
+        var format = ParseTextOrJsonFormat(args);
+
+        if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+        {
+            var result = new CliInspectTombstoneResult
+            {
+                Path = Path.GetFullPath(tombstoneDir),
+                TombstoneFiles = tombstoneFiles.Length,
+                Tombstones = summaries.Count,
+                Databases = summaries.Select(summary => summary.Db).Distinct(StringComparer.Ordinal).Count(),
+                DatabaseEntries = summaries
+                    .GroupBy(summary => summary.Db, StringComparer.Ordinal)
+                    .OrderBy(group => group.Key, StringComparer.Ordinal)
+                    .Select(group => new CliTombstoneDatabaseSummary
+                    {
+                        Name = group.Key,
+                        Tombstones = group.Count()
+                    })
+                    .ToList(),
+                TombstoneEntries = summaries
+                    .OrderBy(summary => summary.Db, StringComparer.Ordinal)
+                    .ThenBy(summary => summary.Tombstone.Measurement, StringComparer.Ordinal)
+                    .ThenBy(summary => summary.Tombstone.TagsCanonical ?? string.Empty, StringComparer.Ordinal)
+                    .ThenBy(summary => summary.Tombstone.MinTimeNs ?? long.MinValue)
+                    .ThenBy(summary => summary.Tombstone.MaxTimeNs ?? long.MaxValue)
+                    .Select(summary => new CliTombstoneEntry
+                    {
+                        Database = summary.Db,
+                        Measurement = summary.Tombstone.Measurement,
+                        Tags = summary.Tombstone.TagsCanonical ?? "*",
+                        MinTimeNs = summary.Tombstone.MinTimeNs,
+                        MaxTimeNs = summary.Tombstone.MaxTimeNs,
+                        CreatedAtNs = summary.Tombstone.CreatedAtNs
+                    })
+                    .ToList()
+            };
+            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectTombstoneResult));
+            return 0;
         }
 
         output.WriteLine($"path={Path.GetFullPath(tombstoneDir)}");
@@ -366,6 +580,30 @@ public static class ManagementCli
             manifestSegmentCount = manifestData.Databases.Sum(kv => kv.Value.RetentionPolicies.Values.Sum(rp => rp.ShardGroups.Sum(shard => shard.SegmentFiles.Count)));
             ValidateManifestLayout(dataPath, manifestData, issues, warnings);
         }
+        var format = ParseTextOrJsonFormat(args);
+
+        if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+        {
+            var result = new CliValidateDataDirResult
+            {
+                DataPath = Path.GetFullPath(dataPath),
+                ManifestPresent = File.Exists(manifestPath),
+                SchemaPresent = File.Exists(schemaPath),
+                TombstoneFiles = tombstoneFiles.Length,
+                WalFiles = walFilesOnDisk,
+                SegmentsOnDisk = segmentFilesOnDisk,
+                ManifestDatabases = manifestDbCount,
+                ManifestRetentionPolicies = manifestRpCount,
+                ManifestShardGroups = manifestShardCount,
+                ManifestSegmentFiles = manifestSegmentCount,
+                Issues = issues.Count,
+                Warnings = warnings.Count,
+                IssueEntries = issues.Select(issue => new CliValidationMessage { Code = issue.Code, Message = issue.Message }).ToList(),
+                WarningEntries = warnings.Select(warning => new CliValidationMessage { Code = warning.Code, Message = warning.Message }).ToList()
+            };
+            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliValidateDataDirResult));
+            return issues.Count == 0 ? 0 : 1;
+        }
 
         output.WriteLine($"data_path={Path.GetFullPath(dataPath)}");
         output.WriteLine($"manifest_present={File.Exists(manifestPath).ToString().ToLowerInvariant()}");
@@ -391,39 +629,100 @@ public static class ManagementCli
     private static int RunRepair(string[] args, MiniInfluxOptions options, TextWriter output)
     {
         var dataPath = ResolveDataPath(args, options);
-        using var engine = OpenOfflineEngine(dataPath, options);
-        var result = engine.Recover();
-        engine.FlushAll();
-        output.WriteLine($"data_path={Path.GetFullPath(dataPath)}");
-        output.WriteLine($"wal_records_replayed={result.WalRecordsReplayed}");
-        output.WriteLine($"segments_scanned={result.SegmentsScanned}");
-        output.WriteLine($"segments_corrupted={result.SegmentsCorrupted}");
-        output.WriteLine($"schema_conflicts_skipped={result.SchemaConflictsSkipped}");
-        return 0;
+        var dryRun = HasFlag(args, "--dry-run");
+        var format = ParseTextOrJsonFormat(args);
+        var executionDataPath = dryRun ? CreateDryRunDataClone(dataPath) : dataPath;
+        try
+        {
+            using var engine = OpenOfflineEngine(executionDataPath, options);
+            var result = engine.Recover();
+            engine.FlushAll();
+
+            if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+            {
+                var jsonResult = new CliRepairResult
+                {
+                    DataPath = Path.GetFullPath(dataPath),
+                    DryRun = dryRun,
+                    ChangesApplied = !dryRun,
+                    WalRecordsReplayed = result.WalRecordsReplayed,
+                    SegmentsScanned = result.SegmentsScanned,
+                    SegmentsCorrupted = result.SegmentsCorrupted,
+                    SchemaConflictsSkipped = result.SchemaConflictsSkipped
+                };
+                output.WriteLine(JsonSerializer.Serialize(jsonResult, AppJsonContext.Default.CliRepairResult));
+                return 0;
+            }
+
+            output.WriteLine($"data_path={Path.GetFullPath(dataPath)}");
+            output.WriteLine($"dry_run={dryRun.ToString().ToLowerInvariant()}");
+            output.WriteLine($"wal_records_replayed={result.WalRecordsReplayed}");
+            output.WriteLine($"segments_scanned={result.SegmentsScanned}");
+            output.WriteLine($"segments_corrupted={result.SegmentsCorrupted}");
+            output.WriteLine($"schema_conflicts_skipped={result.SchemaConflictsSkipped}");
+            if (dryRun)
+                output.WriteLine("changes_applied=false");
+            return 0;
+        }
+        finally
+        {
+            if (dryRun)
+                DeleteDirectoryBestEffort(executionDataPath);
+        }
     }
 
     private static int RunCompact(string[] args, MiniInfluxOptions options, TextWriter output)
     {
         var dataPath = ResolveDataPath(args, options);
-        using var engine = OpenOfflineEngine(dataPath, options);
-        engine.Recover();
-        engine.FlushAll();
-        var compactor = new Compactor(engine.Meta, new ShardManager(engine.RootPath, engine.Meta), engine.Tombstones, engine.Schema, maxL0Segments: 2, maxL1Segments: 1);
-
-        var totalMerged = 0;
-        int merged;
-        do
+        var dryRun = HasFlag(args, "--dry-run");
+        var format = ParseTextOrJsonFormat(args);
+        var executionDataPath = dryRun ? CreateDryRunDataClone(dataPath) : dataPath;
+        try
         {
-            merged = compactor.CompactAll();
-            totalMerged += merged;
-        } while (merged > 0);
+            using var engine = OpenOfflineEngine(executionDataPath, options);
+            engine.Recover();
+            engine.FlushAll();
+            var compactor = new Compactor(engine.Meta, new ShardManager(engine.RootPath, engine.Meta), engine.Tombstones, engine.Schema, maxL0Segments: 2, maxL1Segments: 1);
 
-        var stats = compactor.GetStats();
-        output.WriteLine($"data_path={Path.GetFullPath(dataPath)}");
-        output.WriteLine($"compaction_tasks_merged={totalMerged}");
-        output.WriteLine($"compaction_runs_total={stats.TotalRuns}");
-        output.WriteLine($"segments_merged_total={stats.TotalSegmentsMerged}");
-        return 0;
+            var totalMerged = 0;
+            int merged;
+            do
+            {
+                merged = compactor.CompactAll();
+                totalMerged += merged;
+            } while (merged > 0);
+
+            var stats = compactor.GetStats();
+
+            if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+            {
+                var jsonResult = new CliCompactResult
+                {
+                    DataPath = Path.GetFullPath(dataPath),
+                    DryRun = dryRun,
+                    ChangesApplied = !dryRun,
+                    CompactionTasksMerged = totalMerged,
+                    CompactionRunsTotal = stats.TotalRuns,
+                    SegmentsMergedTotal = stats.TotalSegmentsMerged
+                };
+                output.WriteLine(JsonSerializer.Serialize(jsonResult, AppJsonContext.Default.CliCompactResult));
+                return 0;
+            }
+
+            output.WriteLine($"data_path={Path.GetFullPath(dataPath)}");
+            output.WriteLine($"dry_run={dryRun.ToString().ToLowerInvariant()}");
+            output.WriteLine($"compaction_tasks_merged={totalMerged}");
+            output.WriteLine($"compaction_runs_total={stats.TotalRuns}");
+            output.WriteLine($"segments_merged_total={stats.TotalSegmentsMerged}");
+            if (dryRun)
+                output.WriteLine("changes_applied=false");
+            return 0;
+        }
+        finally
+        {
+            if (dryRun)
+                DeleteDirectoryBestEffort(executionDataPath);
+        }
     }
 
     private static int RunBackup(string[] args, MiniInfluxOptions options, TextWriter output, TextWriter error)
@@ -445,6 +744,13 @@ public static class ManagementCli
         }
 
         BackupManager.CreateBackup(dataPath, backupPath);
+        if (string.Equals(ParseTextOrJsonFormat(args), "json", StringComparison.OrdinalIgnoreCase))
+        {
+            var result = new CliBackupCreateResult { BackupCreated = Path.GetFullPath(backupPath) };
+            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliBackupCreateResult));
+            return 0;
+        }
+
         output.WriteLine($"backup_created={Path.GetFullPath(backupPath)}");
         return 0;
     }
@@ -476,6 +782,21 @@ public static class ManagementCli
             return WriteError(error, $"backup verification failed: {ex.Message}");
         }
 
+        if (string.Equals(ParseTextOrJsonFormat(args), "json", StringComparison.OrdinalIgnoreCase))
+        {
+            var result = new CliBackupVerifyResult
+            {
+                BackupPath = Path.GetFullPath(backupPath),
+                FormatVersion = metadata!.FormatVersion,
+                CreatedAtUtc = metadata.CreatedAtUtc,
+                SourceRoot = metadata.SourceRoot,
+                Files = metadata.Files.Count,
+                Verified = true
+            };
+            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliBackupVerifyResult));
+            return 0;
+        }
+
         output.WriteLine($"backup_path={Path.GetFullPath(backupPath)}");
         output.WriteLine($"format_version={metadata!.FormatVersion}");
         output.WriteLine($"created_at_utc={metadata.CreatedAtUtc:O}");
@@ -494,7 +815,61 @@ public static class ManagementCli
         }
 
         var dataPath = ResolveDataPath(args, options);
+        var format = ParseTextOrJsonFormat(args);
+        if (HasFlag(args, "--dry-run"))
+        {
+            try
+            {
+                BackupManager.ValidateBackup(backupPath);
+            }
+            catch (Exception ex) when (ex is InvalidDataException or IOException or DirectoryNotFoundException)
+            {
+                return WriteError(error, $"restore dry-run failed: {ex.Message}");
+            }
+
+            if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+            {
+                var result = new CliRestoreResult
+                {
+                    BackupPath = Path.GetFullPath(backupPath),
+                    RestoreTarget = Path.GetFullPath(dataPath),
+                    PendingRestorePath = Path.GetFullPath(dataPath) + ".restore-pending",
+                    DryRun = true,
+                    ValidatedBackup = true,
+                    ChangesApplied = false,
+                    RestartRequired = false
+                };
+                output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliRestoreResult));
+                return 0;
+            }
+
+            output.WriteLine($"backup_path={Path.GetFullPath(backupPath)}");
+            output.WriteLine($"restore_target={Path.GetFullPath(dataPath)}");
+            output.WriteLine($"pending_restore_path={Path.GetFullPath(dataPath)}.restore-pending");
+            output.WriteLine("dry_run=true");
+            output.WriteLine("validated_backup=true");
+            output.WriteLine("changes_applied=false");
+            output.WriteLine("restart_required=false");
+            return 0;
+        }
+
         BackupManager.PrepareRestore(backupPath, dataPath);
+        if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+        {
+            var result = new CliRestoreResult
+            {
+                BackupPath = Path.GetFullPath(backupPath),
+                RestoreTarget = Path.GetFullPath(dataPath),
+                PendingRestorePath = Path.GetFullPath(dataPath) + ".restore-pending",
+                DryRun = false,
+                ValidatedBackup = true,
+                ChangesApplied = true,
+                RestartRequired = true
+            };
+            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliRestoreResult));
+            return 0;
+        }
+
         output.WriteLine($"restore_prepared={Path.GetFullPath(dataPath)}.restore-pending");
         output.WriteLine("restart_required=true");
         return 0;
@@ -503,17 +878,17 @@ public static class ManagementCli
     private static int ShowHelp(TextWriter output)
     {
         output.WriteLine("mini-influx benchmark [--points N] [--concurrency N] [--format text|json|prometheus] [--data PATH]");
-        output.WriteLine("mini-influx inspect segment --path FILE");
-        output.WriteLine("mini-influx inspect wal [--path DIR] [--data PATH]");
-        output.WriteLine("mini-influx inspect manifest [--data PATH]");
-        output.WriteLine("mini-influx inspect schema [--data PATH] [--db NAME] [--measurement NAME]");
-        output.WriteLine("mini-influx inspect tombstone [--data PATH] [--db NAME]");
-        output.WriteLine("mini-influx validate data-dir [--data PATH]");
-        output.WriteLine("mini-influx repair [--data PATH]");
-        output.WriteLine("mini-influx compact [--data PATH]");
-        output.WriteLine("mini-influx backup --path DIR [--data PATH]");
-        output.WriteLine("mini-influx backup verify --path DIR");
-        output.WriteLine("mini-influx restore --path DIR [--data PATH]");
+        output.WriteLine("mini-influx inspect segment --path FILE [--format text|json]");
+        output.WriteLine("mini-influx inspect wal [--path DIR] [--data PATH] [--format text|json]");
+        output.WriteLine("mini-influx inspect manifest [--data PATH] [--format text|json]");
+        output.WriteLine("mini-influx inspect schema [--data PATH] [--db NAME] [--measurement NAME] [--format text|json]");
+        output.WriteLine("mini-influx inspect tombstone [--data PATH] [--db NAME] [--format text|json]");
+        output.WriteLine("mini-influx validate data-dir [--data PATH] [--format text|json]");
+        output.WriteLine("mini-influx repair [--data PATH] [--dry-run] [--format text|json]");
+        output.WriteLine("mini-influx compact [--data PATH] [--dry-run] [--format text|json]");
+        output.WriteLine("mini-influx backup --path DIR [--data PATH] [--format text|json]");
+        output.WriteLine("mini-influx backup verify --path DIR [--format text|json]");
+        output.WriteLine("mini-influx restore --path DIR [--data PATH] [--dry-run] [--format text|json]");
         return 0;
     }
 
@@ -566,6 +941,15 @@ public static class ManagementCli
 
         return "text";
     }
+
+    private static string ParseTextOrJsonFormat(string[] args)
+    {
+        var format = ParseBenchmarkFormat(args);
+        return string.Equals(format, "json", StringComparison.OrdinalIgnoreCase) ? "json" : "text";
+    }
+
+    private static bool HasFlag(string[] args, string flagName) =>
+        args.Any(arg => string.Equals(arg, flagName, StringComparison.OrdinalIgnoreCase));
 
     private static bool TryGetOption(string[] args, string optionName, out string value)
     {
@@ -751,5 +1135,40 @@ public static class ManagementCli
     {
         error.WriteLine(message);
         return 1;
+    }
+
+    private static string CreateDryRunDataClone(string dataPath)
+    {
+        var source = Path.GetFullPath(dataPath);
+        if (!Directory.Exists(source))
+            throw new DirectoryNotFoundException($"data directory does not exist: {source}");
+
+        var cloneRoot = Path.Combine(Path.GetTempPath(), "miniinflux-dryrun", Guid.NewGuid().ToString("N"));
+        CopyDirectoryRecursive(source, cloneRoot);
+        return cloneRoot;
+    }
+
+    private static void CopyDirectoryRecursive(string source, string destination)
+    {
+        Directory.CreateDirectory(destination);
+
+        foreach (var file in Directory.GetFiles(source))
+            File.Copy(file, Path.Combine(destination, Path.GetFileName(file)), overwrite: true);
+
+        foreach (var directory in Directory.GetDirectories(source))
+            CopyDirectoryRecursive(directory, Path.Combine(destination, Path.GetFileName(directory)));
+    }
+
+    private static void DeleteDirectoryBestEffort(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
+            // Best effort cleanup for dry-run temp directories.
+        }
     }
 }

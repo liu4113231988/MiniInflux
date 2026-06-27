@@ -152,6 +152,44 @@ public class HighPriorityFixTests : IDisposable
     }
 
     [Fact]
+    public async Task Delete_WithQuotedMeasurementAndQuotedFieldPredicates_DeletesOnlyMatchingPoints()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu load", "server01", new Dictionary<string, FieldValue>
+            {
+                ["value"] = FieldValue.FromDouble(5),
+                ["temp c"] = FieldValue.FromDouble(80)
+            }, 1),
+            Point("cpu load", "server01", new Dictionary<string, FieldValue>
+            {
+                ["value"] = FieldValue.FromDouble(15),
+                ["temp c"] = FieldValue.FromDouble(80)
+            }, 2),
+            Point("cpu load", "server02", new Dictionary<string, FieldValue>
+            {
+                ["value"] = FieldValue.FromDouble(5),
+                ["temp c"] = FieldValue.FromDouble(80)
+            }, 3)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(
+            engine,
+            "testdb",
+            "DELETE FROM \"cpu load\" WHERE host = 'server01' AND \"temp c\" >= 70 AND value < 10");
+
+        Assert.Null(response.Results[0].Error);
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu load", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+        Assert.Equal(2, points.Count);
+        Assert.Equal("server01", points[0].Tags["host"]);
+        Assert.Equal(15.0, points[0].Fields["value"].AsDouble());
+        Assert.Equal("server02", points[1].Tags["host"]);
+    }
+
+    [Fact]
     public async Task Delete_WithFieldPredicate_OnFlushedSeries_DoesNotDeleteNonMatchingPoints()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1);
@@ -194,6 +232,33 @@ public class HighPriorityFixTests : IDisposable
     }
 
     [Fact]
+    public async Task Delete_WithQualifiedRetentionPolicy_DeletesOnlyTargetRp()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        engine.CreateDatabase("testdb");
+        engine.Meta.CreateRetentionPolicy("testdb", "archive", 0, false);
+        await engine.WriteAsync("testdb", "archive",
+        [
+            Point("cpu", "value", 1.0, "server01", 1),
+            Point("cpu", "value", 10.0, "server01", 2)
+        ]);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 10.0, "server01", 3)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "DELETE FROM archive.cpu WHERE value >= 10");
+
+        Assert.Null(response.Results[0].Error);
+        var archivePoints = engine.ReadAllPoints("testdb", "archive", "cpu", null, null);
+        var autogenPoints = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
+        var archivePoint = Assert.Single(archivePoints);
+        Assert.Equal(1.0, archivePoint.Fields["value"].AsDouble());
+        var autogenPoint = Assert.Single(autogenPoints);
+        Assert.Equal(10.0, autogenPoint.Fields["value"].AsDouble());
+    }
+
+    [Fact]
     public async Task DropSeries_WithFieldPredicate_FindsMatchesAcrossRetentionPolicies()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
@@ -213,6 +278,64 @@ public class HighPriorityFixTests : IDisposable
         Assert.Null(response.Results[0].Error);
         Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu", null, null));
         Assert.Empty(engine.ReadAllPoints("testdb", "archive", "cpu", null, null));
+    }
+
+    [Fact]
+    public async Task DropSeries_WithQuotedMeasurementAndMultipleFieldPredicates_DropsOnlyMatchingSeries()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu load", "server01", new Dictionary<string, FieldValue>
+            {
+                ["usage"] = FieldValue.FromDouble(5),
+                ["temp c"] = FieldValue.FromDouble(80)
+            }, 1),
+            Point("cpu load", "server02", new Dictionary<string, FieldValue>
+            {
+                ["usage"] = FieldValue.FromDouble(5),
+                ["temp c"] = FieldValue.FromDouble(60)
+            }, 2),
+            Point("cpu load", "server03", new Dictionary<string, FieldValue>
+            {
+                ["usage"] = FieldValue.FromDouble(0),
+                ["temp c"] = FieldValue.FromDouble(80)
+            }, 3)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(
+            engine,
+            "testdb",
+            "DROP SERIES FROM \"cpu load\" WHERE \"temp c\" >= 70 AND usage != 0");
+
+        Assert.Null(response.Results[0].Error);
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu load", null, null)
+            .OrderBy(p => p.Tags["host"], StringComparer.Ordinal)
+            .ToList();
+        Assert.Equal(2, points.Count);
+        Assert.DoesNotContain(points, p => p.Tags["host"] == "server01");
+        Assert.Contains(points, p => p.Tags["host"] == "server02");
+        Assert.Contains(points, p => p.Tags["host"] == "server03");
+    }
+
+    [Fact]
+    public async Task DropSeries_WithMultipleMeasurements_DropsMatchesAcrossListedMeasurementsOnly()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1.0, "server01", 1),
+            Point("mem", "value", 2.0, "server01", 1),
+            Point("disk", "value", 3.0, "server01", 1),
+            Point("cpu", "value", 4.0, "server02", 2)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "DROP SERIES FROM cpu,mem WHERE host='server01'");
+
+        Assert.Null(response.Results[0].Error);
+        Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu", null, null));
+        Assert.Empty(engine.ReadAllPoints("testdb", "autogen", "mem", null, null));
+        Assert.Single(engine.ReadAllPoints("testdb", "autogen", "disk", null, null));
     }
 
     [Fact]
@@ -282,6 +405,14 @@ public class HighPriorityFixTests : IDisposable
         Measurement = measurement,
         Tags = new Dictionary<string, string> { ["host"] = host },
         Fields = new Dictionary<string, FieldValue> { [field] = FieldValue.FromDouble(value) },
+        TimestampNs = seconds * 1_000_000_000
+    };
+
+    private static Point Point(string measurement, string host, Dictionary<string, FieldValue> fields, long seconds) => new()
+    {
+        Measurement = measurement,
+        Tags = new Dictionary<string, string> { ["host"] = host },
+        Fields = fields,
         TimestampNs = seconds * 1_000_000_000
     };
 

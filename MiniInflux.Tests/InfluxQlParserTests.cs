@@ -95,6 +95,18 @@ public class InfluxQlParserTests
     }
 
     [Fact]
+    public void Parse_SelectWithGroupByAllTags_ParsesWildcardGrouping()
+    {
+        var query = InfluxQlParser.Parse("SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(1m),*");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.Equal(60_000_000_000, query.GroupByNs);
+        Assert.True(query.GroupByAllTags);
+        Assert.Empty(query.GroupByTags);
+        Assert.Equal("cpu_rollup", query.IntoTarget);
+    }
+
+    [Fact]
     public void Parse_SelectWithLimit_ParsesLimit()
     {
         var query = InfluxQlParser.Parse("SELECT value FROM cpu LIMIT 10");
@@ -175,6 +187,60 @@ public class InfluxQlParserTests
         Assert.Equal("value", field.Field);
         Assert.Equal(FieldOp.Gte, field.Op);
         Assert.Equal(12, field.Value);
+    }
+
+    [Fact]
+    public void Parse_DeleteWithQuotedMeasurementAndQuotedField_ParsesPredicates()
+    {
+        var query = InfluxQlParser.Parse("DELETE FROM \"cpu load\" WHERE host = 'server01' AND \"temp c\" >= 70 AND value < 10");
+
+        Assert.Equal(QueryKind.Delete, query.Kind);
+        Assert.Equal("cpu load", query.Measurement);
+        Assert.Single(query.TagFilters);
+        Assert.Equal("host", query.TagFilters[0].Key);
+        Assert.Equal("server01", query.TagFilters[0].Value);
+        Assert.Equal(2, query.FieldFilters.Count);
+        Assert.Contains(query.FieldFilters, f => f.Field == "temp c" && f.Op == FieldOp.Gte && f.Value == 70);
+        Assert.Contains(query.FieldFilters, f => f.Field == "value" && f.Op == FieldOp.Lt && f.Value == 10);
+    }
+
+    [Fact]
+    public void Parse_DeleteWithQualifiedRetentionPolicy_ParsesTargetRp()
+    {
+        var query = InfluxQlParser.Parse("DELETE FROM \"archive rp\".\"cpu load\" WHERE value >= 10");
+
+        Assert.Equal(QueryKind.Delete, query.Kind);
+        Assert.Equal("archive rp", query.SourceRpName);
+        Assert.Equal("cpu load", query.Measurement);
+        var field = Assert.Single(query.FieldFilters);
+        Assert.Equal("value", field.Field);
+        Assert.Equal(FieldOp.Gte, field.Op);
+        Assert.Equal(10, field.Value);
+    }
+
+    [Fact]
+    public void Parse_DropSeriesWithQuotedMeasurement_ParsesMultipleFieldPredicates()
+    {
+        var query = InfluxQlParser.Parse("DROP SERIES FROM \"cpu load\" WHERE \"temp c\" >= 70 AND usage != 0");
+
+        Assert.Equal(QueryKind.DropSeries, query.Kind);
+        Assert.Equal("cpu load", query.Measurement);
+        Assert.Equal(2, query.FieldFilters.Count);
+        Assert.Contains(query.FieldFilters, f => f.Field == "temp c" && f.Op == FieldOp.Gte && f.Value == 70);
+        Assert.Contains(query.FieldFilters, f => f.Field == "usage" && f.Op == FieldOp.Neq && f.Value == 0);
+    }
+
+    [Fact]
+    public void Parse_DropSeriesWithMultipleMeasurements_ParsesMeasurementList()
+    {
+        var query = InfluxQlParser.Parse("DROP SERIES FROM cpu,mem,\"disk io\" WHERE host = 'server01'");
+
+        Assert.Equal(QueryKind.DropSeries, query.Kind);
+        Assert.Equal(3, query.Measurements.Count);
+        Assert.Equal(["cpu", "mem", "disk io"], query.Measurements);
+        var tag = Assert.Single(query.TagFilters);
+        Assert.Equal("host", tag.Key);
+        Assert.Equal("server01", tag.Value);
     }
 
     [Fact]

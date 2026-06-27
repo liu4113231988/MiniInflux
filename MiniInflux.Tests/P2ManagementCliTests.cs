@@ -1,5 +1,6 @@
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Storage;
+using System.Text.Json;
 
 namespace MiniInflux.Tests;
 
@@ -97,6 +98,33 @@ public sealed class P2ManagementCliTests : IDisposable
     }
 
     [Fact]
+    public async Task InspectManifest_CanEmitStableJsonSchema()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 12.5, "server01", 1)]);
+            engine.FlushAll();
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "manifest", "--data", dataPath, "--format", "json"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        using var json = JsonDocument.Parse(stdout.ToString());
+        Assert.Equal(0, exitCode);
+        Assert.Equal(1, json.RootElement.GetProperty("SchemaVersion").GetInt32());
+        Assert.Equal("inspect-manifest", json.RootElement.GetProperty("Command").GetString());
+        Assert.Equal(1, json.RootElement.GetProperty("Databases").GetInt32());
+        Assert.Equal("testdb", json.RootElement.GetProperty("DatabaseEntries")[0].GetProperty("Name").GetString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
     public async Task InspectSchema_ReportsFieldKinds()
     {
         var dataPath = Path.Combine(_testDir, "data");
@@ -187,6 +215,63 @@ public sealed class P2ManagementCliTests : IDisposable
     }
 
     [Fact]
+    public async Task Compact_DryRun_DoesNotModifyLiveSegments()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        string[] beforeSegments;
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 1, "server01", 1)]);
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 2, "server01", 2)]);
+            engine.FlushAll();
+            beforeSegments = new Manifest(dataPath).GetShards("testdb", "autogen").Single().SegmentFiles.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["compact", "--data", dataPath, "--dry-run"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        var afterSegments = new Manifest(dataPath).GetShards("testdb", "autogen").Single().SegmentFiles.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+        Assert.Equal(0, exitCode);
+        Assert.Equal(beforeSegments, afterSegments);
+        Assert.Contains("dry_run=true", stdout.ToString());
+        Assert.Contains("changes_applied=false", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task Compact_DryRun_CanEmitJsonSchema()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 1, "server01", 1)]);
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 2, "server01", 2)]);
+            engine.FlushAll();
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["compact", "--data", dataPath, "--dry-run", "--format", "json"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        using var json = JsonDocument.Parse(stdout.ToString());
+        Assert.Equal(0, exitCode);
+        Assert.Equal(1, json.RootElement.GetProperty("SchemaVersion").GetInt32());
+        Assert.Equal("compact", json.RootElement.GetProperty("Command").GetString());
+        Assert.True(json.RootElement.GetProperty("DryRun").GetBoolean());
+        Assert.False(json.RootElement.GetProperty("ChangesApplied").GetBoolean());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
     public async Task ValidateDataDir_ReportsHealthyDirectory()
     {
         var dataPath = Path.Combine(_testDir, "data");
@@ -235,6 +320,38 @@ public sealed class P2ManagementCliTests : IDisposable
 
         Assert.Equal(1, exitCode);
         Assert.Contains("issue code=segment_missing_on_disk", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task ValidateDataDir_CanEmitJsonIssues()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        string segmentPath;
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 5, "server01", 1)]);
+            engine.FlushAll();
+            var shard = Assert.Single(engine.Meta.GetShards("testdb", "autogen"));
+            segmentPath = Path.Combine(dataPath, "db", "testdb", "autogen", "shards", shard.Id.ToString("D6"), shard.SegmentFiles[0]);
+        }
+
+        File.Delete(segmentPath);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["validate", "data-dir", "--data", dataPath, "--format", "json"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        using var json = JsonDocument.Parse(stdout.ToString());
+        Assert.Equal(1, exitCode);
+        Assert.Equal(1, json.RootElement.GetProperty("SchemaVersion").GetInt32());
+        Assert.Equal("validate-data-dir", json.RootElement.GetProperty("Command").GetString());
+        Assert.True(json.RootElement.GetProperty("Issues").GetInt32() > 0);
+        Assert.Equal("segment_missing_on_disk", json.RootElement.GetProperty("IssueEntries")[0].GetProperty("Code").GetString());
         Assert.Equal(string.Empty, stderr.ToString());
     }
 
@@ -303,6 +420,74 @@ public sealed class P2ManagementCliTests : IDisposable
     }
 
     [Fact]
+    public async Task Restore_DryRun_ValidatesBackup_WithoutPreparingPendingDirectory()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var backupPath = Path.Combine(_testDir, "backup");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1000, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 7, "server01", 1)]);
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        Assert.Equal(
+            0,
+            ManagementCli.TryRun(["backup", "--data", dataPath, "--path", backupPath], CreateOptions(dataPath), stdout, stderr));
+
+        stdout.GetStringBuilder().Clear();
+        stderr.GetStringBuilder().Clear();
+
+        var exitCode = ManagementCli.TryRun(
+            ["restore", "--data", dataPath, "--path", backupPath, "--dry-run"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.False(Directory.Exists(dataPath + ".restore-pending"));
+        Assert.Contains("dry_run=true", stdout.ToString());
+        Assert.Contains("validated_backup=true", stdout.ToString());
+        Assert.Contains("changes_applied=false", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task Restore_DryRun_CanEmitJsonSchema()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var backupPath = Path.Combine(_testDir, "backup");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1000, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 7, "server01", 1)]);
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        Assert.Equal(
+            0,
+            ManagementCli.TryRun(["backup", "--data", dataPath, "--path", backupPath], CreateOptions(dataPath), stdout, stderr));
+
+        stdout.GetStringBuilder().Clear();
+        stderr.GetStringBuilder().Clear();
+
+        var exitCode = ManagementCli.TryRun(
+            ["restore", "--data", dataPath, "--path", backupPath, "--dry-run", "--format", "json"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        using var json = JsonDocument.Parse(stdout.ToString());
+        Assert.Equal(0, exitCode);
+        Assert.Equal(1, json.RootElement.GetProperty("SchemaVersion").GetInt32());
+        Assert.Equal("restore", json.RootElement.GetProperty("Command").GetString());
+        Assert.True(json.RootElement.GetProperty("DryRun").GetBoolean());
+        Assert.True(json.RootElement.GetProperty("ValidatedBackup").GetBoolean());
+        Assert.False(json.RootElement.GetProperty("ChangesApplied").GetBoolean());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
     public async Task BackupAndRestore_CommandsRoundTripData()
     {
         var dataPath = Path.Combine(_testDir, "data");
@@ -336,6 +521,36 @@ public sealed class P2ManagementCliTests : IDisposable
 
         Assert.Single(points);
         Assert.Equal(7.0, points[0].Fields["value"].AsDouble());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task Repair_DryRun_DoesNotRewriteManifest()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        string segmentName;
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 1, "server01", 1)]);
+            engine.FlushAll();
+            var shard = Assert.Single(engine.Meta.GetShards("testdb", "autogen"));
+            segmentName = Assert.Single(shard.SegmentFiles);
+            engine.Meta.RemoveSegmentsFromShard("testdb", "autogen", shard.Id, [segmentName]);
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["repair", "--data", dataPath, "--dry-run"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        var shardAfter = new Manifest(dataPath).GetShards("testdb", "autogen").Single();
+        Assert.Equal(0, exitCode);
+        Assert.DoesNotContain(segmentName, shardAfter.SegmentFiles);
+        Assert.Contains("dry_run=true", stdout.ToString());
+        Assert.Contains("changes_applied=false", stdout.ToString());
         Assert.Equal(string.Empty, stderr.ToString());
     }
 

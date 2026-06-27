@@ -438,9 +438,11 @@ compact
 backup
 backup verify
 restore
+管理 CLI 稳定 JSON schema（`--format json`）
+repair / compact / restore `--dry-run`
 ```
 
-`backup` / `restore` 已支持备份元信息、文件长度、SHA256 校验和 pending restore 边界；`backup verify` 可离线校验备份完整性；`inspect manifest` / `inspect schema` / `inspect tombstone` / `validate data-dir` 可用于离线查看 manifest、schema、删除标记以及检查 manifest / segment / schema / tombstone 的基本一致性。
+`backup` / `restore` 已支持备份元信息、文件长度、SHA256 校验和 pending restore 边界；`backup verify` 可离线校验备份完整性；`inspect manifest` / `inspect schema` / `inspect tombstone` / `validate data-dir` 可用于离线查看 manifest、schema、删除标记以及检查 manifest / segment / schema / tombstone 的基本一致性。除 `benchmark` 外，其余管理 CLI 也已支持稳定的 `--format json` 机器可读输出，当前顶层结果统一携带 `SchemaVersion=1`。
 
 ## 19. AOT 兼容设计
 

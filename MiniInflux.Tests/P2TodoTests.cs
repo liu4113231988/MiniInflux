@@ -118,6 +118,40 @@ public class P2TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task SelectInto_GroupByAllTags_PreservesAllSourceTags()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01", ["region"] = "cn" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(10) },
+                TimestampNs = 1_000_000_000L
+            },
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01", ["region"] = "cn" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(20) },
+                TimestampNs = 2_000_000_000L
+            }
+        ]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(
+            engine,
+            "testdb",
+            "SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),*");
+
+        Assert.Null(outcome.Response.Results[0].Error);
+        var copied = Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu_rollup", null, null));
+        Assert.Equal("server01", copied.Tags["host"]);
+        Assert.Equal("cn", copied.Tags["region"]);
+        Assert.Equal(15.0, copied.Fields["mean_value"].AsDouble());
+    }
+
+    [Fact]
     public async Task ContinuousQuery_Ddl_CanCreateShowAndDrop()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
@@ -142,6 +176,27 @@ public class P2TodoTests : IDisposable
 
         var showAfterDrop = await executor.ExecuteAsync(engine, "testdb", "SHOW CONTINUOUS QUERIES");
         Assert.Empty(Assert.Single(showAfterDrop.Results[0].Series!).Values);
+    }
+
+    [Fact]
+    public async Task ContinuousQuery_Ddl_RejectsResampleForSmallerThanGroupByOrEvery()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        var executor = new QueryExecutor();
+
+        var shorterThanGroupBy = await executor.ExecuteAsync(
+            engine,
+            "testdb",
+            "CREATE CONTINUOUS QUERY cq_bad_group ON testdb RESAMPLE EVERY 10s FOR 5s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");
+
+        Assert.Contains("RESAMPLE FOR must be greater than or equal to GROUP BY time", shorterThanGroupBy.Results[0].Error);
+
+        var shorterThanEvery = await executor.ExecuteAsync(
+            engine,
+            "testdb",
+            "CREATE CONTINUOUS QUERY cq_bad_every ON testdb RESAMPLE EVERY 20s FOR 10s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");
+
+        Assert.Contains("RESAMPLE FOR must be greater than or equal to RESAMPLE EVERY", shorterThanEvery.Results[0].Error);
     }
 
     [Fact]
@@ -194,6 +249,62 @@ public class P2TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task ContinuousQueryRunner_GroupByAllTags_PreservesTagsInRollup()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        const long everyNs = 1_000_000_000L;
+        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var bucketStart = (nowNs / everyNs) * everyNs - everyNs;
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01", ["region"] = "cn" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(10) },
+                TimestampNs = bucketStart + 100_000_000L
+            },
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01", ["region"] = "cn" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(20) },
+                TimestampNs = bucketStart + 600_000_000L
+            }
+        ]);
+
+        var executor = new QueryExecutor();
+        await executor.ExecuteAsync(
+            engine,
+            "testdb",
+            "CREATE CONTINUOUS QUERY cq_cpu_all_tags ON testdb BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(1s),* END");
+
+        using var loggerFactory = LoggerFactory.Create(builder => { });
+        var runner = new ContinuousQueryRunner(
+            engine,
+            executor,
+            new MiniInfluxOptions
+            {
+                ContinuousQuery = new ContinuousQueryOptions
+                {
+                    Enabled = true,
+                    CheckIntervalMs = 1000,
+                    MaxCatchUpRunsPerCycle = 4
+                }
+            },
+            new MetricsCollector(engine),
+            loggerFactory.CreateLogger<ContinuousQueryRunner>());
+
+        var executed = await runner.ExecuteDueQueriesAsync();
+
+        Assert.Equal(1, executed);
+        var rollup = Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu_rollup", null, null));
+        Assert.Equal("server01", rollup.Tags["host"]);
+        Assert.Equal("cn", rollup.Tags["region"]);
+        Assert.Equal(15.0, rollup.Fields["mean_value"].AsDouble());
+    }
+
+    [Fact]
     public async Task ContinuousQueryRunner_UsesResampleForWindow_ForInitialBackfill()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
@@ -242,6 +353,56 @@ public class P2TodoTests : IDisposable
         Assert.Equal(15.0, rollups[0].Fields["mean_value"].AsDouble());
         Assert.Equal(latestClosedBucketStart, rollups[^1].TimestampNs);
         Assert.Equal(40.0, rollups[^1].Fields["mean_value"].AsDouble());
+    }
+
+    [Fact]
+    public async Task ContinuousQueryRunner_WhenEveryExceedsGroupBy_UsesEveryAsExecutionWindow()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        const long everyNs = 20_000_000_000L;
+        const long groupByNs = 10_000_000_000L;
+        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var latestClosedWindowStart = (nowNs / everyNs) * everyNs - everyNs;
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "server01", 10, latestClosedWindowStart + 1_000_000_000L),
+            Point("cpu", "server01", 20, latestClosedWindowStart + 5_000_000_000L),
+            Point("cpu", "server01", 30, latestClosedWindowStart + groupByNs + 1_000_000_000L),
+            Point("cpu", "server01", 50, latestClosedWindowStart + groupByNs + 5_000_000_000L)
+        ]);
+
+        var executor = new QueryExecutor();
+        await executor.ExecuteAsync(
+            engine,
+            "testdb",
+            "CREATE CONTINUOUS QUERY cq_cpu_every_20s ON testdb RESAMPLE EVERY 20s FOR 20s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");
+
+        using var loggerFactory = LoggerFactory.Create(builder => { });
+        var runner = new ContinuousQueryRunner(
+            engine,
+            executor,
+            new MiniInfluxOptions
+            {
+                ContinuousQuery = new ContinuousQueryOptions
+                {
+                    Enabled = true,
+                    MaxCatchUpRunsPerCycle = 4
+                }
+            },
+            new MetricsCollector(engine),
+            loggerFactory.CreateLogger<ContinuousQueryRunner>());
+
+        var executed = await runner.ExecuteDueQueriesAsync();
+
+        Assert.Equal(1, executed);
+        var rollups = engine.ReadAllPoints("testdb", "autogen", "cpu_rollup", null, null)
+            .OrderBy(p => p.TimestampNs)
+            .ToList();
+        Assert.Equal(2, rollups.Count);
+        Assert.Equal(latestClosedWindowStart, rollups[0].TimestampNs);
+        Assert.Equal(15.0, rollups[0].Fields["mean_value"].AsDouble());
+        Assert.Equal(latestClosedWindowStart + groupByNs, rollups[1].TimestampNs);
+        Assert.Equal(40.0, rollups[1].Fields["mean_value"].AsDouble());
     }
 
     [Fact]

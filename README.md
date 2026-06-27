@@ -25,9 +25,14 @@
   - 序列函数：`difference,derivative,non_negative_derivative,moving_average,cumulative_sum,integral,elapsed`
   - 采样/排名函数：`top,bottom,sample`
   - 已支持 `GROUP BY time(...)`、`GROUP BY tag`、`GROUP BY time(...),tag`
+  - 已支持 `GROUP BY *`，用于在 `SELECT INTO` / Continuous Query 中保留源 tags
   - 已支持 `fill(none|null|previous|linear|zero)`、`ORDER BY time DESC`、`SLIMIT`、`SOFFSET`
 - `SELECT ... INTO ...`
   - 支持写回 `measurement`、`db.measurement`、`db.rp.measurement`
+- `DELETE` / `DROP SERIES`
+  - 支持 `DELETE FROM measurement ...`
+  - 支持 `DELETE FROM rp.measurement ...`
+  - 支持 `DROP SERIES FROM m1,m2 WHERE ...`
 - 查询保护与观测
   - chunked query response
   - query count / error / timeout / rows / scanned points / duration buckets
@@ -327,6 +332,7 @@ dotnet run -- inspect manifest --data ./data
 dotnet run -- inspect schema --data ./data
 dotnet run -- inspect tombstone --data ./data
 dotnet run -- validate data-dir --data ./data
+dotnet run -- validate data-dir --data ./data --format json
 dotnet run -- repair --data ./data
 dotnet run -- compact --data ./data
 dotnet run -- backup --data ./data --path ./backup
@@ -348,6 +354,7 @@ dotnet run -- restore --data ./data --path ./backup
 - `compact` 会离线触发 compaction。
 - `backup verify` 会离线校验备份元数据、文件长度和 SHA256。
 - `backup` / `restore` 使用带元数据校验的备份恢复流程。
+- 除 `benchmark` 支持 `text/json/prometheus` 外，其余管理 CLI 也已支持稳定的 `--format json` 输出，便于脚本消费；所有顶层 JSON 结果当前都带 `SchemaVersion=1`；`repair`、`compact`、`restore` 同时支持 `--dry-run`。
 
 ## Benchmark 输出重点
 

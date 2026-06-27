@@ -461,6 +461,12 @@ public sealed class TsdbEngine : IDisposable
             DeleteBuffered(db, rp, measurement, minTime, maxTime, _ => true);
     }
 
+    public void DeleteFromMeasurement(string db, string rp, string measurement, long? minTime, long? maxTime)
+    {
+        _tombstones.AddMeasurementDelete(db, measurement, minTime, maxTime);
+        DeleteBuffered(db, rp, measurement, minTime, maxTime, _ => true);
+    }
+
     public void DeleteFromMeasurement(string db, string measurement, long? minTime, long? maxTime, Predicate<Point> predicate)
     {
         foreach (var rp in _manifest.ListRetentionPolicies(db).Select(r => r.Name).DefaultIfEmpty("autogen"))
@@ -477,6 +483,21 @@ public sealed class TsdbEngine : IDisposable
 
             DeleteBuffered(db, rp, measurement, minTime, maxTime, predicate);
         }
+    }
+
+    public void DeleteFromMeasurement(string db, string rp, string measurement, long? minTime, long? maxTime, Predicate<Point> predicate)
+    {
+        var matches = ReadAllPoints(db, rp, measurement, minTime, maxTime)
+            .Where(p => predicate(p))
+            .GroupBy(p => SeriesKey.From(p).TagsCanonical);
+
+        foreach (var group in matches)
+        {
+            foreach (var point in group)
+                _tombstones.AddSeriesDelete(db, measurement, group.Key, point.TimestampNs, point.TimestampNs);
+        }
+
+        DeleteBuffered(db, rp, measurement, minTime, maxTime, predicate);
     }
 
     public void DropSeries(string db, string? measurement, List<string> tagsCanonical)

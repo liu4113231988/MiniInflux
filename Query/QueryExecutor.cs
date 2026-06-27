@@ -454,6 +454,13 @@ public sealed class QueryExecutor
         var cadence = q.ContinuousQueryEveryNs ?? parsedSelect.GroupByNs.Value;
         if (cadence <= 0)
             throw new NotSupportedException("continuous query cadence must be positive");
+        if (q.ContinuousQueryForNs.HasValue && q.ContinuousQueryForNs.Value > 0)
+        {
+            if (q.ContinuousQueryForNs.Value < parsedSelect.GroupByNs.Value)
+                throw new NotSupportedException("continuous query RESAMPLE FOR must be greater than or equal to GROUP BY time(...)");
+            if (q.ContinuousQueryForNs.Value < cadence)
+                throw new NotSupportedException("continuous query RESAMPLE FOR must be greater than or equal to RESAMPLE EVERY");
+        }
 
         e.CreateDatabase(q.Database!);
         e.Meta.SaveContinuousQuery(q.Database!, new ContinuousQueryInfo
@@ -600,9 +607,9 @@ public sealed class QueryExecutor
         report.EstimatedInputBytes = Math.Max(report.EstimatedInputBytes, filteredInputBytes);
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes);
 
-        if (q.GroupByNs.HasValue || q.GroupByTags.Count > 0)
+        if (q.GroupByNs.HasValue || q.GroupByTags.Count > 0 || q.GroupByAllTags)
         {
-            var groupingStateBytes = EstimateGroupingStateBytes(pts, q.GroupByTags, q.GroupByNs);
+            var groupingStateBytes = EstimateGroupingStateBytes(pts, q.GroupByTags, q.GroupByAllTags, q.GroupByNs);
             report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + groupingStateBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
 
@@ -689,6 +696,7 @@ public sealed class QueryExecutor
     {
         long? step = q.GroupByNs;
         var tagNames = q.GroupByTags;
+        var groupByAllTags = q.GroupByAllTags;
         var items = q.Select.Where(x => x.Func != "").ToList();
         if (items.Count == 0) items = [new("count", "*", "count")];
         var hasRowExpandingFunctions = items.Any(IsRowExpandingGroupFunction);
@@ -697,8 +705,7 @@ public sealed class QueryExecutor
         foreach (var p in pts)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var tagVals = tagNames.Select(tn => p.Tags.TryGetValue(tn, out var v) ? v : "").ToArray();
-            var tagKey = string.Join("|", tagVals);
+            var tagKey = BuildGroupByTagKey(p.Tags, tagNames, groupByAllTags);
             long? bucketTime = step.HasValue ? p.TimestampNs / step.Value * step.Value : null;
             var key = (tagKey, bucketTime);
             if (!groups.TryGetValue(key, out var list))
@@ -713,10 +720,7 @@ public sealed class QueryExecutor
         foreach (var (key, groupPts) in groups.OrderBy(g => g.Key.BucketTime ?? 0))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var tagVals = key.TagKey.Split('|');
-            var tagsDict = tagNames.Count > 0
-                ? tagNames.Zip(tagVals, (n, v) => (n, v)).ToDictionary(x => x.n, x => x.v)
-                : null;
+            var tagsDict = BuildGroupByTags(key.TagKey, tagNames, groupByAllTags);
             var seriesKey = key.TagKey;
             if (!seriesMap.TryGetValue(seriesKey, out var series))
             {
@@ -1101,7 +1105,7 @@ public sealed class QueryExecutor
 
     static long EstimatePointsBytes(List<Point> points) => points.Sum(EstimatePointBytes);
 
-    static long EstimateGroupingStateBytes(List<Point> points, List<string> groupByTags, long? groupByNs)
+    static long EstimateGroupingStateBytes(List<Point> points, List<string> groupByTags, bool groupByAllTags, long? groupByNs)
     {
         if (points.Count == 0)
             return 0;
@@ -1109,9 +1113,7 @@ public sealed class QueryExecutor
         var groups = new Dictionary<(string TagKey, long? BucketTime), int>();
         foreach (var point in points)
         {
-            var tagKey = groupByTags.Count == 0
-                ? string.Empty
-                : string.Join("|", groupByTags.Select(tag => point.Tags.TryGetValue(tag, out var value) ? value : ""));
+            var tagKey = BuildGroupByTagKey(point.Tags, groupByTags, groupByAllTags);
             long? bucketTime = groupByNs.HasValue ? point.TimestampNs / groupByNs.Value * groupByNs.Value : null;
             var key = (tagKey, bucketTime);
             groups.TryGetValue(key, out var count);
@@ -1322,19 +1324,33 @@ public sealed class QueryExecutor
 
     static void Delete(TsdbEngine e, string db, ParsedQuery q)
     {
+        var targetDb = q.SourceDatabase ?? db;
+        var targetRp = q.SourceRpName;
         if (q.TagFilters.Count == 0 && q.FieldFilters.Count == 0)
         {
-            e.DeleteFromMeasurement(db, q.Measurement!, q.MinTimeNs, q.MaxTimeNs);
+            if (targetRp != null)
+                e.DeleteFromMeasurement(targetDb, targetRp, q.Measurement!, q.MinTimeNs, q.MaxTimeNs);
+            else
+                e.DeleteFromMeasurement(targetDb, q.Measurement!, q.MinTimeNs, q.MaxTimeNs);
             return;
         }
 
-        e.DeleteFromMeasurement(db, q.Measurement!, q.MinTimeNs, q.MaxTimeNs, p =>
+        if (targetRp != null)
+        {
+            e.DeleteFromMeasurement(targetDb, targetRp, q.Measurement!, q.MinTimeNs, q.MaxTimeNs, p =>
+                MatchesTagFilters(p, q.TagFilters) && MatchesFieldFilters(p, q.FieldFilters));
+            return;
+        }
+
+        e.DeleteFromMeasurement(targetDb, q.Measurement!, q.MinTimeNs, q.MaxTimeNs, p =>
             MatchesTagFilters(p, q.TagFilters) && MatchesFieldFilters(p, q.FieldFilters));
     }
 
     static void DropSeries(TsdbEngine e, string db, ParsedQuery q)
     {
-        var measurements = q.Measurement != null ? new[] { q.Measurement } : e.ListMeasurements(db);
+        var measurements = q.Measurements.Count > 0
+            ? q.Measurements
+            : q.Measurement != null ? [q.Measurement] : e.ListMeasurements(db).ToList();
         foreach (var measurement in measurements)
         {
             var points = e.Meta.ListRetentionPolicies(db)
@@ -1615,7 +1631,7 @@ public sealed class QueryExecutor
         QueryExecutionReport report,
         string resultMeasurement)
     {
-        if (q.GroupByTags.Count == 0 || q.GroupByNs.HasValue)
+        if (q.GroupByTags.Count == 0 || q.GroupByNs.HasValue || q.GroupByAllTags)
             return null;
 
         var items = q.Select.Where(s => s.Func != "").ToList();
@@ -1641,10 +1657,10 @@ public sealed class QueryExecutor
         var groupedMetas = metas.GroupBy(meta =>
         {
             var tags = ParseTagsCanonical(meta.TagsCanonical);
-            return BuildGroupByTagKey(tags, q.GroupByTags);
+            return BuildGroupByTagKey(tags, q.GroupByTags, q.GroupByAllTags);
         }).ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
 
-        var groupedBufferPoints = bufferPoints.GroupBy(point => BuildGroupByTagKey(point.Tags, q.GroupByTags))
+        var groupedBufferPoints = bufferPoints.GroupBy(point => BuildGroupByTagKey(point.Tags, q.GroupByTags, q.GroupByAllTags))
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
 
         var groupKeys = groupedMetas.Keys.Concat(groupedBufferPoints.Keys).Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
@@ -1671,7 +1687,7 @@ public sealed class QueryExecutor
             result.Add(new QuerySeries
             {
                 Name = resultMeasurement,
-                Tags = BuildGroupByTags(groupKey, q.GroupByTags),
+                Tags = BuildGroupByTags(groupKey, q.GroupByTags, q.GroupByAllTags),
                 Columns = ["time", .. items.Select(i => i.Alias)],
                 Values = [row]
             });
@@ -1709,15 +1725,19 @@ public sealed class QueryExecutor
         };
     }
 
-    static string BuildGroupByTagKey(IReadOnlyDictionary<string, string> tags, List<string> groupByTags)
+    static string BuildGroupByTagKey(IReadOnlyDictionary<string, string> tags, List<string> groupByTags, bool groupByAllTags)
     {
+        if (groupByAllTags)
+            return ToCanonicalTagKey(tags);
         if (groupByTags.Count == 0)
             return string.Empty;
         return string.Join("|", groupByTags.Select(tag => tags.TryGetValue(tag, out var value) ? value : ""));
     }
 
-    static Dictionary<string, string>? BuildGroupByTags(string groupKey, List<string> groupByTags)
+    static Dictionary<string, string>? BuildGroupByTags(string groupKey, List<string> groupByTags, bool groupByAllTags)
     {
+        if (groupByAllTags)
+            return string.IsNullOrEmpty(groupKey) ? null : ParseTagsCanonical(groupKey);
         if (groupByTags.Count == 0)
             return null;
 
@@ -1730,6 +1750,11 @@ public sealed class QueryExecutor
         }
         return result;
     }
+
+    static string ToCanonicalTagKey(IReadOnlyDictionary<string, string> tags) =>
+        string.Join(",",
+            tags.OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .Select(kv => $"{kv.Key}={kv.Value}"));
 
     static Dictionary<string, string> ParseTagsCanonical(string tagsCanonical)
     {
@@ -1774,6 +1799,7 @@ public sealed class QueryExecutor
         && q.Subquery == null
         && q.GroupByNs == null
         && q.GroupByTags.Count == 0
+        && !q.GroupByAllTags
         && q.Select.All(s => string.IsNullOrEmpty(s.Func))
         && string.IsNullOrWhiteSpace(q.IntoTarget)
         && !q.Desc

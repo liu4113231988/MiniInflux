@@ -23,6 +23,7 @@ public sealed class ParsedQuery
     public required QueryKind Kind { get; init; }
     public string? Database { get; init; }
     public string? Measurement { get; init; }
+    public List<string> Measurements { get; init; } = [];
     public ParsedQuery? Subquery { get; init; }
     public string? SourceDatabase { get; init; }
     public string? SourceRpName { get; init; }
@@ -36,6 +37,7 @@ public sealed class ParsedQuery
     public bool Desc { get; init; }
     public long? GroupByNs { get; init; }
     public List<string> GroupByTags { get; init; } = [];
+    public bool GroupByAllTags { get; init; }
     public FillMode Fill { get; init; } = FillMode.None;
     public string? TagKey { get; init; }
     public List<TagFilter> TagFilters { get; init; } = [];
@@ -218,32 +220,45 @@ public static class InfluxQlParser
     static ParsedQuery ParseDelete(string q)
     {
         var rest = q["DELETE FROM ".Length..].Trim();
-        var meas = ReadToken(ref rest);
+        var target = ParseQualifiedMeasurement(ReadToken(ref rest));
         long? min = null, max = null;
         var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
         var upper = rest.ToUpperInvariant(); var wi = upper.IndexOf(" WHERE ");
         if (wi >= 0) ParseWhere(rest[(wi + 7)..], out min, out max, tagFilters, fieldFilters);
-        return new() { Kind = QueryKind.Delete, Measurement = Unq(meas),
+        return new() { Kind = QueryKind.Delete, Measurement = target.Measurement,
+            SourceDatabase = target.Database, SourceRpName = target.RetentionPolicy,
             MinTimeNs = min, MaxTimeNs = max, TagFilters = tagFilters, FieldFilters = fieldFilters };
     }
 
     static ParsedQuery ParseDropSeries(string q)
     {
         var rest = q["DROP SERIES".Length..].Trim();
-        string? meas = null;
+        var measurements = new List<string>();
         long? min = null, max = null;
         var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
 
         if (rest.StartsWith("FROM ", StringComparison.OrdinalIgnoreCase))
         {
             rest = rest["FROM ".Length..].Trim();
-            meas = Unq(ReadToken(ref rest));
+            var upperWhere = rest.ToUpperInvariant();
+            var whereIndex = upperWhere.IndexOf(" WHERE ");
+            var measurementText = whereIndex >= 0 ? rest[..whereIndex] : rest;
+            rest = whereIndex >= 0 ? rest[whereIndex..] : string.Empty;
+            measurements = SplitMeasurementList(measurementText);
         }
 
         var upper = rest.ToUpperInvariant(); var wi = upper.IndexOf(" WHERE ");
         if (wi >= 0) ParseWhere(rest[(wi + 7)..], out min, out max, tagFilters, fieldFilters);
-        return new() { Kind = QueryKind.DropSeries, Measurement = meas, MinTimeNs = min, MaxTimeNs = max,
-            TagFilters = tagFilters, FieldFilters = fieldFilters };
+        return new()
+        {
+            Kind = QueryKind.DropSeries,
+            Measurement = measurements.FirstOrDefault(),
+            Measurements = measurements,
+            MinTimeNs = min,
+            MaxTimeNs = max,
+            TagFilters = tagFilters,
+            FieldFilters = fieldFilters
+        };
     }
 
     static ParsedQuery ParseSelect(string q)
@@ -292,11 +307,11 @@ public static class InfluxQlParser
         var tu = tail.ToUpperInvariant();
         bool desc = tu.Contains(" ORDER BY TIME DESC");
         var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
-        var groupByTags = new List<string>(); var fill = FillMode.None;
+        var groupByTags = new List<string>(); var groupByAllTags = false; var fill = FillMode.None;
         int wi = tu.IndexOf(" WHERE ");
         if (wi >= 0) { var end = EndClause(tu, wi + 7); ParseWhere(tail[(wi + 7)..end], out min, out max, tagFilters, fieldFilters); }
         var gu = tu.IndexOf(" GROUP BY ");
-        if (gu >= 0) { var gs = gu + 10; var ge = EndClause(tu, gs); ParseGroupBy(tail[gs..ge].Trim(), out gb, groupByTags); }
+        if (gu >= 0) { var gs = gu + 10; var ge = EndClause(tu, gs); ParseGroupBy(tail[gs..ge].Trim(), out gb, groupByTags, out groupByAllTags); }
         var fu = tu.IndexOf(" FILL(");
         if (fu >= 0) { var fe = tu.IndexOf(')', fu); if (fe >= 0) { var fv = tail[(fu + 6)..fe].Trim().ToLowerInvariant();
             fill = fv switch { "null" => FillMode.Null, "0" => FillMode.Zero, "previous" => FillMode.Previous, "linear" => FillMode.Linear, _ => FillMode.None }; } }
@@ -311,16 +326,18 @@ public static class InfluxQlParser
         return new() { Kind = QueryKind.Select, Measurement = measurement, Subquery = subquery, SourceDatabase = sourceDb, SourceRpName = sourceRp, Select = ParseItems(fieldText),
             MinTimeNs = min, MaxTimeNs = max, Limit = limit, Desc = desc, GroupByNs = gb,
             Offset = offset, SeriesLimit = slimit, SeriesOffset = soffset,
-            GroupByTags = groupByTags, Fill = fill, TagFilters = tagFilters, FieldFilters = fieldFilters, IntoTarget = intoTarget };
+            GroupByTags = groupByTags, GroupByAllTags = groupByAllTags, Fill = fill, TagFilters = tagFilters, FieldFilters = fieldFilters, IntoTarget = intoTarget };
     }
 
-    static void ParseGroupBy(string text, out long? gbNs, List<string> tags)
+    static void ParseGroupBy(string text, out long? gbNs, List<string> tags, out bool groupByAllTags)
     {
         gbNs = null;
+        groupByAllTags = false;
         foreach (var part in text.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
         {
             var p = part.Trim(); var pu = p.ToUpperInvariant();
             if (pu.StartsWith("TIME(") && p.EndsWith(')')) gbNs = DurationToNs(p[5..^1]);
+            else if (p == "*") groupByAllTags = true;
             else tags.Add(Unq(p));
         }
     }
@@ -412,6 +429,30 @@ public static class InfluxQlParser
         }
         result.Add(s[start..]);
         return result;
+    }
+    static List<string> SplitMeasurementList(string text)
+    {
+        var parts = new List<string>();
+        int start = 0;
+        bool inDoubleQuote = false;
+        for (int i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '"')
+                inDoubleQuote = !inDoubleQuote;
+            else if (ch == ',' && !inDoubleQuote)
+            {
+                var part = text[start..i].Trim();
+                if (part.Length > 0)
+                    parts.Add(ParseQualifiedMeasurement(part).Measurement);
+                start = i + 1;
+            }
+        }
+
+        var tail = text[start..].Trim();
+        if (tail.Length > 0)
+            parts.Add(ParseQualifiedMeasurement(tail).Measurement);
+        return parts;
     }
     static string? AfterFrom(string q) { var u = q.ToUpperInvariant(); var i = u.IndexOf(" FROM "); return i < 0 ? null : Unq(ReadToken(q[(i + 6)..].Trim())); }
     static string? AfterKey(string q) { var u = q.ToUpperInvariant(); var i = u.IndexOf(" KEY "); if (i < 0) return null; var part = q[(i + 5)..].Trim(); if (part.StartsWith('=')) part = part[1..].Trim(); return Unq(ReadToken(part)); }
