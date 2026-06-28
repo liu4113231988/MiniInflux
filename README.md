@@ -508,3 +508,17 @@ dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo --no-restore
 - 在这轮本地单机 HTTP 压测里，MiniInflux 明显慢于 InfluxDB 1.7.9，尤其是简单聚合查询差距最大。
 - 写入侧 MiniInflux 已经能稳定跑到约 `3.0 万 pts/s`，说明主链路可用，但距离成熟的 InfluxDB 1.x 仍有明显性能差距。
 - 这组数据更适合当“当前基线”，不应直接外推成生产承诺；如果后续要继续优化，优先看查询执行路径、索引过滤、聚合下推和 HTTP 写入批处理开销。
+
+### 2026-06-28 P0 优化后一轮复测
+
+P0 优化内容包括：benchmark 阶段耗时、manifest 索引延迟落盘、segment metadata 缓存、简单聚合 buffer stats fast path、buffer 按 series 候选扫描、关闭压测场景访问日志开销，以及 WAL 写入不再为 tag 排序。
+
+测试口径同样是本机 HTTP、单连接顺序写入；脚本对查询做 warmup 后再计时，并对 MiniInflux 额外采集 query report。
+
+| Metric | MiniInflux | InfluxDB 1.7.9 | Ratio |
+| --- | ---: | ---: | ---: |
+| Write throughput (points/s) | 27,829.38 | 99,033.34 | InfluxDB 1.7.9 is `3.56x` |
+| Aggregate query latency (ms) | 16.16 | 3.15 | MiniInflux is `5.13x` slower |
+| Raw `LIMIT 1000` query latency (ms) | 16.00 | 8.48 | MiniInflux is `1.89x` slower |
+
+MiniInflux 聚合查询 report：`ScannedPoints=1250`、`UsedAggregatePushdown=true`、`UsedSeriesIndexPushdown=true`、`DurationMs=0`。这说明 P0 后聚合主路径已经命中索引与统计下推，剩余差距主要在 HTTP 总耗时、响应序列化和更底层 segment metadata / 存储格式演进。

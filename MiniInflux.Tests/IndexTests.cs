@@ -126,6 +126,47 @@ public class IndexTests : IDisposable
     }
 
     [Fact]
+    public async Task Indexes_ArePersistedWhenEngineDisposes()
+    {
+        using (var engine = new TsdbEngine(_testDir, flushThreshold: 1000))
+        {
+            await engine.WriteAsync("testdb", "autogen",
+            [
+                new Point
+                {
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string> { { "host", "server01" } },
+                    Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(1.0) } },
+                    TimestampNs = 1000_000_000
+                }
+            ]);
+        }
+
+        var reloaded = new Manifest(_testDir);
+        Assert.Single(reloaded.GetSeries("testdb", "cpu"));
+        Assert.Single(reloaded.GetTagValues("testdb", "cpu", "host"));
+    }
+
+    [Fact]
+    public async Task Indexes_RemainQueryableBeforeManifestFlush()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { { "host", "server01" } },
+                Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(1.0) } },
+                TimestampNs = 1000_000_000
+            }
+        ]);
+
+        Assert.Single(engine.Meta.GetSeries("testdb", "cpu"));
+        Assert.Single(engine.Meta.GetTagValues("testdb", "cpu", "host"));
+    }
+
+    [Fact]
     public async Task DropMeasurement_RemovesIndexEntries()
     {
         var points = new List<Point>

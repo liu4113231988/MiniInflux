@@ -104,27 +104,30 @@ engine.Recover();
 runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {BindAddress}, auth {AuthEnabled}, log level {LogLevel}",
     Path.GetFullPath(options.DataPath), options.Http.BindAddress, options.Auth.Enabled, options.Logging.Level);
 
-app.Use(async (context, next) =>
+if (options.Http.LogEnabled)
 {
-    var sw = System.Diagnostics.Stopwatch.StartNew();
-    try
+    app.Use(async (context, next) =>
     {
-        await next();
-    }
-    finally
-    {
-        sw.Stop();
-        var shouldLog = HttpLoggingSupport.ShouldLogRequest(options.Http, context.Request.Path, context.Response.StatusCode);
-        if (shouldLog)
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        try
         {
-            var line = HttpLoggingSupport.FormatAccessLogLine(context, sw.ElapsedMilliseconds);
-            if (accessLogWriter.Enabled)
-                accessLogWriter.Write(line);
-            else
-                runtimeLogger.LogInformation("{AccessLog}", line);
+            await next();
         }
-    }
-});
+        finally
+        {
+            sw.Stop();
+            var shouldLog = HttpLoggingSupport.ShouldLogRequest(options.Http, context.Request.Path, context.Response.StatusCode);
+            if (shouldLog)
+            {
+                var line = HttpLoggingSupport.FormatAccessLogLine(context, sw.ElapsedMilliseconds);
+                if (accessLogWriter.Enabled)
+                    accessLogWriter.Write(line);
+                else
+                    runtimeLogger.LogInformation("{AccessLog}", line);
+            }
+        }
+    });
+}
 
 app.Use(async (context, next) =>
 {
@@ -251,6 +254,7 @@ app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQu
 app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics, string? db, string? q) =>
 {
     var chunked = TryParseBool(request.Query["chunked"].ToString());
+    var debug = TryParseBool(request.Query["debug"].ToString());
     var chunkSize = ParseChunkSize(request.Query["chunk_size"].ToString());
     if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
     {
@@ -258,6 +262,7 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
         q = form["q"];
         db ??= form["db"];
         chunked = chunked || TryParseBool(form["chunked"].ToString());
+        debug = debug || TryParseBool(form["debug"].ToString());
         chunkSize ??= ParseChunkSize(form["chunk_size"].ToString());
     }
 
@@ -279,6 +284,8 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     var outcome = executor.ExecuteWithReport(tsdbEngine, db, q, request.HttpContext.RequestAborted);
     metrics.RecordQuery(outcome.Report);
     LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
+    if (debug)
+        return Results.Json(new QueryDebugResponse { Response = outcome.Response, Report = outcome.Report }, AppJsonContext.Default.QueryDebugResponse);
     return Results.Json(outcome.Response, AppJsonContext.Default.QueryResponse);
 });
 

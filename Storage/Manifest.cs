@@ -50,6 +50,7 @@ public sealed class Manifest
     private readonly string _path;
     private readonly object _lock = new();
     private ManifestData _data = new();
+    private bool _dirty;
 
     public Manifest(string dataPath)
     {
@@ -394,12 +395,13 @@ public sealed class Manifest
         lock (_lock)
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return;
+            var changed = false;
             foreach (var (meas, tagsCanon, tags) in points)
             {
                 // Series index
                 if (!dbInfo.SeriesIndex.TryGetValue(meas, out var seriesSet))
                 { seriesSet = new(StringComparer.Ordinal); dbInfo.SeriesIndex[meas] = seriesSet; }
-                seriesSet.Add(tagsCanon);
+                changed |= seriesSet.Add(tagsCanon);
 
                 // Tag inverted index
                 if (!dbInfo.TagIndex.TryGetValue(meas, out var tagMap))
@@ -410,16 +412,16 @@ public sealed class Manifest
                 {
                     if (!tagMap.TryGetValue(k, out var valSet))
                     { valSet = new(StringComparer.Ordinal); tagMap[k] = valSet; }
-                    valSet.Add(v);
+                    changed |= valSet.Add(v);
 
                     if (!tagSeriesMap.TryGetValue(k, out var valueMap))
                     { valueMap = new(StringComparer.Ordinal); tagSeriesMap[k] = valueMap; }
                     if (!valueMap.TryGetValue(v, out var tagValueSeries))
                     { tagValueSeries = new(StringComparer.Ordinal); valueMap[v] = tagValueSeries; }
-                    tagValueSeries.Add(tagsCanon);
+                    changed |= tagValueSeries.Add(tagsCanon);
                 }
             }
-            Save();
+            if (changed) _dirty = true;
         }
     }
 
@@ -654,6 +656,15 @@ public sealed class Manifest
         var json = JsonSerializer.Serialize(_data, ManifestJsonContext.Default.ManifestData);
         File.WriteAllText(tmp, json);
         File.Move(tmp, _path, overwrite: true);
+        _dirty = false;
+    }
+
+    public void SaveIfDirty()
+    {
+        lock (_lock)
+        {
+            if (_dirty) Save();
+        }
     }
 
     #endregion

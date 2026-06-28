@@ -41,6 +41,13 @@ public sealed record FloatWorkloadBenchmark(
     FloatStrategyBenchmarkResult BestByDecode,
     IReadOnlyList<FloatStrategyBenchmarkResult> Strategies);
 
+public sealed record BenchmarkPhaseTimings(
+    double WriteMs,
+    double QueryMs,
+    double FlushMs,
+    double CompactionMs,
+    double RecoveryMs);
+
 public sealed record BenchmarkRunResult(
     int PointsWritten,
     int Concurrency,
@@ -49,6 +56,7 @@ public sealed record BenchmarkRunResult(
     double RecoveryMs,
     double CompactionMs,
     long BufferedPointsAfterWrite,
+    BenchmarkPhaseTimings Phases,
     CodecComparisonBenchmark CodecComparison,
     IReadOnlyList<FloatWorkloadBenchmark> FloatStrategyBenchmarks);
 
@@ -64,6 +72,7 @@ public static class BenchmarkRunner
         var writeWatch = System.Diagnostics.Stopwatch.StartNew();
         long buffered;
         double queryLatencyMs;
+        double flushMs;
         double compactionMs;
         using (var engine = new TsdbEngine(dataPath, flushThreshold: Math.Max(1, pointCount / 4)))
         {
@@ -86,8 +95,12 @@ public static class BenchmarkRunner
             queryLatencyMs = queryWatch.Elapsed.TotalMilliseconds;
 
             buffered = engine.GetBufferedPointCount();
-            var compactionWatch = System.Diagnostics.Stopwatch.StartNew();
+            var flushWatch = System.Diagnostics.Stopwatch.StartNew();
             engine.FlushAll();
+            flushWatch.Stop();
+            flushMs = flushWatch.Elapsed.TotalMilliseconds;
+
+            var compactionWatch = System.Diagnostics.Stopwatch.StartNew();
             var compactor = new Compactor(engine.Meta, new ShardManager(engine.RootPath, engine.Meta), engine.Tombstones, engine.Schema, maxL0Segments: 2, maxL1Segments: 1);
             compactor.CompactAll();
             compactionWatch.Stop();
@@ -110,6 +123,12 @@ public static class BenchmarkRunner
             recoveryWatch.Elapsed.TotalMilliseconds,
             compactionMs,
             buffered,
+            new BenchmarkPhaseTimings(
+                writeWatch.Elapsed.TotalMilliseconds,
+                queryLatencyMs,
+                flushMs,
+                compactionMs,
+                recoveryWatch.Elapsed.TotalMilliseconds),
             codecComparison,
             floatStrategyBenchmarks);
     }
@@ -125,6 +144,11 @@ public static class BenchmarkRunner
             $"recovery_ms={result.RecoveryMs:F2}",
             $"compaction_ms={result.CompactionMs:F2}",
             $"buffered_points_after_write={result.BufferedPointsAfterWrite}",
+            $"phase_write_ms={result.Phases.WriteMs:F2}",
+            $"phase_query_ms={result.Phases.QueryMs:F2}",
+            $"phase_flush_ms={result.Phases.FlushMs:F2}",
+            $"phase_compaction_ms={result.Phases.CompactionMs:F2}",
+            $"phase_recovery_ms={result.Phases.RecoveryMs:F2}",
             $"codec_compare_point_count={result.CodecComparison.PointCount}",
             $"codec_legacy_total_bytes={result.CodecComparison.Legacy.TotalBytes}",
             $"codec_legacy_encode_ms={result.CodecComparison.Legacy.EncodeMs:F2}",
@@ -154,6 +178,11 @@ public static class BenchmarkRunner
         sb.AppendLine($"mini_influx_benchmark_recovery_ms {result.RecoveryMs:F2}");
         sb.AppendLine($"mini_influx_benchmark_compaction_ms {result.CompactionMs:F2}");
         sb.AppendLine($"mini_influx_benchmark_buffered_points_after_write {result.BufferedPointsAfterWrite}");
+        sb.AppendLine($"mini_influx_benchmark_phase_write_ms {result.Phases.WriteMs:F2}");
+        sb.AppendLine($"mini_influx_benchmark_phase_query_ms {result.Phases.QueryMs:F2}");
+        sb.AppendLine($"mini_influx_benchmark_phase_flush_ms {result.Phases.FlushMs:F2}");
+        sb.AppendLine($"mini_influx_benchmark_phase_compaction_ms {result.Phases.CompactionMs:F2}");
+        sb.AppendLine($"mini_influx_benchmark_phase_recovery_ms {result.Phases.RecoveryMs:F2}");
         sb.AppendLine($"mini_influx_benchmark_codec_compare_point_count {result.CodecComparison.PointCount}");
         sb.AppendLine($"mini_influx_benchmark_codec_legacy_total_bytes {result.CodecComparison.Legacy.TotalBytes}");
         sb.AppendLine($"mini_influx_benchmark_codec_legacy_encode_ms {result.CodecComparison.Legacy.EncodeMs:F2}");

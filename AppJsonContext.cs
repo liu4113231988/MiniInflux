@@ -3,12 +3,14 @@ using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
 
 [JsonSerializable(typeof(QueryResponse))]
+[JsonSerializable(typeof(QueryDebugResponse))]
 [JsonSerializable(typeof(QueryResult))]
 [JsonSerializable(typeof(QuerySeries))]
 [JsonSerializable(typeof(ErrorResponse))]
 [JsonSerializable(typeof(AdminMessage))]
 [JsonSerializable(typeof(BenchmarkSnapshot))]
 [JsonSerializable(typeof(BenchmarkRunResult))]
+[JsonSerializable(typeof(BenchmarkPhaseTimings))]
 [JsonSerializable(typeof(CodecComparisonBenchmark))]
 [JsonSerializable(typeof(CodecBenchmarkResult))]
 [JsonSerializable(typeof(FloatWorkloadBenchmark))]

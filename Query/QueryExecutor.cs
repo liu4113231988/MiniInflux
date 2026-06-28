@@ -11,6 +11,12 @@ public sealed class QueryResponse
     public List<QueryResult> Results { get; set; } = [];
 }
 
+public sealed class QueryDebugResponse
+{
+    public QueryResponse Response { get; set; } = new();
+    public QueryExecutionReport Report { get; set; } = new();
+}
+
 public sealed class QueryResult
 {
     public int StatementId { get; set; }
@@ -1596,22 +1602,22 @@ public sealed class QueryExecutor
             return null;
         if (q.FieldFilters.Count > 0) return null;
 
-        var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
-        report.ScannedPoints += bufferPoints.Count;
+        var bufferStats = e.ReadBufferedStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
+        report.ScannedPoints += bufferStats.MatchedPointCount;
         var metas = e.ReadSegmentMetadata(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
-        if (metas.Count == 0 && bufferPoints.Count == 0) return null;
+        if (metas.Count == 0 && bufferStats.MatchedPointCount == 0) return null;
         if (metas.Count > 0)
         {
             if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null)) return null;
             report.ScannedPoints += metas.Sum(m => m.PointCount);
         }
 
-        var row = new List<object?> { Time(MaxTime(metas, bufferPoints)) };
+        var row = new List<object?> { Time(MaxTime(metas, bufferStats)) };
         foreach (var item in items)
         {
             var relevantMetas = metas.Where(m => m.Field == item.Field).ToList();
-            if (relevantMetas.Count == 0 && !bufferPoints.Any(p => p.Fields.ContainsKey(item.Field))) return null;
-            row.Add(CalcPushdownValue(item.Func, item.Field, relevantMetas, bufferPoints));
+            if (relevantMetas.Count == 0 && !bufferStats.Fields.ContainsKey(item.Field)) return null;
+            row.Add(CalcPushdownValue(item.Func, item.Field, relevantMetas, bufferStats));
         }
 
         report.UsedAggregatePushdown = true;
@@ -1713,6 +1719,27 @@ public sealed class QueryExecutor
         return Math.Max(metaMax, bufferMax);
     }
 
+    static long MaxTime(List<SegmentColumnMeta> metas, BufferedStatsSnapshot bufferStats)
+    {
+        var metaMax = metas.Count == 0 ? 0 : metas.Max(m => m.MaxTime);
+        return Math.Max(metaMax, bufferStats.MaxTime);
+    }
+
+    static object? CalcPushdownValue(string func, string field, List<SegmentColumnMeta> metas, BufferedStatsSnapshot bufferStats)
+    {
+        bufferStats.Fields.TryGetValue(field, out var bufferFieldStats);
+        var metaStats = metas.Select(m => m.Stats!).ToList();
+        return func switch
+        {
+            "count" => metas.Sum(m => m.PointCount) + bufferFieldStats.Count,
+            "sum" => metaStats.Sum(s => s.Sum) + bufferFieldStats.Sum,
+            "min" => CombineMin(metaStats, bufferFieldStats),
+            "max" => CombineMax(metaStats, bufferFieldStats),
+            "mean" => CombineMean(metaStats, bufferFieldStats),
+            _ => null
+        };
+    }
+
     static object? CalcPushdownValue(string func, string field, List<SegmentColumnMeta> metas, List<Point> bufferPoints)
     {
         var bufferValues = bufferPoints
@@ -1794,6 +1821,27 @@ public sealed class QueryExecutor
     {
         var sum = stats.Sum(s => s.Sum) + bufferValues.Sum();
         var count = stats.Sum(s => s.Count) + bufferValues.Count;
+        return count == 0 ? null : sum / count;
+    }
+
+    static object? CombineMin(List<BlockStats> stats, BufferedFieldStats bufferStats)
+    {
+        if (stats.Count == 0 && bufferStats.Count == 0) return null;
+        var min = stats.Count == 0 ? bufferStats.Min : stats.Min(s => s.Min);
+        return bufferStats.Count == 0 ? min : Math.Min(min, bufferStats.Min);
+    }
+
+    static object? CombineMax(List<BlockStats> stats, BufferedFieldStats bufferStats)
+    {
+        if (stats.Count == 0 && bufferStats.Count == 0) return null;
+        var max = stats.Count == 0 ? bufferStats.Max : stats.Max(s => s.Max);
+        return bufferStats.Count == 0 ? max : Math.Max(max, bufferStats.Max);
+    }
+
+    static object? CombineMean(List<BlockStats> stats, BufferedFieldStats bufferStats)
+    {
+        var sum = stats.Sum(s => s.Sum) + bufferStats.Sum;
+        var count = stats.Sum(s => s.Count) + bufferStats.Count;
         return count == 0 ? null : sum / count;
     }
 

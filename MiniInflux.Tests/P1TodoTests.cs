@@ -84,6 +84,26 @@ public class P1TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task AggregateQuery_WithTagFilter_UsesBufferStatsPushdown()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", 1, "server01"),
+            Point("cpu", 2, "server01"),
+            Point("cpu", 10, "server02")
+        ]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb", "SELECT mean(value),count(value) FROM cpu WHERE host='server01'");
+
+        Assert.True(outcome.Report.UsedAggregatePushdown);
+        Assert.Equal(2, outcome.Report.ScannedPoints);
+        var row = Assert.Single(outcome.Response.Results[0].Series![0].Values);
+        Assert.Equal(1.5, row[1]);
+        Assert.Equal(2, row[2]);
+    }
+
+    [Fact]
     public async Task AggregateQuery_GroupByTag_UsesBlockStatsPushdown()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1);

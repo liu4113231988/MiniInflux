@@ -5,7 +5,7 @@ namespace MiniInflux.Net10.Storage;
 
 public sealed class TsdbEngine : IDisposable
 {
-    private sealed record BufferedPoint(Point Point, WalPosition Position);
+    private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey);
 
     private readonly string _root;
     private readonly WalManager _wal;
@@ -16,7 +16,9 @@ public sealed class TsdbEngine : IDisposable
     private readonly Compactor _compactor;
     private readonly Dictionary<string, ReaderWriterLockSlim> _locks = new(StringComparer.Ordinal);
     private readonly ReaderWriterLockSlim _globalLock = new();
+    private readonly Dictionary<string, (long Length, DateTime LastWriteUtc, List<SegmentColumnMeta> Metas)> _segmentMetadataCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, List<BufferedPoint>> _buf = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Dictionary<SeriesKey, List<BufferedPoint>>> _bufBySeries = new(StringComparer.Ordinal);
     private readonly Dictionary<string, WalPosition> _bufferReplayFloors = new(StringComparer.Ordinal);
     private readonly int _threshold;
     private readonly long _maxSeriesPerDb;
@@ -60,7 +62,7 @@ public sealed class TsdbEngine : IDisposable
             try
             {
                 _schema.ValidateAndRegister(replayPoint.Db, replayPoint.Point.Measurement, [replayPoint.Point]);
-                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position));
+                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, SeriesKey.From(replayPoint.Point)));
             }
             catch (FieldConflictException) { result.SchemaConflictsSkipped++; }
 
@@ -70,7 +72,7 @@ public sealed class TsdbEngine : IDisposable
             {
                 var key = K(replayPoint.Db, replayPoint.Rp);
                 if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
-                list.AddRange(validPoints); TrackSeriesKeys(replayPoint.Db, validPoints);
+                AddBufferedPoints(key, list, validPoints); TrackSeriesKeys(replayPoint.Db, validPoints);
                 UpdateBufferReplayFloor(key, list);
             }
             finally { lk.ExitWriteLock(); }
@@ -90,7 +92,7 @@ public sealed class TsdbEngine : IDisposable
                     result.SegmentsScanned++;
                     try
                     {
-                        var metas = SegmentReader.ReadMetadata(segFile);
+                        var metas = ReadSegmentMetadataCached(segFile);
                         var pointsForIndex = new List<(string Measurement, string TagsCanonical, Dictionary<string, string> Tags)>();
                         foreach (var m in metas)
                         {
@@ -137,10 +139,10 @@ public sealed class TsdbEngine : IDisposable
         {
             var key = K(db, rp);
             if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
-            var buffered = pts.Zip(walPositions, (point, position) => new BufferedPoint(point, position)).ToList();
-            list.AddRange(buffered); TrackSeriesKeys(db, buffered);
+            var buffered = pts.Zip(walPositions, (point, position) => new BufferedPoint(point, position, SeriesKey.From(point))).ToList();
+            AddBufferedPoints(key, list, buffered); TrackSeriesKeys(db, buffered);
             UpdateBufferReplayFloor(key, list);
-            _manifest.UpdateIndexes(db, pts.Select(p => (p.Measurement, SeriesKey.From(p).TagsCanonical, p.Tags)));
+            _manifest.UpdateIndexes(db, buffered.Select(p => (p.Point.Measurement, p.SeriesKey.TagsCanonical, p.Point.Tags)));
             if (list.Count >= _threshold) FlushLocked(db, rp, list);
         }
         finally { lk.ExitWriteLock(); }
@@ -195,10 +197,12 @@ public sealed class TsdbEngine : IDisposable
         lk.EnterReadLock();
         try
         {
-            if (_buf.TryGetValue(K(db, rp), out var l))
+            var key = K(db, rp);
+            if (_buf.TryGetValue(key, out var l))
             {
-                var bufMatched = l.Select(x => x.Point).Where(p => Match(p, meas, min, max)
-                    && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(SeriesKey.From(p).TagsCanonical)));
+                var bufMatched = BufferedCandidates(key, l, meas, allowedTagsCanonical)
+                    .Where(p => Match(p.Point, meas, min, max))
+                    .Select(p => p.Point);
                 if (requestedFields != null)
                     bufMatched = bufMatched.Select(p => new Point
                     {
@@ -220,7 +224,7 @@ public sealed class TsdbEngine : IDisposable
                 {
                     try
                     {
-                        var metas = SegmentReader.ReadMetadata(segPath);
+                        var metas = ReadSegmentMetadataCached(segPath);
                         if (meas != null && !metas.Any(m => m.Measurement == meas)) continue;
                         if (min.HasValue && !metas.Any(m => m.MaxTime >= min.Value)) continue;
                         if (max.HasValue && !metas.Any(m => m.MinTime <= max.Value)) continue;
@@ -255,10 +259,12 @@ public sealed class TsdbEngine : IDisposable
         lk.EnterReadLock();
         try
         {
-            if (_buf.TryGetValue(K(db, rp), out var l))
+            var key = K(db, rp);
+            if (_buf.TryGetValue(key, out var l))
             {
-                var bufMatched = l.Select(x => x.Point).Where(p => Match(p, meas, min, max)
-                    && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(SeriesKey.From(p).TagsCanonical)));
+                var bufMatched = BufferedCandidates(key, l, meas, allowedTagsCanonical)
+                    .Where(p => Match(p.Point, meas, min, max))
+                    .Select(p => p.Point);
                 if (requestedFields != null)
                     bufMatched = bufMatched.Select(p => new Point
                     {
@@ -286,7 +292,7 @@ public sealed class TsdbEngine : IDisposable
                 {
                     try
                     {
-                        var metas = SegmentReader.ReadMetadata(segPath);
+                        var metas = ReadSegmentMetadataCached(segPath);
                         if (meas != null && !metas.Any(m => m.Measurement == meas)) continue;
                         if (min.HasValue && !metas.Any(m => m.MaxTime >= min.Value)) continue;
                         if (max.HasValue && !metas.Any(m => m.MinTime <= max.Value)) continue;
@@ -377,10 +383,12 @@ public sealed class TsdbEngine : IDisposable
         lk.EnterReadLock();
         try
         {
-            if (_buf.TryGetValue(K(db, rp), out var list))
+            var key = K(db, rp);
+            if (_buf.TryGetValue(key, out var list))
             {
-                var matched = list.Select(x => x.Point).Where(p => Match(p, meas, min, max)
-                    && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(SeriesKey.From(p).TagsCanonical)));
+                var matched = BufferedCandidates(key, list, meas, allowedTagsCanonical)
+                    .Where(p => Match(p.Point, meas, min, max))
+                    .Select(p => p.Point);
                 if (requestedFields != null)
                 {
                     matched = matched.Select(p => new Point
@@ -398,6 +406,45 @@ public sealed class TsdbEngine : IDisposable
         return res;
     }
 
+    public BufferedStatsSnapshot ReadBufferedStats(string db, string rp, string? meas, long? min, long? max,
+        HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null)
+    {
+        var fields = new Dictionary<string, BufferedFieldStats>(StringComparer.Ordinal);
+        var matchedPoints = 0;
+        long maxTime = 0;
+        var lk = GetLock(K(db, rp));
+        lk.EnterReadLock();
+        try
+        {
+            var key = K(db, rp);
+            if (!_buf.TryGetValue(key, out var list))
+                return new BufferedStatsSnapshot(0, 0, fields);
+
+            foreach (var buffered in BufferedCandidates(key, list, meas, allowedTagsCanonical))
+            {
+                var point = buffered.Point;
+                if (!Match(point, meas, min, max))
+                    continue;
+
+                matchedPoints++;
+                maxTime = Math.Max(maxTime, point.TimestampNs);
+                foreach (var (field, value) in point.Fields)
+                {
+                    if (requestedFields != null && !requestedFields.Contains(field))
+                        continue;
+                    var number = value.AsDouble();
+                    if (!number.HasValue)
+                        continue;
+                    fields[field] = fields.TryGetValue(field, out var stats)
+                        ? stats.Add(number.Value)
+                        : BufferedFieldStats.Single(number.Value);
+                }
+            }
+        }
+        finally { lk.ExitReadLock(); }
+        return new BufferedStatsSnapshot(matchedPoints, maxTime, fields);
+    }
+
     public List<SegmentColumnMeta> ReadSegmentMetadata(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, CancellationToken cancellationToken = default)
     {
@@ -407,7 +454,7 @@ public sealed class TsdbEngine : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                result.AddRange(SegmentReader.ReadMetadata(segPath)
+                result.AddRange(ReadSegmentMetadataCached(segPath)
                     .Where(m => (meas == null || m.Measurement == meas)
                         && (!min.HasValue || m.MaxTime >= min.Value)
                         && (!max.HasValue || m.MinTime <= max.Value)
@@ -429,7 +476,7 @@ public sealed class TsdbEngine : IDisposable
         if (Directory.Exists(dbDir)) try { Directory.Delete(dbDir, true); } catch { }
         _manifest.DropDatabase(db); _tombstones.DropDatabase(db);
         _globalLock.EnterWriteLock();
-        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { _buf.Remove(k); _locks.Remove(k); _bufferReplayFloors.Remove(k); } _seriesKeys.Remove(db); }
+        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { _buf.Remove(k); _bufBySeries.Remove(k); _locks.Remove(k); _bufferReplayFloors.Remove(k); } _seriesKeys.Remove(db); }
         finally { _globalLock.ExitWriteLock(); }
     }
 
@@ -447,6 +494,7 @@ public sealed class TsdbEngine : IDisposable
                 if (_buf.TryGetValue(key, out var list))
                 {
                     list.RemoveAll(p => p.Point.Measurement == measurement);
+                    RebuildBufferSeriesIndex(key, list);
                     UpdateBufferReplayFloor(key, list);
                 }
             }
@@ -523,7 +571,8 @@ public sealed class TsdbEngine : IDisposable
             {
                 if (_buf.TryGetValue(key, out var list))
                 {
-                    list.RemoveAll(p => p.Point.Measurement == measurement && tagSet.Contains(SeriesKey.From(p.Point).TagsCanonical));
+                    list.RemoveAll(p => p.Point.Measurement == measurement && tagSet.Contains(p.SeriesKey.TagsCanonical));
+                    RebuildBufferSeriesIndex(key, list);
                     UpdateBufferReplayFloor(key, list);
                 }
             }
@@ -550,17 +599,19 @@ public sealed class TsdbEngine : IDisposable
 
     private void DeleteBuffered(string db, string rp, string measurement, long? minTime, long? maxTime, Predicate<Point> predicate)
     {
-        var lk = GetLock(K(db, rp));
+        var key = K(db, rp);
+        var lk = GetLock(key);
         lk.EnterWriteLock();
         try
         {
-            if (_buf.TryGetValue(K(db, rp), out var list))
+            if (_buf.TryGetValue(key, out var list))
             {
                 list.RemoveAll(p => p.Point.Measurement == measurement
                     && (!minTime.HasValue || p.Point.TimestampNs >= minTime.Value)
                     && (!maxTime.HasValue || p.Point.TimestampNs <= maxTime.Value)
                     && predicate(p.Point));
-                UpdateBufferReplayFloor(K(db, rp), list);
+                RebuildBufferSeriesIndex(key, list);
+                UpdateBufferReplayFloor(key, list);
             }
         }
         finally { lk.ExitWriteLock(); }
@@ -581,6 +632,30 @@ public sealed class TsdbEngine : IDisposable
 
     private static Dictionary<string, string> ParseTags(string s)
     { var d = new Dictionary<string, string>(StringComparer.Ordinal); if (string.IsNullOrEmpty(s)) return d; foreach (var p in s.Split(',')) { var i = p.IndexOf('='); if (i > 0) d[p[..i]] = p[(i + 1)..]; } return d; }
+
+    private List<SegmentColumnMeta> ReadSegmentMetadataCached(string path)
+    {
+        var info = new FileInfo(path);
+        var key = info.FullName;
+        var lastWriteUtc = info.LastWriteTimeUtc;
+        var length = info.Length;
+
+        _globalLock.EnterUpgradeableReadLock();
+        try
+        {
+            if (_segmentMetadataCache.TryGetValue(key, out var cached)
+                && cached.Length == length
+                && cached.LastWriteUtc == lastWriteUtc)
+                return cached.Metas.ToList();
+
+            var metas = SegmentReader.ReadMetadata(path);
+            _globalLock.EnterWriteLock();
+            try { _segmentMetadataCache[key] = (length, lastWriteUtc, metas); }
+            finally { _globalLock.ExitWriteLock(); }
+            return metas.ToList();
+        }
+        finally { _globalLock.ExitUpgradeableReadLock(); }
+    }
 
     private static bool Match(Point p, string? m, long? min, long? max) => (m == null || p.Measurement == m) && (!min.HasValue || p.TimestampNs >= min) && (!max.HasValue || p.TimestampNs <= max);
 
@@ -640,6 +715,7 @@ public sealed class TsdbEngine : IDisposable
         }
         l.Clear();
         var key = K(db, rp);
+        _bufBySeries.Remove(key);
         UpdateBufferReplayFloor(key, l);
         UpdateWalCheckpoint();
     }
@@ -707,13 +783,68 @@ public sealed class TsdbEngine : IDisposable
 
     private static long EstimateStringBytes(string? value) => string.IsNullOrEmpty(value) ? 0 : 24 + value.Length * 2L;
 
+    private void AddBufferedPoints(string key, List<BufferedPoint> list, List<BufferedPoint> points)
+    {
+        list.AddRange(points);
+        if (!_bufBySeries.TryGetValue(key, out var bySeries))
+        {
+            bySeries = new();
+            _bufBySeries[key] = bySeries;
+        }
+
+        foreach (var point in points)
+        {
+            if (!bySeries.TryGetValue(point.SeriesKey, out var seriesPoints))
+            {
+                seriesPoints = [];
+                bySeries[point.SeriesKey] = seriesPoints;
+            }
+            seriesPoints.Add(point);
+        }
+    }
+
+    private IEnumerable<BufferedPoint> BufferedCandidates(string key, List<BufferedPoint> list, string? measurement, HashSet<string>? allowedTagsCanonical)
+    {
+        if (measurement == null || allowedTagsCanonical == null || allowedTagsCanonical.Count == 0)
+            return list;
+        if (!_bufBySeries.TryGetValue(key, out var bySeries))
+            return list;
+
+        var candidates = new List<BufferedPoint>();
+        foreach (var tags in allowedTagsCanonical)
+            if (bySeries.TryGetValue(new SeriesKey(measurement, tags), out var points))
+                candidates.AddRange(points);
+        return candidates;
+    }
+
+    private void RebuildBufferSeriesIndex(string key, List<BufferedPoint> list)
+    {
+        if (list.Count == 0)
+        {
+            _bufBySeries.Remove(key);
+            return;
+        }
+
+        var bySeries = new Dictionary<SeriesKey, List<BufferedPoint>>();
+        foreach (var point in list)
+        {
+            if (!bySeries.TryGetValue(point.SeriesKey, out var points))
+            {
+                points = [];
+                bySeries[point.SeriesKey] = points;
+            }
+            points.Add(point);
+        }
+        _bufBySeries[key] = bySeries;
+    }
+
     private void TrackSeriesKeys(string db, List<BufferedPoint> pts)
     {
         _globalLock.EnterWriteLock();
         try
         {
             if (!_seriesKeys.TryGetValue(db, out var keys)) { keys = new(StringComparer.Ordinal); _seriesKeys[db] = keys; }
-            foreach (var p in pts) keys.Add(SeriesKey.From(p.Point).ToString());
+            foreach (var p in pts) keys.Add(p.SeriesKey.ToString());
         }
         finally { _globalLock.ExitWriteLock(); }
     }
@@ -769,7 +900,7 @@ public sealed class TsdbEngine : IDisposable
 
     public void Dispose()
     {
-        _rpExpiryTimer?.Dispose(); _compactionTimer?.Dispose(); _flushTimer?.Dispose(); FlushAll(); _wal.Dispose(); _globalLock.Dispose();
+        _rpExpiryTimer?.Dispose(); _compactionTimer?.Dispose(); _flushTimer?.Dispose(); FlushAll(); _manifest.SaveIfDirty(); _wal.Dispose(); _globalLock.Dispose();
         foreach (var lk in _locks.Values) lk.Dispose();
     }
 
@@ -815,4 +946,12 @@ public sealed class CardinalityLimitExceededException : Exception
 public sealed class MemoryLimitExceededException : Exception
 {
     public MemoryLimitExceededException(string message) : base(message) { }
+}
+
+public readonly record struct BufferedStatsSnapshot(int MatchedPointCount, long MaxTime, IReadOnlyDictionary<string, BufferedFieldStats> Fields);
+
+public readonly record struct BufferedFieldStats(int Count, double Sum, double Min, double Max)
+{
+    public static BufferedFieldStats Single(double value) => new(1, value, value, value);
+    public BufferedFieldStats Add(double value) => new(Count + 1, Sum + value, Math.Min(Min, value), Math.Max(Max, value));
 }

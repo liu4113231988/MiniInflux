@@ -128,7 +128,7 @@ public sealed class WalManager : IDisposable
     private static string FormatRecord(string db, string rp, Point p)
     {
         var fields = string.Join(",", p.Fields.Select(f => $"{f.Key}={FormatFieldValue(f.Value)}"));
-        var tags = p.Tags.Count > 0 ? "," + string.Join(",", p.Tags.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value}")) : "";
+        var tags = p.Tags.Count > 0 ? "," + string.Join(",", p.Tags.Select(kv => $"{kv.Key}={kv.Value}")) : "";
         return $"{db}\t{rp}\t{p.Measurement}{tags} {fields} {p.TimestampNs}\n";
     }
 
