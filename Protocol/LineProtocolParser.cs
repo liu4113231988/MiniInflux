@@ -13,7 +13,19 @@ public static class LineProtocolParser
     public static List<Point> ParseMany(string text, TimestampPrecision precision)
     {
         var res = new List<Point>();
-        foreach (var raw in text.Split('\n')) { var line = raw.TrimEnd('\r'); if (string.IsNullOrWhiteSpace(line) || line.StartsWith('#')) continue; res.Add(ParseOne(line, precision)); }
+        var start = 0;
+        while (start < text.Length)
+        {
+            var end = text.IndexOf('\n', start);
+            if (end < 0)
+                end = text.Length;
+
+            var line = text[start..end].TrimEnd('\r');
+            if (!string.IsNullOrWhiteSpace(line) && !line.StartsWith('#'))
+                res.Add(ParseOne(line, precision));
+
+            start = end + 1;
+        }
         return res;
     }
     public static Point ParseOne(string line, TimestampPrecision precision)

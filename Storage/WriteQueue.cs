@@ -79,16 +79,37 @@ public sealed class WriteQueue : IDisposable
 
     private async Task ProcessBatch(List<WriteRequest> batch)
     {
+        var grouped = new Dictionary<(string Db, string Rp), List<WriteRequest>>();
         foreach (var req in batch)
         {
+            var key = (req.Db, req.Rp);
+            if (!grouped.TryGetValue(key, out var requests))
+            {
+                requests = [];
+                grouped[key] = requests;
+            }
+
+            requests.Add(req);
+        }
+
+        foreach (var entry in grouped)
+        {
+            var requests = entry.Value;
             try
             {
-                await _engine.WriteInternalAsync(req.Db, req.Rp, req.Points);
-                req.Completion.TrySetResult(true);
+                var pointCount = requests.Sum(x => x.Points.Count);
+                var mergedPoints = new List<Point>(pointCount);
+                foreach (var req in requests)
+                    mergedPoints.AddRange(req.Points);
+
+                await _engine.WriteInternalAsync(entry.Key.Db, entry.Key.Rp, mergedPoints);
+                foreach (var req in requests)
+                    req.Completion.TrySetResult(true);
             }
             catch (Exception ex)
             {
-                req.Completion.TrySetException(ex);
+                foreach (var req in requests)
+                    req.Completion.TrySetException(ex);
             }
         }
     }

@@ -1599,9 +1599,12 @@ public sealed class QueryExecutor
         var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
         report.ScannedPoints += bufferPoints.Count;
         var metas = e.ReadSegmentMetadata(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
-        if (metas.Count == 0) return null;
-        if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null)) return null;
-        report.ScannedPoints += metas.Sum(m => m.PointCount);
+        if (metas.Count == 0 && bufferPoints.Count == 0) return null;
+        if (metas.Count > 0)
+        {
+            if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null)) return null;
+            report.ScannedPoints += metas.Sum(m => m.PointCount);
+        }
 
         var row = new List<object?> { Time(MaxTime(metas, bufferPoints)) };
         foreach (var item in items)
@@ -1648,11 +1651,14 @@ public sealed class QueryExecutor
         report.ScannedPoints += bufferPoints.Count;
 
         var metas = e.ReadSegmentMetadata(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
-        if (metas.Count == 0)
+        if (metas.Count == 0 && bufferPoints.Count == 0)
             return null;
-        if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null))
-            return null;
-        report.ScannedPoints += metas.Sum(m => m.PointCount);
+        if (metas.Count > 0)
+        {
+            if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null))
+                return null;
+            report.ScannedPoints += metas.Sum(m => m.PointCount);
+        }
 
         var groupedMetas = metas.GroupBy(meta =>
         {

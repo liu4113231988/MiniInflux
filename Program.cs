@@ -195,6 +195,8 @@ app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
 app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQueue writeQueue, MetricsCollector metrics, string db, string? rp, string? precision) =>
 {
     if (string.IsNullOrWhiteSpace(db)) return Results.BadRequest(new ErrorResponse("missing required parameter db"));
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
     if (request.ContentLength > options.Write.MaxRequestBodyBytes)
         return Results.StatusCode(413);
 
@@ -211,9 +213,6 @@ app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQu
     try
     {
         var points = LineProtocolParser.ParseMany(body, TimestampPrecision.Parse(precision));
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
-        return authResult;
-
         try
         {
             await writeQueue.EnqueueAsync(db, rp ?? "autogen", points, request.HttpContext.RequestAborted);

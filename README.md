@@ -1,5 +1,61 @@
 # MiniInflux.Net10
 
+[English](#english) | [中文](#中文说明)
+
+## English
+
+MiniInflux.Net10 is a small single-node time-series database built with .NET 10 and ASP.NET Core Minimal API. It implements a practical subset of InfluxDB 1.x: Line Protocol writes, InfluxQL subset queries, WAL + segment storage, continuous queries, a small admin UI, and an offline management CLI.
+
+### Highlights
+
+- HTTP endpoints: `GET /ping`, `GET /health`, `GET /debug/stats`, `GET /debug/benchmark`, `GET /metrics`, `POST /write`, `GET|POST /query`
+- InfluxQL subset: `CREATE DATABASE`, `SHOW ...`, `SELECT`, `GROUP BY time(...)`, `fill(...)`, `SELECT ... INTO ...`, `DELETE`, `DROP SERIES`, `CREATE|SHOW|DROP CONTINUOUS QUERY`
+- Storage path: write queue, WAL recovery, segment compaction, schema registry, manifest/index metadata
+- Operations: admin UI at `/admin`, CLI commands for `benchmark`, `inspect`, `validate`, `repair`, `compact`, `backup`, `restore`
+- AOT-friendly: `PublishAot`, trimmed publish, source-generated JSON metadata
+
+### Quick Start
+
+```bash
+dotnet run -c Release --project MiniInflux.Net10.csproj
+```
+
+Default HTTP listen address is `http://0.0.0.0:8086`.
+
+The checked-in [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) currently enables authentication with a sample local password. Change `Auth__Password` or `Auth.Password` before exposing the service anywhere outside local development.
+
+Write a point:
+
+```bash
+curl -i -XPOST "http://localhost:8086/write?db=metrics&precision=ns" \
+  -u admin:replace-with-a-strong-password \
+  --data-binary "cpu,host=s1,region=cn value=0.64,temp=42i,ok=true 1710000000000000000"
+```
+
+Run a query:
+
+```bash
+curl -G http://localhost:8086/query \
+  -u admin:replace-with-a-strong-password \
+  --data-urlencode "db=metrics" \
+  --data-urlencode "q=SELECT mean(value),max(temp) FROM cpu GROUP BY time(1m)"
+```
+
+### Configuration Notes
+
+- `Data.Dir` controls the data directory and is preferred over legacy `MiniInflux:DataPath`
+- `Http.BindAddress` is converted into ASP.NET Core `Urls`
+- `Auth.Enabled` is the main auth switch; `Http.AuthEnabled` only exists for backward compatibility
+- `ContinuousQuery.*` controls the CQ scheduler and catch-up behavior
+- `Write.*`, `Wal.*`, and `Storage.*` provide request, durability, and query guardrails
+- `Tls.Enabled` adds an HTTPS listener on `Tls.Port` when a certificate path is configured
+
+### Current Scope
+
+MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node workloads. It is not a full replacement for InfluxDB 1.x: advanced compatibility edges, long-running soak validation, and broader production features are still intentionally out of scope.
+
+## 中文说明
+
 一个使用 .NET 10 / ASP.NET Core Minimal API 实现的 InfluxDB 1.x 兼容子集时序数据库。
 
 ## 功能
@@ -57,6 +113,8 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 
 默认监听 `http://0.0.0.0:8086`。当前配置同时兼容旧版 `MiniInflux:DataPath`，也支持更接近 InfluxDB 1.x 风格的 `Data`、`Http`、`Logging` 段。
 
+仓库内提交的 [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) 当前默认开启了认证，并带有仅供本地开发使用的示例密码。对外暴露服务前，请先改掉 `Auth__Password` 或 `Auth.Password`。
+
 ## 近期补齐
 
 - `GROUP BY` 查询已补齐到当前项目范围内的可用状态：`time`、`tag`、`time+tag`、`fill`、`SLIMIT/SOFFSET`、`top/bottom/sample` 组合都已支持。
@@ -71,6 +129,10 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 
 ```json
 {
+  "MiniInflux": {
+    "DataPath": "./data",
+    "FlushThreshold": 50000
+  },
   "Data": {
     "Dir": "./data",
     "QueryLogEnabled": true
@@ -86,9 +148,9 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
     "WriteTracing": false
   },
   "Auth": {
-    "Enabled": false,
+    "Enabled": true,
     "Username": "admin",
-    "Password": "change-this-password",
+    "Password": "replace-with-a-strong-password",
     "AuditFailures": true,
     "MaxFailedAttempts": 5,
     "FailureWindowMs": 60000,
@@ -106,9 +168,42 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
     "MaxCatchUpRunsPerCycle": 8,
     "RecomputeRecentBuckets": 0,
     "InitialBackfillDuration": "0s"
-  }
+  },
+  "Wal": {
+    "Fsync": true,
+    "FsyncIntervalMs": 1000,
+    "MaxWalFileBytes": 16777216
+  },
+  "Write": {
+    "QueueCapacity": 100000,
+    "BatchSize": 10000,
+    "MaxRequestBodyBytes": 26214400
+  },
+  "Storage": {
+    "RpCheckIntervalMs": 60000,
+    "MaxSeriesPerDatabase": 10000000,
+    "MaxFieldsPerMeasurement": 1024,
+    "MaxResponseRows": 100000,
+    "MaxQueryPoints": 1000000,
+    "MaxQueryDurationMs": 0,
+    "MaxBufferPoints": 1000000,
+    "MaxBufferBytes": 0,
+    "MaxQueryMemoryBytes": 0
+  },
+  "Tls": {
+    "Enabled": false,
+    "Port": 8087,
+    "CertPath": "",
+    "Password": ""
+  },
+  "Urls": "http://0.0.0.0:8086"
 }
 ```
+
+说明：
+
+- 这里的密码占位符使用的是文档推荐值；仓库里真实的 [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) 可能为了本地测试保留了不同的示例密码
+- `Http.AuthEnabled` 仍然保留在示例中，是为了说明旧配置兼容路径；实际优先读取的是 `Auth.Enabled`
 
 设计参考了 InfluxDB 官方配置/日志项思路，但当前只实现了与 MiniInflux 现阶段能力匹配的子集：
 
@@ -382,3 +477,34 @@ dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo --no-restore
 ## 说明
 
 这是一个完整可运行的工程包，但仍是 InfluxDB 1.x 的兼容子集，不是完整替代品。生产增强建议包括：更完整 InfluxQL、LSM compaction、倒排索引持久化、Retention Policy、权限认证、多节点副本等。
+
+## 2026-06-28 压测对比
+
+本节记录一轮在同一台 Windows 开发机上，对 MiniInflux 与本地 `InfluxDB 1.7.9` 的 HTTP 接口做的对比压测。复现脚本见 [`scripts/compare-with-influxdb.ps1`](/D:/workingfold/MiniInflux/scripts/compare-with-influxdb.ps1)。
+
+测试口径：
+
+- MiniInflux 使用 `dotnet run -c Release --no-restore` 本地启动，关闭认证，监听 `127.0.0.1:18086`
+- InfluxDB 使用本地路径 `D:\workingfold\Influxdb\influxdb-1.7.9\influxd.exe` 启动，监听 `127.0.0.1:18087`
+- 两边都使用独立数据目录，避免历史数据干扰
+- 每轮写入 `20,000` 条 Line Protocol 点，`batch size = 2,000`，单连接顺序压测
+- 查询 1：`SELECT mean(value),count(value) FROM cpu WHERE host='server00' AND region='cn'`
+- 查询 2：`SELECT * FROM cpu WHERE host='server00' AND region='cn' ORDER BY time DESC LIMIT 1000`
+- 共跑了两轮，以下表格展示两轮平均值
+
+| Metric | MiniInflux | InfluxDB 1.7.9 | Ratio |
+| --- | ---: | ---: | ---: |
+| Write throughput (points/s) | 30,007.44 | 139,590.99 | InfluxDB 1.7.9 is `4.65x` |
+| Aggregate query latency (ms) | 175.62 | 1.92 | MiniInflux is `91.70x` slower |
+| Raw `LIMIT 1000` query latency (ms) | 47.47 | 7.38 | MiniInflux is `6.44x` slower |
+
+两轮原始结果：
+
+- Round 1: MiniInflux `23,541.00 pts/s`, aggregate `198.89 ms`, raw `54.92 ms`; InfluxDB 1.7.9 `138,987.24 pts/s`, aggregate `2.05 ms`, raw `7.58 ms`
+- Round 2: MiniInflux `36,473.89 pts/s`, aggregate `152.34 ms`, raw `40.02 ms`; InfluxDB 1.7.9 `140,194.74 pts/s`, aggregate `1.78 ms`, raw `7.17 ms`
+
+结论：
+
+- 在这轮本地单机 HTTP 压测里，MiniInflux 明显慢于 InfluxDB 1.7.9，尤其是简单聚合查询差距最大。
+- 写入侧 MiniInflux 已经能稳定跑到约 `3.0 万 pts/s`，说明主链路可用，但距离成熟的 InfluxDB 1.x 仍有明显性能差距。
+- 这组数据更适合当“当前基线”，不应直接外推成生产承诺；如果后续要继续优化，优先看查询执行路径、索引过滤、聚合下推和 HTTP 写入批处理开销。

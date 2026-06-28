@@ -63,6 +63,27 @@ public class P1TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task AggregateQuery_UsesBufferOnlyPushdown()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", 1, "server01"),
+            Point("cpu", 2, "server01"),
+            Point("cpu", 3, "server01")
+        ]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb", "SELECT sum(value),count(value),max(value),mean(value) FROM cpu");
+
+        Assert.True(outcome.Report.UsedAggregatePushdown);
+        var row = Assert.Single(outcome.Response.Results[0].Series![0].Values);
+        Assert.Equal(6.0, row[1]);
+        Assert.Equal(3, row[2]);
+        Assert.Equal(3.0, row[3]);
+        Assert.Equal(2.0, row[4]);
+    }
+
+    [Fact]
     public async Task AggregateQuery_GroupByTag_UsesBlockStatsPushdown()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1);
@@ -99,6 +120,29 @@ public class P1TodoTests : IDisposable
         Assert.Equal(2, row02[2]);
         Assert.Equal(20.0, row02[3]);
         Assert.Equal(15.0, row02[4]);
+    }
+
+    [Fact]
+    public async Task AggregateQuery_GroupByTag_UsesBufferOnlyPushdown()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", 1, "server01"),
+            Point("cpu", 2, "server01"),
+            Point("cpu", 10, "server02"),
+            Point("cpu", 20, "server02")
+        ]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(
+            engine,
+            "testdb",
+            "SELECT sum(value),count(value),max(value),mean(value) FROM cpu GROUP BY host");
+
+        Assert.True(outcome.Report.UsedAggregatePushdown);
+        var series = outcome.Response.Results[0].Series;
+        Assert.NotNull(series);
+        Assert.Equal(2, series.Count);
     }
 
     [Fact]
