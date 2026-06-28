@@ -34,25 +34,40 @@ public sealed class SchemaRegistry
     /// </summary>
     public void ValidateAndRegister(string db, string measurement, IEnumerable<Point> points)
     {
+        var batchFields = new Dictionary<string, FieldKind>(StringComparer.Ordinal);
+        foreach (var p in points)
+        {
+            foreach (var field in p.Fields)
+            {
+                if (batchFields.TryGetValue(field.Key, out var batchKind))
+                {
+                    if (batchKind != field.Value.Kind)
+                        throw new FieldConflictException(
+                            $"field type conflict: {measurement}.{field.Key} is {batchKind}, got {field.Value.Kind}");
+                }
+                else
+                {
+                    batchFields[field.Key] = field.Value.Kind;
+                }
+            }
+        }
+
         lock (_lock)
         {
             var changed = false;
-            foreach (var p in points)
+            foreach (var field in batchFields)
             {
-                foreach (var field in p.Fields)
+                var key = MakeKey(db, measurement, field.Key);
+                if (_schema.TryGetValue(key, out var existing))
                 {
-                    var key = MakeKey(db, measurement, field.Key);
-                    if (_schema.TryGetValue(key, out var existing))
-                    {
-                        if (existing != field.Value.Kind)
-                            throw new FieldConflictException(
-                                $"field type conflict: {measurement}.{field.Key} is {existing}, got {field.Value.Kind}");
-                    }
-                    else
-                    {
-                        _schema[key] = field.Value.Kind;
-                        changed = true;
-                    }
+                    if (existing != field.Value)
+                        throw new FieldConflictException(
+                            $"field type conflict: {measurement}.{field.Key} is {existing}, got {field.Value}");
+                }
+                else
+                {
+                    _schema[key] = field.Value;
+                    changed = true;
                 }
             }
 

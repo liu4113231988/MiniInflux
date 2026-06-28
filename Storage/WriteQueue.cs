@@ -97,10 +97,18 @@ public sealed class WriteQueue : IDisposable
             var requests = entry.Value;
             try
             {
-                var pointCount = requests.Sum(x => x.Points.Count);
-                var mergedPoints = new List<Point>(pointCount);
-                foreach (var req in requests)
-                    mergedPoints.AddRange(req.Points);
+                List<Point> mergedPoints;
+                if (requests.Count == 1)
+                {
+                    mergedPoints = requests[0].Points;
+                }
+                else
+                {
+                    var pointCount = requests.Sum(x => x.Points.Count);
+                    mergedPoints = new List<Point>(pointCount);
+                    foreach (var req in requests)
+                        mergedPoints.AddRange(req.Points);
+                }
 
                 await _engine.WriteInternalAsync(entry.Key.Db, entry.Key.Rp, mergedPoints);
                 foreach (var req in requests)

@@ -517,8 +517,18 @@ P0 优化内容包括：benchmark 阶段耗时、manifest 索引延迟落盘、s
 
 | Metric | MiniInflux | InfluxDB 1.7.9 | Ratio |
 | --- | ---: | ---: | ---: |
-| Write throughput (points/s) | 27,829.38 | 99,033.34 | InfluxDB 1.7.9 is `3.56x` |
-| Aggregate query latency (ms) | 16.16 | 3.15 | MiniInflux is `5.13x` slower |
-| Raw `LIMIT 1000` query latency (ms) | 16.00 | 8.48 | MiniInflux is `1.89x` slower |
+| Write throughput (points/s) | 32,502.22 | 77,447.22 | InfluxDB 1.7.9 is `2.38x` |
+| Aggregate query latency (ms) | 14.18 | 2.25 | MiniInflux is `6.30x` slower |
+| Raw `LIMIT 1000` query latency (ms) | 15.64 | 8.65 | MiniInflux is `1.81x` slower |
 
 MiniInflux 聚合查询 report：`ScannedPoints=1250`、`UsedAggregatePushdown=true`、`UsedSeriesIndexPushdown=true`、`DurationMs=0`。这说明 P0 后聚合主路径已经命中索引与统计下推，剩余差距主要在 HTTP 总耗时、响应序列化和更底层 segment metadata / 存储格式演进。
+
+### 2026-06-28 写入专项复测
+
+压测脚本会在 MiniInflux 启动时把 `MiniInflux:FlushThreshold` 设置为 `max(points * 2, 50000)`，避免默认 50,000 点同步 flush 把 segment 落盘耗时计入纯写入吞吐。
+
+| Metric | MiniInflux | InfluxDB 1.7.9 | Ratio |
+| --- | ---: | ---: | ---: |
+| 100,000 points write throughput (points/s) | 50,366.88 | 90,251.71 | InfluxDB 1.7.9 is `1.79x` |
+| 100,000 points aggregate query latency (ms) | 6.11 | 4.34 | MiniInflux is `1.41x` slower |
+| 100,000 points raw `LIMIT 1000` query latency (ms) | 44.10 | 8.04 | MiniInflux is `5.49x` slower |

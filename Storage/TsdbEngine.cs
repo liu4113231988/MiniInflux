@@ -5,7 +5,14 @@ namespace MiniInflux.Net10.Storage;
 
 public sealed class TsdbEngine : IDisposable
 {
-    private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey);
+    private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey, string SeriesKeyText);
+    private sealed class PendingPoint(Point point, SeriesKey seriesKey)
+    {
+        public Point Point = point;
+        public readonly SeriesKey SeriesKey = seriesKey;
+        public readonly string SeriesKeyText = seriesKey.ToString();
+        public bool Cloned;
+    }
 
     private readonly string _root;
     private readonly WalManager _wal;
@@ -62,7 +69,8 @@ public sealed class TsdbEngine : IDisposable
             try
             {
                 _schema.ValidateAndRegister(replayPoint.Db, replayPoint.Point.Measurement, [replayPoint.Point]);
-                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, SeriesKey.From(replayPoint.Point)));
+                var seriesKey = SeriesKey.From(replayPoint.Point);
+                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey, seriesKey.ToString()));
             }
             catch (FieldConflictException) { result.SchemaConflictsSkipped++; }
 
@@ -128,10 +136,12 @@ public sealed class TsdbEngine : IDisposable
     public Task WriteInternalAsync(string db, string rp, List<Point> pts)
     {
         CreateDatabase(db); _manifest.EnsureRp(db, rp);
-        pts = DeduplicatePoints(pts);
-        CheckCardinality(db, pts);
+        var pending = DeduplicateWritePoints(pts);
+        pts = new List<Point>(pending.Count);
+        foreach (var p in pending) pts.Add(p.Point);
+        CheckCardinality(db, pending);
         CheckBufferLimit(pts);
-        foreach (var group in pts.GroupBy(p => p.Measurement)) _schema.ValidateAndRegister(db, group.Key, group);
+        ValidateSchema(db, pts);
         var walPositions = _wal.Append(db, rp, pts);
         var lk = GetLock(K(db, rp));
         lk.EnterWriteLock();
@@ -139,7 +149,9 @@ public sealed class TsdbEngine : IDisposable
         {
             var key = K(db, rp);
             if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
-            var buffered = pts.Zip(walPositions, (point, position) => new BufferedPoint(point, position, SeriesKey.From(point))).ToList();
+            var buffered = new List<BufferedPoint>(pending.Count);
+            for (var i = 0; i < pending.Count; i++)
+                buffered.Add(new BufferedPoint(pending[i].Point, walPositions[i], pending[i].SeriesKey, pending[i].SeriesKeyText));
             AddBufferedPoints(key, list, buffered); TrackSeriesKeys(db, buffered);
             UpdateBufferReplayFloor(key, list);
             _manifest.UpdateIndexes(db, buffered.Select(p => (p.Point.Measurement, p.SeriesKey.TagsCanonical, p.Point.Tags)));
@@ -147,6 +159,71 @@ public sealed class TsdbEngine : IDisposable
         }
         finally { lk.ExitWriteLock(); }
         return Task.CompletedTask;
+    }
+
+    private void ValidateSchema(string db, List<Point> pts)
+    {
+        if (pts.Count == 0) return;
+        var measurement = pts[0].Measurement;
+        for (var i = 1; i < pts.Count; i++)
+        {
+            if (pts[i].Measurement == measurement) continue;
+            foreach (var group in pts.GroupBy(p => p.Measurement))
+                _schema.ValidateAndRegister(db, group.Key, group);
+            return;
+        }
+
+        _schema.ValidateAndRegister(db, measurement, pts);
+    }
+
+    private static List<PendingPoint> DeduplicateWritePoints(List<Point> pts)
+    {
+        if (pts.Count == 0) return [];
+
+        var pending = new List<PendingPoint>(pts.Count);
+        var first = pts[0];
+        pending.Add(new PendingPoint(first, SeriesKey.From(first)));
+        if (pts.Count == 1) return pending;
+
+        var strictlyIncreasingTimestamps = true;
+        var lastTimestamp = first.TimestampNs;
+        for (var i = 1; i < pts.Count; i++)
+        {
+            var point = pts[i];
+            if (point.TimestampNs <= lastTimestamp) strictlyIncreasingTimestamps = false;
+            lastTimestamp = point.TimestampNs;
+            pending.Add(new PendingPoint(point, SeriesKey.From(point)));
+        }
+
+        if (strictlyIncreasingTimestamps) return pending;
+
+        var map = new Dictionary<(string Meas, string Tags, long Ts), PendingPoint>();
+        foreach (var candidate in pending)
+        {
+            var p = candidate.Point;
+            var key = (p.Measurement, candidate.SeriesKey.TagsCanonical, p.TimestampNs);
+            if (map.TryGetValue(key, out var existing))
+            {
+                if (!existing.Cloned)
+                {
+                    existing.Point = new Point
+                    {
+                        Measurement = existing.Point.Measurement,
+                        Tags = existing.Point.Tags,
+                        Fields = new Dictionary<string, FieldValue>(existing.Point.Fields, StringComparer.Ordinal),
+                        TimestampNs = existing.Point.TimestampNs,
+                        TagsCanonical = existing.Point.TagsCanonical
+                    };
+                    existing.Cloned = true;
+                }
+                foreach (var kv in p.Fields) existing.Point.Fields[kv.Key] = kv.Value;
+            }
+            else
+            {
+                map[key] = candidate;
+            }
+        }
+        return map.Values.ToList();
     }
 
     /// <summary>
@@ -495,7 +572,7 @@ public sealed class TsdbEngine : IDisposable
                 {
                     list.RemoveAll(p => p.Point.Measurement == measurement);
                     RebuildBufferSeriesIndex(key, list);
-                    UpdateBufferReplayFloor(key, list);
+                    UpdateBufferReplayFloor(key, list, forceRecalculate: true);
                 }
             }
             finally { lk.ExitWriteLock(); }
@@ -573,7 +650,7 @@ public sealed class TsdbEngine : IDisposable
                 {
                     list.RemoveAll(p => p.Point.Measurement == measurement && tagSet.Contains(p.SeriesKey.TagsCanonical));
                     RebuildBufferSeriesIndex(key, list);
-                    UpdateBufferReplayFloor(key, list);
+                    UpdateBufferReplayFloor(key, list, forceRecalculate: true);
                 }
             }
             finally { lk.ExitWriteLock(); }
@@ -611,7 +688,7 @@ public sealed class TsdbEngine : IDisposable
                     && (!maxTime.HasValue || p.Point.TimestampNs <= maxTime.Value)
                     && predicate(p.Point));
                 RebuildBufferSeriesIndex(key, list);
-                UpdateBufferReplayFloor(key, list);
+                UpdateBufferReplayFloor(key, list, forceRecalculate: true);
             }
         }
         finally { lk.ExitWriteLock(); }
@@ -734,16 +811,18 @@ public sealed class TsdbEngine : IDisposable
         finally { _globalLock.ExitWriteLock(); }
     }
 
-    private void CheckCardinality(string db, List<Point> pts)
+    private void CheckCardinality(string db, List<PendingPoint> pts)
     {
         _globalLock.EnterReadLock();
         try
         {
             if (!_seriesKeys.TryGetValue(db, out var existing))
                 existing = [];
-            var newSeries = pts.Select(p => SeriesKey.From(p).ToString())
-                .Distinct(StringComparer.Ordinal)
-                .Count(k => !existing.Contains(k));
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var newSeries = 0;
+            foreach (var p in pts)
+                if (seen.Add(p.SeriesKeyText) && !existing.Contains(p.SeriesKeyText))
+                    newSeries++;
             var total = existing.Count + newSeries;
             if (total > _maxSeriesPerDb) throw new CardinalityLimitExceededException($"series cardinality limit exceeded for database '{db}': {total} > {_maxSeriesPerDb}");
         }
@@ -844,24 +923,37 @@ public sealed class TsdbEngine : IDisposable
         try
         {
             if (!_seriesKeys.TryGetValue(db, out var keys)) { keys = new(StringComparer.Ordinal); _seriesKeys[db] = keys; }
-            foreach (var p in pts) keys.Add(p.SeriesKey.ToString());
+            var seen = new HashSet<SeriesKey>();
+            foreach (var p in pts)
+                if (seen.Add(p.SeriesKey))
+                    keys.Add(p.SeriesKeyText);
         }
         finally { _globalLock.ExitWriteLock(); }
     }
 
-    private void UpdateBufferReplayFloor(string key, List<BufferedPoint> list)
+    private void UpdateBufferReplayFloor(string key, List<BufferedPoint> list, bool forceRecalculate = false)
     {
         var lockHeld = _globalLock.IsWriteLockHeld;
         if (!lockHeld) _globalLock.EnterWriteLock();
         try
         {
             if (list.Count == 0) _bufferReplayFloors.Remove(key);
-            else _bufferReplayFloors[key] = list
-                .OrderBy(x => x.Position.FileId)
-                .ThenBy(x => x.Position.Offset)
-                .First().Position;
+            else if (forceRecalculate || !_bufferReplayFloors.ContainsKey(key))
+                _bufferReplayFloors[key] = FindReplayFloor(list);
         }
         finally { if (!lockHeld) _globalLock.ExitWriteLock(); }
+    }
+
+    private static WalPosition FindReplayFloor(List<BufferedPoint> list)
+    {
+        var floor = list[0].Position;
+        for (var i = 1; i < list.Count; i++)
+        {
+            var position = list[i].Position;
+            if (position.FileId < floor.FileId || (position.FileId == floor.FileId && position.Offset < floor.Offset))
+                floor = position;
+        }
+        return floor;
     }
 
     private void UpdateWalCheckpoint()

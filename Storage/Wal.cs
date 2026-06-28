@@ -92,7 +92,9 @@ public sealed class WalManager : IDisposable
     /// </summary>
     public IReadOnlyList<WalPosition> Append(string db, string rp, IEnumerable<Point> points)
     {
-        var positions = new List<WalPosition>();
+        var positions = points.TryGetNonEnumeratedCount(out var count)
+            ? new List<WalPosition>(count)
+            : [];
         lock (_lock)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
@@ -127,19 +129,48 @@ public sealed class WalManager : IDisposable
 
     private static string FormatRecord(string db, string rp, Point p)
     {
-        var fields = string.Join(",", p.Fields.Select(f => $"{f.Key}={FormatFieldValue(f.Value)}"));
-        var tags = p.Tags.Count > 0 ? "," + string.Join(",", p.Tags.Select(kv => $"{kv.Key}={kv.Value}")) : "";
-        return $"{db}\t{rp}\t{p.Measurement}{tags} {fields} {p.TimestampNs}\n";
+        var sb = new StringBuilder(p.Measurement.Length + p.Tags.Count * 16 + p.Fields.Count * 24 + 48);
+        sb.Append(db).Append('\t').Append(rp).Append('\t');
+        AppendLineProtocol(sb, p);
+        return sb.ToString();
     }
 
-    private static string FormatFieldValue(FieldValue v) => v.Kind switch
+    private static void AppendLineProtocol(StringBuilder sb, Point p)
     {
-        FieldKind.Integer => $"{v.Integer}i",
-        FieldKind.Float => v.Float.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        FieldKind.Boolean => v.Boolean ? "true" : "false",
-        FieldKind.String => $"\"{v.String}\"",
-        _ => ""
-    };
+        sb.Append(p.Measurement);
+        foreach (var tag in p.Tags)
+            sb.Append(',').Append(tag.Key).Append('=').Append(tag.Value);
+
+        sb.Append(' ');
+        var first = true;
+        foreach (var field in p.Fields)
+        {
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append(field.Key).Append('=');
+            AppendFieldValue(sb, field.Value);
+        }
+        sb.Append(' ').Append(p.TimestampNs).Append('\n');
+    }
+
+    private static void AppendFieldValue(StringBuilder sb, FieldValue v)
+    {
+        switch (v.Kind)
+        {
+            case FieldKind.Integer:
+                sb.Append(v.Integer).Append('i');
+                break;
+            case FieldKind.Float:
+                sb.Append(v.Float.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                break;
+            case FieldKind.Boolean:
+                sb.Append(v.Boolean ? "true" : "false");
+                break;
+            case FieldKind.String:
+                sb.Append('"').Append(v.String).Append('"');
+                break;
+        }
+    }
 
     private void RotateLocked()
     {

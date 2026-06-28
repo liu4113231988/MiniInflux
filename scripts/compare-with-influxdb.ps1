@@ -218,6 +218,7 @@ try {
     $env:Http__SuppressWriteLog = 'true'
     $env:Logging__ConsoleEnabled = 'false'
     $env:Logging__FileEnabled = 'false'
+    $env:MiniInflux__FlushThreshold = [Math]::Max($Points * 2, 50000).ToString([System.Globalization.CultureInfo]::InvariantCulture)
     $env:DOTNET_CLI_HOME = (Join-Path $root '.dotnet_home')
     $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
 

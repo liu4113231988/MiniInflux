@@ -396,8 +396,11 @@ public sealed class Manifest
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return;
             var changed = false;
+            var seenSeries = new HashSet<(string Measurement, string TagsCanonical)>();
             foreach (var (meas, tagsCanon, tags) in points)
             {
+                if (!seenSeries.Add((meas, tagsCanon))) continue;
+
                 // Series index
                 if (!dbInfo.SeriesIndex.TryGetValue(meas, out var seriesSet))
                 { seriesSet = new(StringComparer.Ordinal); dbInfo.SeriesIndex[meas] = seriesSet; }
