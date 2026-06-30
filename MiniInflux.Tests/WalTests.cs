@@ -104,26 +104,31 @@ public class WalTests : IDisposable
         var walDir = Path.Combine(_testDir, "wal");
         using (var wal = new WalManager(walDir))
         {
-            for (int i = 0; i < 5; i++)
-            {
-                var points = new List<Point>
+            var positions = wal.Append("testdb", "autogen",
+            [
+                new Point
                 {
-                    new Point
-                    {
-                        Measurement = "cpu",
-                        Tags = new Dictionary<string, string>(),
-                        Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(i) } },
-                        TimestampNs = i * 1000_000_000
-                    }
-                };
-                wal.Append("testdb", "autogen", points);
-            }
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string>(),
+                    Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(1) } },
+                    TimestampNs = 1 * 1000_000_000
+                },
+                new Point
+                {
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string>(),
+                    Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(2) } },
+                    TimestampNs = 2 * 1000_000_000
+                }
+            ]);
+            Assert.Equal(2, positions.Count);
+            Assert.Equal(positions[0], positions[1]);
         }
 
         using var wal2 = new WalManager(walDir);
         var records = wal2.Replay();
 
-        Assert.Equal(5, records.Count);
+        Assert.Equal(2, records.Count);
     }
 
     [Fact]

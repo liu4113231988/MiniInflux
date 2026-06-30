@@ -90,7 +90,6 @@ builder.Services.AddSingleton(new QueryExecutor(
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton<MetricsCollector>();
 builder.Services.AddSingleton(new AccessLogWriter(options.Http.AccessLogPath));
-builder.Services.AddSingleton(sp => new WriteQueue(sp.GetRequiredService<TsdbEngine>(), options.Write.QueueCapacity, options.Write.BatchSize));
 builder.Services.AddSingleton<ContinuousQueryRunner>();
 builder.Services.AddHostedService<ContinuousQueryHostedService>();
 
@@ -196,7 +195,7 @@ app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
     return Results.Text(text, "text/plain; version=0.0.4; charset=utf-8");
 });
 
-app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQueue writeQueue, MetricsCollector metrics, string db, string? rp, string? precision) =>
+app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, MetricsCollector metrics, string db, string? rp, string? precision) =>
 {
     if (string.IsNullOrWhiteSpace(db)) return Results.BadRequest(new ErrorResponse("missing required parameter db"));
     if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
@@ -219,15 +218,10 @@ app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, WriteQu
         var points = LineProtocolParser.ParseMany(body, TimestampPrecision.Parse(precision));
         try
         {
-            await writeQueue.EnqueueAsync(db, rp ?? "autogen", points, request.HttpContext.RequestAborted);
+            await tsdbEngine.WriteInternalAsync(db, rp ?? "autogen", points);
             metrics.RecordWrite(points.Count);
             runtimeLogger.LogDebug("write accepted db={Db} rp={Rp} points={PointCount}", db, rp ?? "autogen", points.Count);
             return Results.NoContent();
-        }
-        catch (WriteQueueFullException)
-        {
-            runtimeLogger.LogWarning("write queue full db={Db} rp={Rp}", db, rp ?? "autogen");
-            return Results.StatusCode(429);
         }
         catch (FieldConflictException ex)
         {

@@ -62,6 +62,16 @@ public class LineProtocolParserTests
     }
 
     [Fact]
+    public void ParseMany_RepeatedSeries_ReusesParsedTags()
+    {
+        var text = "cpu,host=server01,region=us value=1.5 1000000000\ncpu,host=server01,region=us value=2.5 2000000000";
+        var points = LineProtocolParser.ParseMany(text, TimestampPrecision.Parse("ns"));
+
+        Assert.Same(points[0].Tags, points[1].Tags);
+        Assert.Equal("host=server01,region=us", points[0].TagsCanonical);
+    }
+
+    [Fact]
     public void ParseOne_MillisecondPrecision_ConvertsToNanoseconds()
     {
         var line = "cpu value=1.5 1000";

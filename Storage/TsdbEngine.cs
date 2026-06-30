@@ -5,12 +5,11 @@ namespace MiniInflux.Net10.Storage;
 
 public sealed class TsdbEngine : IDisposable
 {
-    private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey, string SeriesKeyText);
+    private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey);
     private sealed class PendingPoint(Point point, SeriesKey seriesKey)
     {
         public Point Point = point;
         public readonly SeriesKey SeriesKey = seriesKey;
-        public readonly string SeriesKeyText = seriesKey.ToString();
         public bool Cloned;
     }
 
@@ -31,7 +30,7 @@ public sealed class TsdbEngine : IDisposable
     private readonly long _maxSeriesPerDb;
     private readonly long _maxBufferPoints;
     private readonly long _maxBufferBytes;
-    private readonly Dictionary<string, HashSet<string>> _seriesKeys = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HashSet<SeriesKey>> _seriesKeys = new(StringComparer.Ordinal);
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
     private Timer? _flushTimer;
@@ -70,7 +69,7 @@ public sealed class TsdbEngine : IDisposable
             {
                 _schema.ValidateAndRegister(replayPoint.Db, replayPoint.Point.Measurement, [replayPoint.Point]);
                 var seriesKey = SeriesKey.From(replayPoint.Point);
-                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey, seriesKey.ToString()));
+                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey));
             }
             catch (FieldConflictException) { result.SchemaConflictsSkipped++; }
 
@@ -108,8 +107,8 @@ public sealed class TsdbEngine : IDisposable
                             _globalLock.EnterWriteLock();
                             try
                             {
-                                if (!_seriesKeys.TryGetValue(db, out var keys)) { keys = new(StringComparer.Ordinal); _seriesKeys[db] = keys; }
-                                keys.Add($"{m.Measurement},{m.TagsCanonical}");
+                                if (!_seriesKeys.TryGetValue(db, out var keys)) { keys = []; _seriesKeys[db] = keys; }
+                                keys.Add(new SeriesKey(m.Measurement, m.TagsCanonical));
                             }
                             finally { _globalLock.ExitWriteLock(); }
 
@@ -137,28 +136,31 @@ public sealed class TsdbEngine : IDisposable
     {
         CreateDatabase(db); _manifest.EnsureRp(db, rp);
         var pending = DeduplicateWritePoints(pts);
-        pts = new List<Point>(pending.Count);
-        foreach (var p in pending) pts.Add(p.Point);
+        var writePoints = pending.Count == pts.Count ? pts : MaterializePendingPoints(pending);
         CheckCardinality(db, pending);
-        CheckBufferLimit(pts);
-        ValidateSchema(db, pts);
-        var walPositions = _wal.Append(db, rp, pts);
+        CheckBufferLimit(writePoints);
+        ValidateSchema(db, writePoints);
+        var walPositions = _wal.Append(db, rp, writePoints);
         var lk = GetLock(K(db, rp));
         lk.EnterWriteLock();
         try
         {
             var key = K(db, rp);
             if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
-            var buffered = new List<BufferedPoint>(pending.Count);
-            for (var i = 0; i < pending.Count; i++)
-                buffered.Add(new BufferedPoint(pending[i].Point, walPositions[i], pending[i].SeriesKey, pending[i].SeriesKeyText));
-            AddBufferedPoints(key, list, buffered); TrackSeriesKeys(db, buffered);
+            AddWrittenPoints(db, key, list, pending, walPositions);
             UpdateBufferReplayFloor(key, list);
-            _manifest.UpdateIndexes(db, buffered.Select(p => (p.Point.Measurement, p.SeriesKey.TagsCanonical, p.Point.Tags)));
             if (list.Count >= _threshold) FlushLocked(db, rp, list);
         }
         finally { lk.ExitWriteLock(); }
         return Task.CompletedTask;
+    }
+
+    private static List<Point> MaterializePendingPoints(List<PendingPoint> pending)
+    {
+        var points = new List<Point>(pending.Count);
+        foreach (var p in pending)
+            points.Add(p.Point);
+        return points;
     }
 
     private void ValidateSchema(string db, List<Point> pts)
@@ -893,10 +895,10 @@ public sealed class TsdbEngine : IDisposable
         {
             if (!_seriesKeys.TryGetValue(db, out var existing))
                 existing = [];
-            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var seen = new HashSet<SeriesKey>();
             var newSeries = 0;
             foreach (var p in pts)
-                if (seen.Add(p.SeriesKeyText) && !existing.Contains(p.SeriesKeyText))
+                if (seen.Add(p.SeriesKey) && !existing.Contains(p.SeriesKey))
                     newSeries++;
             var total = existing.Count + newSeries;
             if (total > _maxSeriesPerDb) throw new CardinalityLimitExceededException($"series cardinality limit exceeded for database '{db}': {total} > {_maxSeriesPerDb}");
@@ -906,9 +908,12 @@ public sealed class TsdbEngine : IDisposable
 
     private void CheckBufferLimit(List<Point> incomingPoints)
     {
-        var bufferedPoints = GetBufferedPointCount();
-        if (_maxBufferPoints > 0 && bufferedPoints + incomingPoints.Count > _maxBufferPoints)
-            throw new MemoryLimitExceededException($"memory buffer point limit exceeded: {bufferedPoints + incomingPoints.Count} > {_maxBufferPoints}");
+        if (_maxBufferPoints > 0)
+        {
+            var bufferedPoints = GetBufferedPointCount();
+            if (bufferedPoints + incomingPoints.Count > _maxBufferPoints)
+                throw new MemoryLimitExceededException($"memory buffer point limit exceeded: {bufferedPoints + incomingPoints.Count} > {_maxBufferPoints}");
+        }
 
         if (_maxBufferBytes > 0)
         {
@@ -966,6 +971,45 @@ public sealed class TsdbEngine : IDisposable
         }
     }
 
+    private void AddWrittenPoints(string db, string key, List<BufferedPoint> list, List<PendingPoint> points, IReadOnlyList<WalPosition> positions)
+    {
+        if (!_bufBySeries.TryGetValue(key, out var bySeries))
+        {
+            bySeries = new();
+            _bufBySeries[key] = bySeries;
+        }
+
+        list.EnsureCapacity(list.Count + points.Count);
+        var seenSeries = new HashSet<SeriesKey>();
+        var indexPoints = new List<(string Measurement, string TagsCanonical, Dictionary<string, string> Tags)>();
+        for (var i = 0; i < points.Count; i++)
+        {
+            var pending = points[i];
+            var buffered = new BufferedPoint(pending.Point, positions[i], pending.SeriesKey);
+            list.Add(buffered);
+            if (!bySeries.TryGetValue(pending.SeriesKey, out var seriesPoints))
+            {
+                seriesPoints = [];
+                bySeries[pending.SeriesKey] = seriesPoints;
+            }
+            seriesPoints.Add(buffered);
+
+            if (seenSeries.Add(pending.SeriesKey))
+                indexPoints.Add((pending.Point.Measurement, pending.SeriesKey.TagsCanonical, pending.Point.Tags));
+        }
+
+        _globalLock.EnterWriteLock();
+        try
+        {
+            if (!_seriesKeys.TryGetValue(db, out var keys)) { keys = []; _seriesKeys[db] = keys; }
+            foreach (var series in seenSeries)
+                keys.Add(series);
+        }
+        finally { _globalLock.ExitWriteLock(); }
+
+        _manifest.UpdateIndexes(db, indexPoints);
+    }
+
     private IEnumerable<BufferedPoint> BufferedCandidates(string key, List<BufferedPoint> list, string? measurement, HashSet<string>? allowedTagsCanonical)
     {
         if (measurement == null || allowedTagsCanonical == null || allowedTagsCanonical.Count == 0)
@@ -1006,11 +1050,11 @@ public sealed class TsdbEngine : IDisposable
         _globalLock.EnterWriteLock();
         try
         {
-            if (!_seriesKeys.TryGetValue(db, out var keys)) { keys = new(StringComparer.Ordinal); _seriesKeys[db] = keys; }
+            if (!_seriesKeys.TryGetValue(db, out var keys)) { keys = []; _seriesKeys[db] = keys; }
             var seen = new HashSet<SeriesKey>();
             foreach (var p in pts)
                 if (seen.Add(p.SeriesKey))
-                    keys.Add(p.SeriesKeyText);
+                    keys.Add(p.SeriesKey);
         }
         finally { _globalLock.ExitWriteLock(); }
     }

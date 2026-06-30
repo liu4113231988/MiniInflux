@@ -88,25 +88,24 @@ public sealed class WalManager : IDisposable
     }
 
     /// <summary>
-    /// Append points to the WAL. Each point is written as a single record.
+    /// Append points to the WAL. A write batch is stored as one record.
     /// </summary>
     public IReadOnlyList<WalPosition> Append(string db, string rp, IEnumerable<Point> points)
     {
-        var positions = points.TryGetNonEnumeratedCount(out var count)
-            ? new List<WalPosition>(count)
-            : [];
+        var pointList = points as IReadOnlyList<Point> ?? points.ToList();
+        if (pointList.Count == 0) return [];
+
+        var positions = new List<WalPosition>(pointList.Count);
         lock (_lock)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
-            foreach (var p in points)
-            {
-                var line = FormatRecord(db, rp, p);
-                var payload = Encoding.UTF8.GetBytes(line);
-                positions.Add(WriteRecord(payload));
+            var payload = Encoding.UTF8.GetBytes(FormatRecord(db, rp, pointList));
+            var position = WriteRecord(payload);
+            for (var i = 0; i < pointList.Count; i++)
+                positions.Add(position);
 
-                if (_currentFileSize >= _maxFileBytes)
-                    RotateLocked();
-            }
+            if (_currentFileSize >= _maxFileBytes)
+                RotateLocked();
 
             if (!_fsync || _fsyncIntervalMs <= 0)
                 _currentStream?.Flush(false);
@@ -127,11 +126,13 @@ public sealed class WalManager : IDisposable
         return new WalPosition(_currentFileId, recordStart);
     }
 
-    private static string FormatRecord(string db, string rp, Point p)
+    private static string FormatRecord(string db, string rp, IReadOnlyList<Point> points)
     {
-        var sb = new StringBuilder(p.Measurement.Length + p.Tags.Count * 16 + p.Fields.Count * 24 + 48);
+        var estimatedBytes = db.Length + rp.Length + points.Count * 80;
+        var sb = new StringBuilder(estimatedBytes);
         sb.Append(db).Append('\t').Append(rp).Append('\t');
-        AppendLineProtocol(sb, p);
+        for (var i = 0; i < points.Count; i++)
+            AppendLineProtocol(sb, points[i]);
         return sb.ToString();
     }
 

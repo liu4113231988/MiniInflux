@@ -12,7 +12,8 @@ public static class LineProtocolParser
 {
     public static List<Point> ParseMany(string text, TimestampPrecision precision)
     {
-        var res = new List<Point>(EstimateLineCount(text));
+        var res = new List<Point>(EstimatePointCapacity(text));
+        var stringPool = new StringPool();
         var start = 0;
         while (start < text.Length)
         {
@@ -25,7 +26,7 @@ public static class LineProtocolParser
             {
                 res.Add(HasSpecial(text, start, lineEnd)
                     ? ParseOne(text[start..lineEnd], precision)
-                    : ParseSimple(text, start, lineEnd, precision));
+                    : ParseSimple(text, start, lineEnd, precision, stringPool));
             }
 
             start = end + 1;
@@ -41,14 +42,7 @@ public static class LineProtocolParser
         return false;
     }
 
-    private static int EstimateLineCount(string text)
-    {
-        if (text.Length == 0) return 0;
-        var count = 1;
-        foreach (var ch in text)
-            if (ch == '\n') count++;
-        return count;
-    }
+    private static int EstimatePointCapacity(string text) => Math.Min(100_000, text.Length / 64);
 
     private static bool HasSpecial(string text, int start, int end)
     {
@@ -77,10 +71,10 @@ public static class LineProtocolParser
 
     private static Point ParseSimple(string line, TimestampPrecision precision)
     {
-        return ParseSimple(line, 0, line.Length, precision);
+        return ParseSimple(line, 0, line.Length, precision, new StringPool());
     }
 
-    private static Point ParseSimple(string line, int start, int end, TimestampPrecision precision)
+    private static Point ParseSimple(string line, int start, int end, TimestampPrecision precision, StringPool stringPool)
     {
         var first = line.IndexOf(' ', start, end - start);
         if (first <= start) throw new FormatException("invalid line protocol: missing field set");
@@ -92,25 +86,42 @@ public static class LineProtocolParser
 
         var measurementEnd = line.IndexOf(',', start, seriesEnd - start);
         if (measurementEnd < 0) measurementEnd = seriesEnd;
-        var tags = new Dictionary<string, string>(CountChar(line, ',', start, seriesEnd), StringComparer.Ordinal);
+        Dictionary<string, string> tags;
         var tagStart = measurementEnd + 1;
         var tagsSorted = true;
-        string? previousTag = null;
-        while (tagStart < seriesEnd)
+        string? tagsCanonical = "";
+        if (measurementEnd >= seriesEnd)
         {
-            var tagEnd = line.IndexOf(',', tagStart, seriesEnd - tagStart);
-            if (tagEnd < 0) tagEnd = seriesEnd;
-            var eq = line.IndexOf('=', tagStart, tagEnd - tagStart);
-            if (eq <= tagStart) throw new FormatException($"invalid key-value: {line[tagStart..tagEnd]}");
-            var tagKey = line[tagStart..eq];
-            if (previousTag != null && string.CompareOrdinal(previousTag, tagKey) > 0)
-                tagsSorted = false;
-            previousTag = tagKey;
-            tags[tagKey] = line[(eq + 1)..tagEnd];
-            tagStart = tagEnd + 1;
+            tags = new Dictionary<string, string>(0, StringComparer.Ordinal);
+        }
+        else if (stringPool.TryGetTags(line, measurementEnd + 1, seriesEnd - measurementEnd - 1, out tagsCanonical, out tags))
+        {
+            // Repeated series in the same batch: reuse the parsed tag dictionary.
+        }
+        else
+        {
+            tags = new Dictionary<string, string>(4, StringComparer.Ordinal);
+            string? previousTag = null;
+            while (tagStart < seriesEnd)
+            {
+                var tagEnd = line.IndexOf(',', tagStart, seriesEnd - tagStart);
+                if (tagEnd < 0) tagEnd = seriesEnd;
+                var eq = line.IndexOf('=', tagStart, tagEnd - tagStart);
+                if (eq <= tagStart) throw new FormatException($"invalid key-value: {line[tagStart..tagEnd]}");
+                var tagKey = stringPool.Get(line, tagStart, eq - tagStart);
+                if (previousTag != null && string.CompareOrdinal(previousTag, tagKey) > 0)
+                    tagsSorted = false;
+                previousTag = tagKey;
+                tags[tagKey] = stringPool.Get(line, eq + 1, tagEnd - eq - 1);
+                tagStart = tagEnd + 1;
+            }
+
+            tagsCanonical = tagsSorted ? stringPool.Get(line, measurementEnd + 1, seriesEnd - measurementEnd - 1) : null;
+            if (tagsCanonical != null)
+                stringPool.AddTags(tagsCanonical, tags);
         }
 
-        var fields = new Dictionary<string, FieldValue>(CountChar(line, ',', fieldsStart, fieldsEnd) + 1, StringComparer.Ordinal);
+        var fields = new Dictionary<string, FieldValue>(2, StringComparer.Ordinal);
         var fieldStart = fieldsStart;
         while (fieldStart < fieldsEnd)
         {
@@ -118,7 +129,7 @@ public static class LineProtocolParser
             if (fieldEnd < 0) fieldEnd = fieldsEnd;
             var eq = line.IndexOf('=', fieldStart, fieldEnd - fieldStart);
             if (eq <= fieldStart) throw new FormatException($"invalid key-value: {line[fieldStart..fieldEnd]}");
-            fields[line[fieldStart..eq]] = ParseSimpleFieldValue(line, eq + 1, fieldEnd);
+            fields[stringPool.Get(line, fieldStart, eq - fieldStart)] = ParseSimpleFieldValue(line, eq + 1, fieldEnd);
             fieldStart = fieldEnd + 1;
         }
 
@@ -134,20 +145,53 @@ public static class LineProtocolParser
 
         return new Point
         {
-            Measurement = line[start..measurementEnd],
+            Measurement = stringPool.Get(line, start, measurementEnd - start),
             Tags = tags,
             Fields = fields,
             TimestampNs = ts,
-            TagsCanonical = tags.Count == 0 ? "" : tagsSorted ? line[(measurementEnd + 1)..seriesEnd] : null
+            TagsCanonical = tags.Count == 0 ? "" : tagsSorted ? tagsCanonical : null
         };
     }
 
-    private static int CountChar(string text, char value, int start, int end)
+    private sealed class StringPool
     {
-        var count = 0;
-        for (var i = start; i < end; i++)
-            if (text[i] == value) count++;
-        return count;
+        private readonly Dictionary<int, List<string>> _buckets = [];
+        private readonly Dictionary<string, Dictionary<string, string>> _tagsByCanonical = new(StringComparer.Ordinal);
+
+        public string Get(string text, int start, int length)
+        {
+            var span = text.AsSpan(start, length);
+            var hash = string.GetHashCode(span, StringComparison.Ordinal);
+            if (_buckets.TryGetValue(hash, out var values))
+            {
+                foreach (var value in values)
+                    if (value.AsSpan().SequenceEqual(span))
+                        return value;
+            }
+            else
+            {
+                values = [];
+                _buckets[hash] = values;
+            }
+
+            var created = text.Substring(start, length);
+            values.Add(created);
+            return created;
+        }
+
+        public bool TryGetTags(string text, int start, int length, out string canonical, out Dictionary<string, string> tags)
+        {
+            canonical = Get(text, start, length);
+            if (_tagsByCanonical.TryGetValue(canonical, out tags!))
+            {
+                return true;
+            }
+
+            tags = null!;
+            return false;
+        }
+
+        public void AddTags(string canonical, Dictionary<string, string> tags) => _tagsByCanonical.TryAdd(canonical, tags);
     }
 
     private static FieldValue ParseSimpleFieldValue(string text, int start, int end)
