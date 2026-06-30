@@ -2,6 +2,7 @@ using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
 using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
+using System.Text;
 
 namespace MiniInflux.Tests;
 
@@ -70,6 +71,49 @@ public class MediumPriorityFixTests : IDisposable
 
         var row = Assert.Single(response.Results[0].Series![0].Values);
         Assert.Equal(2.0, row[^1]);
+    }
+
+    [Fact]
+    public async Task RawDescLimit_ReadsBufferedSeriesDescending()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1, "server01", 1),
+            Point("cpu", "value", 2, "server01", 2),
+            Point("cpu", "value", 3, "server01", 3)
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb",
+            "SELECT * FROM cpu WHERE host='server01' ORDER BY time DESC LIMIT 2");
+
+        var rows = response.Results[0].Series![0].Values;
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(3.0, rows[0][^1]);
+        Assert.Equal(2.0, rows[1][^1]);
+    }
+
+    [Fact]
+    public async Task RawDescLimitFastJson_UsesEpochNs()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1, "server01", 1),
+            Point("cpu", "value", 2, "server01", 2),
+            Point("cpu", "value", 3, "server01", 3)
+        ]);
+
+        var outcome = new QueryExecutor().TryExecuteBufferedRawDescendingJson(
+            engine,
+            "testdb",
+            "SELECT * FROM cpu WHERE host='server01' ORDER BY time DESC LIMIT 1",
+            "ns");
+
+        Assert.NotNull(outcome);
+        var json = Encoding.UTF8.GetString(outcome.Json);
+        Assert.Contains("[3000000000,3", json);
+        Assert.DoesNotContain("1970-", json);
     }
 
     [Fact]

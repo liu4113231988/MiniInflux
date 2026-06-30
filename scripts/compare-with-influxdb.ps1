@@ -1,7 +1,9 @@
 param(
     [int]$Points = 200000,
     [int]$BatchSize = 5000,
-    [int]$Concurrency = 1
+    [int]$Concurrency = 1,
+    [string]$Epoch = '',
+    [int]$QueryIterations = 5
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,11 +77,13 @@ function Invoke-Query {
         [string]$BaseUrl,
         [string]$Database,
         [string]$Query,
-        [bool]$Debug = $false
+        [bool]$Debug = $false,
+        [string]$Epoch = ''
     )
 
     $debugParam = if ($Debug) { '&debug=true' } else { '' }
-    $queryUrl = "$BaseUrl/query?db=$Database&q=$([Uri]::EscapeDataString($Query))$debugParam"
+    $epochParam = if ([string]::IsNullOrWhiteSpace($Epoch)) { '' } else { "&epoch=$([Uri]::EscapeDataString($Epoch))" }
+    $queryUrl = "$BaseUrl/query?db=$Database&q=$([Uri]::EscapeDataString($Query))$debugParam$epochParam"
     $response = $Client.PostAsync($queryUrl, [System.Net.Http.StringContent]::new('', [System.Text.Encoding]::UTF8, 'application/x-www-form-urlencoded')).GetAwaiter().GetResult()
     $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
     if (-not $response.IsSuccessStatusCode) {
@@ -87,6 +91,34 @@ function Invoke-Query {
     }
 
     return $body
+}
+
+function Measure-Query {
+    param(
+        [System.Net.Http.HttpClient]$Client,
+        [string]$BaseUrl,
+        [string]$Database,
+        [string]$Query,
+        [string]$Epoch = '',
+        [int]$Iterations = 5
+    )
+
+    $body = ''
+    $times = @()
+    for ($i = 0; $i -lt [Math]::Max(1, $Iterations); $i++) {
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $body = Invoke-Query -Client $Client -BaseUrl $BaseUrl -Database $Database -Query $Query -Epoch $Epoch
+        $watch.Stop()
+        $times += $watch.Elapsed.TotalMilliseconds
+    }
+
+    $ordered = @($times | Sort-Object)
+    $median = $ordered[[int][Math]::Floor($ordered.Count / 2)]
+    return [pscustomobject]@{
+        Body = $body
+        MedianMs = [Math]::Round($median, 2)
+        SamplesMs = @($times | ForEach-Object { [Math]::Round($_, 2) })
+    }
 }
 
 function New-LineProtocolBatch {
@@ -116,7 +148,9 @@ function Measure-Server {
         [string]$Database,
         [int]$Points,
         [int]$BatchSize,
-        [int]$Concurrency
+        [int]$Concurrency,
+        [string]$Epoch = '',
+        [int]$QueryIterations = 5
     )
 
     $handler = [System.Net.Http.HttpClientHandler]::new()
@@ -151,16 +185,13 @@ function Measure-Server {
     $aggregateQuery = "SELECT mean(value),count(value) FROM cpu WHERE host='server00' AND region='cn'"
     $rawLimitQuery = "SELECT * FROM cpu WHERE host='server00' AND region='cn' ORDER BY time DESC LIMIT 1000"
 
-    Invoke-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $aggregateQuery | Out-Null
-    Invoke-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $rawLimitQuery | Out-Null
+    Invoke-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $aggregateQuery -Epoch $Epoch | Out-Null
+    Invoke-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $rawLimitQuery -Epoch $Epoch | Out-Null
 
-    $query1Watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $query1Body = Invoke-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $aggregateQuery
-    $query1Watch.Stop()
-
-    $query2Watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $query2Body = Invoke-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $rawLimitQuery
-    $query2Watch.Stop()
+    $query1 = Measure-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $aggregateQuery -Epoch $Epoch -Iterations $QueryIterations
+    $query2 = Measure-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $rawLimitQuery -Epoch $Epoch -Iterations $QueryIterations
+    $query1Body = $query1.Body
+    $query2Body = $query2.Body
 
     $query1Report = $null
     $query2Report = $null
@@ -181,8 +212,10 @@ function Measure-Server {
         Concurrency = $Concurrency
         WriteSeconds = [Math]::Round($writeWatch.Elapsed.TotalSeconds, 3)
         WriteThroughput = [Math]::Round($Points / [Math]::Max($writeWatch.Elapsed.TotalSeconds, 0.001), 2)
-        AggregateQueryMs = [Math]::Round($query1Watch.Elapsed.TotalMilliseconds, 2)
-        RawLimitQueryMs = [Math]::Round($query2Watch.Elapsed.TotalMilliseconds, 2)
+        AggregateQueryMs = $query1.MedianMs
+        RawLimitQueryMs = $query2.MedianMs
+        AggregateQuerySamplesMs = $query1.SamplesMs
+        RawLimitQuerySamplesMs = $query2.SamplesMs
         AggregateQueryBytes = ($query1Body | Measure-Object -Character).Characters
         RawLimitQueryBytes = ($query2Body | Measure-Object -Character).Characters
         AggregateQueryReport = $query1Report
@@ -225,8 +258,8 @@ try {
     $miniProc = Start-Process -FilePath 'dotnet' -ArgumentList @('run', '-c', 'Release', '--project', 'MiniInflux.Net10.csproj', '--no-launch-profile', '--no-restore') -WorkingDirectory $root -WindowStyle Hidden -PassThru
     $influxProc = Start-Process -FilePath 'D:\workingfold\Influxdb\influxdb-1.7.9\influxd.exe' -ArgumentList @('run', '-config', $influxConfig) -WorkingDirectory $root -WindowStyle Hidden -PassThru
 
-    $miniResult = Measure-Server -Name 'MiniInflux' -BaseUrl 'http://127.0.0.1:18086' -Database 'benchmini' -Points $Points -BatchSize $BatchSize -Concurrency $Concurrency
-    $influxResult = Measure-Server -Name 'InfluxDB 1.7.9' -BaseUrl 'http://127.0.0.1:18087' -Database 'benchinflux' -Points $Points -BatchSize $BatchSize -Concurrency $Concurrency
+    $miniResult = Measure-Server -Name 'MiniInflux' -BaseUrl 'http://127.0.0.1:18086' -Database 'benchmini' -Points $Points -BatchSize $BatchSize -Concurrency $Concurrency -Epoch $Epoch -QueryIterations $QueryIterations
+    $influxResult = Measure-Server -Name 'InfluxDB 1.7.9' -BaseUrl 'http://127.0.0.1:18087' -Database 'benchinflux' -Points $Points -BatchSize $BatchSize -Concurrency $Concurrency -Epoch $Epoch -QueryIterations $QueryIterations
 
     [pscustomobject]@{
         TimestampUtc = [DateTime]::UtcNow.ToString('o')

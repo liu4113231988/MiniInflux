@@ -114,13 +114,13 @@ public sealed class WalManager : IDisposable
         return positions;
     }
 
-    private WalPosition WriteRecord(byte[] payload)
+    private WalPosition WriteRecord(ReadOnlySpan<byte> payload)
     {
         if (_currentStream == null) return CurrentPosition;
         var recordStart = _currentFileSize;
-        var header = new byte[8];
-        BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(0, 4), payload.Length);
-        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(4, 4), Crc32.Compute(payload));
+        Span<byte> header = stackalloc byte[8];
+        BinaryPrimitives.WriteInt32LittleEndian(header[..4], payload.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(header[4..], Crc32.Compute(payload));
         _currentStream.Write(header);
         _currentStream.Write(payload);
         _currentFileSize += 8 + payload.Length;

@@ -529,6 +529,23 @@ MiniInflux 聚合查询 report：`ScannedPoints=1250`、`UsedAggregatePushdown=t
 
 | Metric | MiniInflux | InfluxDB 1.7.9 | Ratio |
 | --- | ---: | ---: | ---: |
-| 100,000 points write throughput (points/s) | 50,366.88 | 90,251.71 | InfluxDB 1.7.9 is `1.79x` |
-| 100,000 points aggregate query latency (ms) | 6.11 | 4.34 | MiniInflux is `1.41x` slower |
-| 100,000 points raw `LIMIT 1000` query latency (ms) | 44.10 | 8.04 | MiniInflux is `5.49x` slower |
+| 100,000 points write throughput (points/s) | 89,660.11 | 114,307.84 | InfluxDB 1.7.9 is `1.27x` |
+| 100,000 points aggregate query latency (ms) | 3.82 | 8.00 | MiniInflux is `2.09x` faster |
+| 100,000 points raw `LIMIT 1000` query latency (ms) | 26.34 | 13.25 | MiniInflux is `1.99x` slower |
+
+Raw `ORDER BY time DESC LIMIT 1000` 在 buffer-only 单 series 场景已命中倒序 LIMIT 下推，MiniInflux debug report 从扫描 `6,250` points 降到 `1,000` points，内部 `DurationMs=4`；HTTP wall time 仍主要受 JSON/响应输出波动影响。
+
+### 2026-06-29 raw 输出路径结构性优化复测
+
+本轮不再继续做小循环级改动，改为给普通 `/query` 增加 buffer-only raw `ORDER BY time DESC LIMIT` 专用 JSON 输出路径：命中单 series、无 group/function/subquery/field filter、且数据仍在内存 buffer 时，直接生成响应 JSON，绕过 `QueryResponse -> QuerySeries -> Values -> List<List<object?>>` 对象图；同时 fast JSON 将固定 series tag 写入 `Tags`，不再在每行 `values` 中重复输出 tag 列。根据 InfluxDB v1 官方 API 文档，`/query` 支持 `epoch=ns|u|ms|s|m|h` 返回 Unix epoch 时间戳，默认才返回 RFC3339；脚本已补 `-Epoch` 参数用于复测官方轻量时间戳模式。
+
+复测口径：`100,000` points、`batch size = 5,000`、`concurrency = 1`；MiniInflux 仍由脚本以 `dotnet run -c Release --no-restore` 启动。查询延迟改为 5 次采样取 median，避免单次毫秒级请求被本机进程调度噪声误导。
+
+| Metric | MiniInflux | InfluxDB 1.7.9 | Ratio |
+| --- | ---: | ---: | ---: |
+| 100,000 points write throughput (points/s) | 59,579.21 | 158,393.08 | InfluxDB 1.7.9 is `2.66x` |
+| 100,000 points aggregate query latency median (ms) | 5.04 | 8.34 | MiniInflux is `1.65x` faster |
+| 100,000 points raw `LIMIT 1000` query latency median (ms) | 5.92 | 9.09 | MiniInflux is `1.54x` faster |
+| 100,000 points raw `LIMIT 1000` response bytes | 42,532 | 48,496 | MiniInflux response is `12.30%` smaller |
+
+`epoch=ns` 复测：MiniInflux raw median `2.97 ms`、InfluxDB 1.7.9 raw median `7.84 ms`；MiniInflux raw 响应体 `29,532` bytes，InfluxDB `45,496` bytes。结论：当前 raw 查询方向已经不是最优继续投入点；下一轮应优先转向写入吞吐，raw 侧只保留 median 压测和 `epoch` 兼容维护。

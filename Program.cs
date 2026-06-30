@@ -3,6 +3,7 @@ using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
+using System.Buffers;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
 using MiniInflux.Net10.Model;
@@ -255,6 +256,7 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
 {
     var chunked = TryParseBool(request.Query["chunked"].ToString());
     var debug = TryParseBool(request.Query["debug"].ToString());
+    var epoch = request.Query["epoch"].ToString();
     var chunkSize = ParseChunkSize(request.Query["chunk_size"].ToString());
     if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
     {
@@ -263,6 +265,8 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
         db ??= form["db"];
         chunked = chunked || TryParseBool(form["chunked"].ToString());
         debug = debug || TryParseBool(form["debug"].ToString());
+        if (string.IsNullOrWhiteSpace(epoch))
+            epoch = form["epoch"].ToString();
         chunkSize ??= ParseChunkSize(form["chunk_size"].ToString());
     }
 
@@ -281,12 +285,23 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
         return ChunkedResult(chunkOutcome, metrics, runtimeLogger, db);
     }
 
+    if (!debug)
+    {
+        var rawJsonOutcome = executor.TryExecuteBufferedRawDescendingJson(tsdbEngine, db, q, epoch, request.HttpContext.RequestAborted);
+        if (rawJsonOutcome != null)
+        {
+            metrics.RecordQuery(rawJsonOutcome.Report);
+            LogQueryOutcome(runtimeLogger, db, rawJsonOutcome.Report, rawJsonOutcome.Report.Error);
+            return Results.Bytes(rawJsonOutcome.Json, "application/json; charset=utf-8");
+        }
+    }
+
     var outcome = executor.ExecuteWithReport(tsdbEngine, db, q, request.HttpContext.RequestAborted);
     metrics.RecordQuery(outcome.Report);
     LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
     if (debug)
         return Results.Json(new QueryDebugResponse { Response = outcome.Response, Report = outcome.Report }, AppJsonContext.Default.QueryDebugResponse);
-    return Results.Json(outcome.Response, AppJsonContext.Default.QueryResponse);
+    return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
 });
 
 app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string path) =>
@@ -642,8 +657,7 @@ static IResult ChunkedResult(QueryChunkedExecutionOutcome outcome, MetricsCollec
         {
             foreach (var chunk in outcome.Responses)
             {
-                var bytes = JsonSerializer.SerializeToUtf8Bytes(chunk, AppJsonContext.Default.QueryResponse);
-                await stream.WriteAsync(bytes);
+                await WriteQueryResponseAsync(stream, chunk);
                 await stream.WriteAsync("\n"u8.ToArray());
                 await stream.FlushAsync();
             }
@@ -654,6 +668,200 @@ static IResult ChunkedResult(QueryChunkedExecutionOutcome outcome, MetricsCollec
             LogQueryOutcome(logger, db, outcome.Report, outcome.Report.Error);
         }
     }, "application/x-ndjson; charset=utf-8");
+}
+
+static IResult QueryResponseResult(QueryResponse response, long epochDivisor)
+{
+    return Results.Stream(stream => WriteQueryResponseAsync(stream, response, epochDivisor), "application/json; charset=utf-8");
+}
+
+static async Task WriteQueryResponseAsync(Stream stream, QueryResponse response, long epochDivisor = 0)
+{
+    var buffer = new ArrayBufferWriter<byte>();
+    using (var writer = new Utf8JsonWriter(buffer))
+    {
+        WriteQueryResponse(writer, response, epochDivisor);
+        writer.Flush();
+    }
+    await stream.WriteAsync(buffer.WrittenMemory);
+}
+
+static void WriteQueryResponse(Utf8JsonWriter writer, QueryResponse response, long epochDivisor)
+{
+    writer.WriteStartObject();
+    writer.WritePropertyName(nameof(QueryResponse.Results));
+    writer.WriteStartArray();
+    foreach (var result in response.Results)
+        WriteQueryResult(writer, result, epochDivisor);
+    writer.WriteEndArray();
+    writer.WriteEndObject();
+}
+
+static void WriteQueryResult(Utf8JsonWriter writer, QueryResult result, long epochDivisor)
+{
+    writer.WriteStartObject();
+    writer.WriteNumber(nameof(QueryResult.StatementId), result.StatementId);
+    writer.WritePropertyName(nameof(QueryResult.Series));
+    if (result.Series is null)
+    {
+        writer.WriteNullValue();
+    }
+    else
+    {
+        writer.WriteStartArray();
+        foreach (var series in result.Series)
+            WriteQuerySeries(writer, series, epochDivisor);
+        writer.WriteEndArray();
+    }
+
+    writer.WritePropertyName(nameof(QueryResult.Error));
+    if (result.Error is null)
+        writer.WriteNullValue();
+    else
+        writer.WriteStringValue(result.Error);
+    writer.WriteEndObject();
+}
+
+static void WriteQuerySeries(Utf8JsonWriter writer, QuerySeries series, long epochDivisor)
+{
+    writer.WriteStartObject();
+    writer.WriteString(nameof(QuerySeries.Name), series.Name);
+    writer.WritePropertyName(nameof(QuerySeries.Tags));
+    if (series.Tags is null)
+    {
+        writer.WriteNullValue();
+    }
+    else
+    {
+        writer.WriteStartObject();
+        foreach (var (key, value) in series.Tags)
+            writer.WriteString(key, value);
+        writer.WriteEndObject();
+    }
+
+    writer.WritePropertyName(nameof(QuerySeries.Columns));
+    writer.WriteStartArray();
+    foreach (var column in series.Columns)
+        writer.WriteStringValue(column);
+    writer.WriteEndArray();
+
+    writer.WritePropertyName(nameof(QuerySeries.Values));
+    writer.WriteStartArray();
+    var timeColumnIndex = epochDivisor > 0 ? series.Columns.FindIndex(x => string.Equals(x, "time", StringComparison.OrdinalIgnoreCase)) : -1;
+    foreach (var row in series.Values)
+    {
+        writer.WriteStartArray();
+        for (var i = 0; i < row.Count; i++)
+        {
+            if (i == timeColumnIndex && TryWriteEpochValue(writer, row[i], epochDivisor))
+                continue;
+            WriteQueryValue(writer, row[i]);
+        }
+        writer.WriteEndArray();
+    }
+    writer.WriteEndArray();
+    writer.WriteEndObject();
+}
+
+static bool TryWriteEpochValue(Utf8JsonWriter writer, object? value, long epochDivisor)
+{
+    if (value is long numeric)
+    {
+        writer.WriteNumberValue(numeric / epochDivisor);
+        return true;
+    }
+    if (value is string text && TryParseRfc3339Ns(text, out var ns))
+    {
+        writer.WriteNumberValue(ns / epochDivisor);
+        return true;
+    }
+    return false;
+}
+
+static bool TryParseRfc3339Ns(string text, out long ns)
+{
+    ns = 0;
+    var dot = text.IndexOf('.');
+    var z = text.EndsWith("Z", StringComparison.Ordinal) ? text.Length - 1 : text.Length;
+    var secondEnd = dot >= 0 ? dot : z;
+    if (!DateTimeOffset.TryParse(text[..secondEnd] + "Z", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dto))
+        return false;
+    var nanos = 0L;
+    if (dot >= 0)
+    {
+        var scale = 100_000_000L;
+        for (var i = dot + 1; i < z && scale > 0; i++, scale /= 10)
+        {
+            var ch = text[i];
+            if (ch < '0' || ch > '9') return false;
+            nanos += (ch - '0') * scale;
+        }
+    }
+    ns = checked(dto.ToUnixTimeSeconds() * 1_000_000_000L + nanos);
+    return true;
+}
+
+static long ParseEpochDivisor(string? epoch) => epoch switch
+{
+    "ns" => 1,
+    "u" or "µ" => 1_000,
+    "ms" => 1_000_000,
+    "s" => 1_000_000_000,
+    "m" => 60L * 1_000_000_000,
+    "h" => 3600L * 1_000_000_000,
+    _ => 0
+};
+
+static void WriteQueryValue(Utf8JsonWriter writer, object? value)
+{
+    switch (value)
+    {
+        case null:
+            writer.WriteNullValue();
+            break;
+        case string text:
+            writer.WriteStringValue(text);
+            break;
+        case bool boolean:
+            writer.WriteBooleanValue(boolean);
+            break;
+        case int number:
+            writer.WriteNumberValue(number);
+            break;
+        case uint number:
+            writer.WriteNumberValue(number);
+            break;
+        case long number:
+            writer.WriteNumberValue(number);
+            break;
+        case ulong number:
+            writer.WriteNumberValue(number);
+            break;
+        case short number:
+            writer.WriteNumberValue(number);
+            break;
+        case ushort number:
+            writer.WriteNumberValue(number);
+            break;
+        case byte number:
+            writer.WriteNumberValue(number);
+            break;
+        case sbyte number:
+            writer.WriteNumberValue(number);
+            break;
+        case double number:
+            writer.WriteNumberValue(number);
+            break;
+        case float number:
+            writer.WriteNumberValue(number);
+            break;
+        case decimal number:
+            writer.WriteNumberValue(number);
+            break;
+        default:
+            writer.WriteStringValue(Convert.ToString(value, CultureInfo.InvariantCulture));
+            break;
+    }
 }
 
 static void LogQueryOutcome(ILogger logger, string? db, QueryExecutionReport report, string? error)

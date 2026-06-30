@@ -284,7 +284,8 @@ public sealed class TsdbEngine : IDisposable
                     bufMatched = bufMatched.Select(p => new Point
                     {
                         Measurement = p.Measurement, Tags = p.Tags, TimestampNs = p.TimestampNs,
-                        Fields = p.Fields.Where(f => requestedFields.Contains(f.Key)).ToDictionary(f => f.Key, f => f.Value)
+                        Fields = SelectFields(p.Fields, requestedFields),
+                        TagsCanonical = p.TagsCanonical
                     });
                 res.AddRange(bufMatched);
             }
@@ -327,6 +328,79 @@ public sealed class TsdbEngine : IDisposable
         return DeduplicatePoints(res.OrderBy(x => x.TimestampNs).ToList());
     }
 
+    public bool HasSegments(string db, string rp, long? min, long? max) =>
+        _shards.ListSegments(db, rp, min, max).Count > 0;
+
+    public List<Point>? TryReadBufferedSeriesDescending(string db, string rp, string measurement, string tagsCanonical,
+        long? min, long? max, HashSet<string>? requestedFields = null, int? limit = null, CancellationToken cancellationToken = default)
+    {
+        var key = K(db, rp);
+        var seriesKey = new SeriesKey(measurement, tagsCanonical);
+        var lk = GetLock(key);
+        lk.EnterReadLock();
+        try
+        {
+            if (!_bufBySeries.TryGetValue(key, out var bySeries) || !bySeries.TryGetValue(seriesKey, out var buffered))
+                return [];
+
+            for (var i = 1; i < buffered.Count; i++)
+                if (buffered[i].Point.TimestampNs < buffered[i - 1].Point.TimestampNs)
+                    return null;
+
+            var result = new Dictionary<long, Point>();
+            HashSet<long>? cloned = null;
+            for (var i = buffered.Count - 1; i >= 0; i--)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var point = buffered[i].Point;
+                if (!Match(point, measurement, min, max)) continue;
+
+                if (requestedFields != null)
+                {
+                    point = new Point
+                    {
+                        Measurement = point.Measurement,
+                        Tags = point.Tags,
+                        Fields = SelectFields(point.Fields, requestedFields),
+                        TimestampNs = point.TimestampNs,
+                        TagsCanonical = point.TagsCanonical
+                    };
+                }
+
+                if (result.TryGetValue(point.TimestampNs, out var existing))
+                {
+                    cloned ??= [];
+                    if (cloned.Add(point.TimestampNs))
+                    {
+                        existing = new Point
+                        {
+                            Measurement = existing.Measurement,
+                            Tags = existing.Tags,
+                            Fields = new Dictionary<string, FieldValue>(existing.Fields, StringComparer.Ordinal),
+                            TimestampNs = existing.TimestampNs,
+                            TagsCanonical = existing.TagsCanonical
+                        };
+                        result[point.TimestampNs] = existing;
+                    }
+
+                    foreach (var field in point.Fields)
+                        if (!existing.Fields.ContainsKey(field.Key))
+                            existing.Fields[field.Key] = field.Value;
+                }
+                else
+                {
+                    result[point.TimestampNs] = point;
+                }
+
+                if (limit.HasValue && result.Count >= limit.Value)
+                    break;
+            }
+
+            return result.Values.ToList();
+        }
+        finally { lk.ExitReadLock(); }
+    }
+
     public IEnumerable<Point> EnumeratePoints(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, List<FieldFilter>? fieldFilters = null,
         CancellationToken cancellationToken = default)
@@ -346,7 +420,8 @@ public sealed class TsdbEngine : IDisposable
                     bufMatched = bufMatched.Select(p => new Point
                     {
                         Measurement = p.Measurement, Tags = p.Tags, TimestampNs = p.TimestampNs,
-                        Fields = p.Fields.Where(f => requestedFields.Contains(f.Key)).ToDictionary(f => f.Key, f => f.Value)
+                        Fields = SelectFields(p.Fields, requestedFields),
+                        TagsCanonical = p.TagsCanonical
                     });
                 buffered.AddRange(bufMatched);
             }
@@ -861,6 +936,15 @@ public sealed class TsdbEngine : IDisposable
     };
 
     private static long EstimateStringBytes(string? value) => string.IsNullOrEmpty(value) ? 0 : 24 + value.Length * 2L;
+
+    private static Dictionary<string, FieldValue> SelectFields(Dictionary<string, FieldValue> fields, HashSet<string> requestedFields)
+    {
+        var selected = new Dictionary<string, FieldValue>(Math.Min(fields.Count, requestedFields.Count), StringComparer.Ordinal);
+        foreach (var key in requestedFields)
+            if (fields.TryGetValue(key, out var value))
+                selected[key] = value;
+        return selected;
+    }
 
     private void AddBufferedPoints(string key, List<BufferedPoint> list, List<BufferedPoint> points)
     {

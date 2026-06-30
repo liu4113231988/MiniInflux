@@ -56,6 +56,12 @@ public sealed class QueryExecutionOutcome
     public required QueryExecutionReport Report { get; init; }
 }
 
+public sealed class QueryJsonExecutionOutcome
+{
+    public required byte[] Json { get; init; }
+    public required QueryExecutionReport Report { get; init; }
+}
+
 public sealed class QueryChunkedExecutionOutcome
 {
     public required IEnumerable<QueryResponse> Responses { get; init; }
@@ -83,6 +89,102 @@ public sealed class QueryExecutor
 
     public Task<QueryResponse> ExecuteAsync(TsdbEngine e, string? db, string q, CancellationToken cancellationToken = default)
         => Task.FromResult(ExecuteWithReport(e, db, q, cancellationToken).Response);
+
+    public QueryJsonExecutionOutcome? TryExecuteBufferedRawDescendingJson(TsdbEngine e, string? db, string query, string? epoch = null, CancellationToken cancellationToken = default)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var report = new QueryExecutionReport();
+        ParsedQuery q;
+        try
+        {
+            q = InfluxQlParser.Parse(query);
+        }
+        catch
+        {
+            return null;
+        }
+
+        if (!CanWriteBufferedRawDescendingJson(q))
+            return null;
+
+        try
+        {
+            using var timeoutCts = _maxQueryDurationMs > 0 ? new CancellationTokenSource(_maxQueryDurationMs) : null;
+            using var linkedCts = timeoutCts != null
+                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
+                : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var token = linkedCts.Token;
+
+            Req(q.SourceDatabase ?? db);
+            var sourceDb = q.SourceDatabase ?? db!;
+            var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);
+            var requestedFields = BuildRequestedFields(q);
+            var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
+            if (seriesFilter is null || seriesFilter.Count != 1 || e.HasSegments(sourceDb, sourceRp, q.MinTimeNs, q.MaxTimeNs))
+                return null;
+
+            var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+            var readLimit = checked(Math.Max(0, q.Offset ?? 0) + rowLimit);
+            var tagsCanonical = seriesFilter.First();
+            var points = e.TryReadBufferedSeriesDescending(
+                sourceDb,
+                sourceRp,
+                q.Measurement!,
+                tagsCanonical,
+                q.MinTimeNs,
+                q.MaxTimeNs,
+                requestedFields,
+                readLimit,
+                token);
+            if (points is null)
+                return null;
+
+            var resultMeasurement = ResolveResultMeasurementName(q);
+            var fields = ResolveRawFields(e, sourceDb, q, requestedFields);
+            var seriesTags = ParseTagsCanonical(tagsCanonical);
+            var cols = new List<string>(1 + fields.Count) { "time" };
+            cols.AddRange(fields);
+
+            var offset = Math.Max(0, q.Offset ?? 0);
+            var epochDivisor = ParseEpochDivisor(epoch);
+            var resultBytes = EstimateRawSeriesShellBytes(resultMeasurement, cols);
+            report.ScannedPoints = points.Count;
+            report.EstimatedInputBytes = EstimatePointsBytes(points);
+
+            var buffer = new System.Buffers.ArrayBufferWriter<byte>();
+            using (var writer = new System.Text.Json.Utf8JsonWriter(buffer))
+                WriteRawJsonResponse(writer, resultMeasurement, seriesTags, cols, fields, points, offset, rowLimit, epochDivisor, report, ref resultBytes);
+
+            sw.Stop();
+            report.DurationMs = sw.ElapsedMilliseconds;
+            report.EstimatedResultBytes = resultBytes;
+            report.PeakEstimatedMemoryBytes = report.EstimatedInputBytes + resultBytes;
+            return new QueryJsonExecutionOutcome { Json = buffer.WrittenSpan.ToArray(), Report = report };
+        }
+        catch (OperationCanceledException) when (_maxQueryDurationMs > 0 && !cancellationToken.IsCancellationRequested)
+        {
+            sw.Stop();
+            report.DurationMs = sw.ElapsedMilliseconds;
+            report.TimedOut = true;
+            report.Error = $"query timed out after {_maxQueryDurationMs} ms";
+            return ErrorJsonOutcome(report);
+        }
+        catch (OperationCanceledException)
+        {
+            sw.Stop();
+            report.DurationMs = sw.ElapsedMilliseconds;
+            report.Canceled = true;
+            report.Error = "query canceled";
+            return ErrorJsonOutcome(report);
+        }
+        catch (Exception ex)
+        {
+            sw.Stop();
+            report.DurationMs = sw.ElapsedMilliseconds;
+            report.Error = ex.Message;
+            return ErrorJsonOutcome(report);
+        }
+    }
 
     public QueryChunkedExecutionOutcome ExecuteChunkedWithReport(TsdbEngine e, string? db, string q, int chunkSize, CancellationToken cancellationToken = default)
     {
@@ -559,6 +661,9 @@ public sealed class QueryExecutor
                 requestedFields.Add(filter.Field);
 
         List<Point> pts;
+        var pointsAreDescending = false;
+        var tagFiltersApplied = false;
+        var filtersMayChangePoints = true;
         if (q.Subquery != null)
         {
             var innerSeries = Run(e, db, q.Subquery, cancellationToken, report) ?? [];
@@ -595,7 +700,18 @@ public sealed class QueryExecutor
                 }
             }
 
-            pts = e.ReadAllPoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken);
+            var descendingPoints = TryReadBufferedRawDescending(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, _maxResponseRows, cancellationToken);
+            if (descendingPoints != null)
+            {
+                pts = descendingPoints;
+                pointsAreDescending = true;
+                tagFiltersApplied = true;
+                filtersMayChangePoints = q.FieldFilters.Count != 0;
+            }
+            else
+            {
+                pts = e.ReadAllPoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken);
+            }
             EnsureQueryPointLimit(pts.Count);
             report.ScannedPoints += pts.Count;
             report.EstimatedInputBytes = EstimatePointsBytes(pts);
@@ -604,12 +720,12 @@ public sealed class QueryExecutor
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        pts = ApplyTagFilters(pts, q.TagFilters);
+        if (!tagFiltersApplied) pts = ApplyTagFilters(pts, q.TagFilters);
         cancellationToken.ThrowIfCancellationRequested();
         pts = ApplyFieldFilters(pts, q.FieldFilters);
-        if (q.Desc) pts = pts.OrderByDescending(x => x.TimestampNs).ToList();
+        if (q.Desc && !pointsAreDescending) pts.Reverse();
 
-        var filteredInputBytes = EstimatePointsBytes(pts);
+        var filteredInputBytes = filtersMayChangePoints ? EstimatePointsBytes(pts) : report.EstimatedInputBytes;
         report.EstimatedInputBytes = Math.Max(report.EstimatedInputBytes, filteredInputBytes);
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes);
 
@@ -654,24 +770,32 @@ public sealed class QueryExecutor
         }
 
         var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
-        pts = pts.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
+        if (!pointsAreDescending || (q.Offset ?? 0) != 0)
+            pts = pts.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
 
         var fields = q.Select.Count == 1 && q.Select[0].Field == "*"
-            ? pts.SelectMany(p => p.Fields.Keys).Distinct().Order().ToList()
+            ? pointsAreDescending
+                ? ResolveRawFields(e, sourceDb, q, requestedFields)
+                : pts.SelectMany(p => p.Fields.Keys).Distinct().Order().ToList()
             : q.Select.Select(x => x.Field).ToList();
-        var tags = pts.SelectMany(p => p.Tags.Keys).Distinct().Order().ToList();
+        var tags = pointsAreDescending && pts.Count > 0
+            ? pts[0].Tags.Keys.Order().ToList()
+            : pts.SelectMany(p => p.Tags.Keys).Distinct().Order().ToList();
         var cols = new List<string> { "time" };
         cols.AddRange(tags);
         cols.AddRange(fields);
 
-        var vals = new List<List<object?>>();
+        var vals = new List<List<object?>>(pts.Count);
+        var rowCapacity = 1 + tags.Count + fields.Count;
+        var rawResultBytes = EstimateRawSeriesShellBytes(resultMeasurement, cols);
         foreach (var p in pts)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var row = new List<object?> { Time(p.TimestampNs) };
+            var row = new List<object?>(rowCapacity) { Time(p.TimestampNs) };
             foreach (var t in tags) row.Add(p.Tags.TryGetValue(t, out var v) ? v : null);
             foreach (var f in fields) row.Add(p.Fields.TryGetValue(f, out var v) ? v.ToObject() : null);
             vals.Add(row);
+            rawResultBytes += 32 + EstimateRowBytes(row);
         }
 
         EnsureWithinLimit(vals.Count);
@@ -685,7 +809,7 @@ public sealed class QueryExecutor
                 TagColumns = new HashSet<string>(tags, StringComparer.Ordinal)
             }
         ];
-        report.EstimatedResultBytes = EstimateQuerySeriesBytes(rawResult);
+        report.EstimatedResultBytes = rawResultBytes;
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + report.EstimatedResultBytes);
         EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
         if (!string.IsNullOrWhiteSpace(q.IntoTarget))
@@ -696,6 +820,28 @@ public sealed class QueryExecutor
             ExecuteSelectInto(e, sourceDb, q, rawResult);
         }
         return rawResult;
+    }
+
+    static List<Point>? TryReadBufferedRawDescending(TsdbEngine e, string sourceDb, string sourceRp, ParsedQuery q,
+        HashSet<string>? requestedFields, HashSet<string>? seriesFilter, int maxResponseRows, CancellationToken cancellationToken)
+    {
+        if (!q.Desc
+            || q.Subquery != null
+            || q.GroupByNs.HasValue
+            || q.GroupByTags.Count > 0
+            || q.GroupByAllTags
+            || q.Select.Any(s => !string.IsNullOrEmpty(s.Func))
+            || !string.IsNullOrWhiteSpace(q.IntoTarget)
+            || string.IsNullOrWhiteSpace(q.Measurement)
+            || seriesFilter == null
+            || seriesFilter.Count != 1
+            || q.FieldFilters.Count != 0
+            || e.HasSegments(sourceDb, sourceRp, q.MinTimeNs, q.MaxTimeNs))
+            return null;
+
+        var rowLimit = Math.Min(q.Limit ?? maxResponseRows, maxResponseRows);
+        var readLimit = checked(Math.Max(0, q.Offset ?? 0) + rowLimit);
+        return e.TryReadBufferedSeriesDescending(sourceDb, sourceRp, q.Measurement, seriesFilter.First(), q.MinTimeNs, q.MaxTimeNs, requestedFields, readLimit, cancellationToken);
     }
 
     List<QuerySeries> AggGroupBy(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken, string resultMeasurement)
@@ -1188,6 +1334,14 @@ public sealed class QueryExecutor
             foreach (var row in series.Values)
                 size += 32 + row.Sum(EstimateObjectBytes);
         }
+        return size;
+    }
+
+    static long EstimateRowBytes(List<object?> row)
+    {
+        long size = 0;
+        foreach (var value in row)
+            size += EstimateObjectBytes(value);
         return size;
     }
 
@@ -1859,6 +2013,163 @@ public sealed class QueryExecutor
         && !q.Desc
         && !string.IsNullOrWhiteSpace(q.Measurement);
 
+    static bool CanWriteBufferedRawDescendingJson(ParsedQuery q) =>
+        q.Kind == QueryKind.Select
+        && q.Subquery == null
+        && q.GroupByNs == null
+        && q.GroupByTags.Count == 0
+        && !q.GroupByAllTags
+        && q.Select.All(s => string.IsNullOrEmpty(s.Func))
+        && string.IsNullOrWhiteSpace(q.IntoTarget)
+        && q.Desc
+        && q.FieldFilters.Count == 0
+        && !string.IsNullOrWhiteSpace(q.Measurement);
+
+    static QueryJsonExecutionOutcome ErrorJsonOutcome(QueryExecutionReport report)
+    {
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>();
+        using (var writer = new System.Text.Json.Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartObject();
+            writer.WritePropertyName(nameof(QueryResponse.Results));
+            writer.WriteStartArray();
+            writer.WriteStartObject();
+            writer.WriteNumber(nameof(QueryResult.StatementId), 0);
+            writer.WritePropertyName(nameof(QueryResult.Series));
+            writer.WriteNullValue();
+            writer.WriteString(nameof(QueryResult.Error), report.Error);
+            writer.WriteEndObject();
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+        }
+        return new QueryJsonExecutionOutcome { Json = buffer.WrittenSpan.ToArray(), Report = report };
+    }
+
+    static void WriteRawJsonResponse(
+        System.Text.Json.Utf8JsonWriter writer,
+        string measurement,
+        Dictionary<string, string> seriesTags,
+        List<string> columns,
+        List<string> fields,
+        List<Point> points,
+        int offset,
+        int rowLimit,
+        long epochDivisor,
+        QueryExecutionReport report,
+        ref long resultBytes)
+    {
+        writer.WriteStartObject();
+        writer.WritePropertyName(nameof(QueryResponse.Results));
+        writer.WriteStartArray();
+        writer.WriteStartObject();
+        writer.WriteNumber(nameof(QueryResult.StatementId), 0);
+        writer.WritePropertyName(nameof(QueryResult.Series));
+        writer.WriteStartArray();
+        writer.WriteStartObject();
+        writer.WriteString(nameof(QuerySeries.Name), measurement);
+        writer.WritePropertyName(nameof(QuerySeries.Tags));
+        if (seriesTags.Count == 0)
+        {
+            writer.WriteNullValue();
+        }
+        else
+        {
+            writer.WriteStartObject();
+            foreach (var (key, value) in seriesTags)
+                writer.WriteString(key, value);
+            writer.WriteEndObject();
+        }
+        writer.WritePropertyName(nameof(QuerySeries.Columns));
+        writer.WriteStartArray();
+        foreach (var column in columns)
+            writer.WriteStringValue(column);
+        writer.WriteEndArray();
+        writer.WritePropertyName(nameof(QuerySeries.Values));
+        writer.WriteStartArray();
+
+        var emitted = 0;
+        for (var i = offset; i < points.Count && emitted < rowLimit; i++)
+        {
+            var point = points[i];
+            writer.WriteStartArray();
+            long rowBytes = 32;
+            if (epochDivisor > 0)
+            {
+                var timestamp = point.TimestampNs / epochDivisor;
+                writer.WriteNumberValue(timestamp);
+                rowBytes += EstimateObjectBytes(timestamp);
+            }
+            else
+            {
+                var timestamp = Time(point.TimestampNs);
+                writer.WriteStringValue(timestamp);
+                rowBytes += EstimateObjectBytes(timestamp);
+            }
+            foreach (var field in fields)
+            {
+                point.Fields.TryGetValue(field, out var fieldValue);
+                var value = fieldValue.ToObject();
+                WriteRawJsonValue(writer, value);
+                rowBytes += EstimateObjectBytes(value);
+            }
+            writer.WriteEndArray();
+            emitted++;
+            resultBytes += rowBytes;
+        }
+
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+        writer.WriteEndArray();
+        writer.WritePropertyName(nameof(QueryResult.Error));
+        writer.WriteNullValue();
+        writer.WriteEndObject();
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+        report.RowsReturned = emitted;
+    }
+
+    static long ParseEpochDivisor(string? epoch) => epoch switch
+    {
+        "ns" => 1,
+        "u" or "µ" => 1_000,
+        "ms" => 1_000_000,
+        "s" => 1_000_000_000,
+        "m" => 60L * 1_000_000_000,
+        "h" => 3600L * 1_000_000_000,
+        _ => 0
+    };
+
+    static void WriteRawJsonValue(System.Text.Json.Utf8JsonWriter writer, object? value)
+    {
+        switch (value)
+        {
+            case null:
+                writer.WriteNullValue();
+                break;
+            case string text:
+                writer.WriteStringValue(text);
+                break;
+            case bool boolean:
+                writer.WriteBooleanValue(boolean);
+                break;
+            case int number:
+                writer.WriteNumberValue(number);
+                break;
+            case long number:
+                writer.WriteNumberValue(number);
+                break;
+            case double number:
+                writer.WriteNumberValue(number);
+                break;
+            case float number:
+                writer.WriteNumberValue(number);
+                break;
+            default:
+                writer.WriteStringValue(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture));
+                break;
+        }
+    }
+
     static HashSet<string>? BuildRequestedFields(ParsedQuery q)
     {
         HashSet<string>? requestedFields = null;
@@ -1939,7 +2250,7 @@ public sealed class QueryExecutor
 
     static List<object?> BuildRawRow(Point point, List<string> tags, List<string> fields)
     {
-        var row = new List<object?> { Time(point.TimestampNs) };
+        var row = new List<object?>(1 + tags.Count + fields.Count) { Time(point.TimestampNs) };
         foreach (var tag in tags)
             row.Add(point.Tags.TryGetValue(tag, out var value) ? value : null);
         foreach (var field in fields)
