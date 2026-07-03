@@ -99,6 +99,31 @@ public class IndexTests : IDisposable
     }
 
     [Fact]
+    public async Task ListTagKeys_UsesIndex()
+    {
+        await _engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { { "host", "server01" }, { "region", "us-east" } },
+                Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(1.0) } },
+                TimestampNs = 1000_000_000
+            },
+            new Point
+            {
+                Measurement = "mem",
+                Tags = new Dictionary<string, string> { { "host", "server01" }, { "rack", "r1" } },
+                Fields = new Dictionary<string, FieldValue> { { "used", FieldValue.FromInteger(1024) } },
+                TimestampNs = 1000_000_000
+            }
+        ]);
+
+        Assert.Equal(["host", "region"], _engine.ListTagKeys("testdb", "cpu"));
+        Assert.Equal(["host", "rack", "region"], _engine.ListTagKeys("testdb", null));
+    }
+
+    [Fact]
     public async Task ListTagValues_UsesIndex()
     {
         var points = new List<Point>

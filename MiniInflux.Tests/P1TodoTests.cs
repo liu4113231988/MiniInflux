@@ -76,6 +76,8 @@ public class P1TodoTests : IDisposable
         var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb", "SELECT sum(value),count(value),max(value),mean(value) FROM cpu");
 
         Assert.True(outcome.Report.UsedAggregatePushdown);
+        Assert.True(outcome.Report.SegmentMetadataFooterHits > 0);
+        Assert.Equal(0, outcome.Report.SegmentMetadataFullReads);
         var row = Assert.Single(outcome.Response.Results[0].Series![0].Values);
         Assert.Equal(6.0, row[1]);
         Assert.Equal(3, row[2]);
@@ -163,6 +165,22 @@ public class P1TodoTests : IDisposable
         var series = outcome.Response.Results[0].Series;
         Assert.NotNull(series);
         Assert.Equal(2, series.Count);
+    }
+
+    [Fact]
+    public async Task Query_IgnoresSegmentFilesMissingFromManifest()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0);
+        await engine.WriteAsync("testdb", "autogen", [Point("cpu", 1, "server01")]);
+        engine.FlushAll();
+        var shard = Assert.Single(engine.Meta.GetShards("testdb", "autogen"));
+        var shardDir = Path.Combine(_testDir, "db", "testdb", "autogen", "shards", shard.Id.ToString("D6"));
+        var segment = Assert.Single(shard.SegmentFiles);
+        File.Copy(Path.Combine(shardDir, segment), Path.Combine(shardDir, "orphan.seg"));
+
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
+
+        Assert.Single(points);
     }
 
     [Fact]

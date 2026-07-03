@@ -1,0 +1,1 @@
+{"Databases":{"benchmini":{"RetentionPolicies":{"autogen":{"Name":"autogen","DurationNs":0,"Replication":1,"IsDefault":true,"ShardGroups":[],"DurationMs":0}},"ContinuousQueries":{},"SeriesIndex":{},"TagIndex":{},"TagSeriesIndex":{}}}}

@@ -267,16 +267,15 @@ public sealed class Compactor
         }
 
         var merged = MergeColumns(filtered);
-        var points = ColumnsToPoints(merged);
-        if (points.Count == 0) return false;
+        if (merged.Count == 0) return false;
 
-        foreach (var group in points.GroupBy(p => p.Measurement))
-            _schema.ValidateAndRegister(db, group.Key, group);
-
+        _schema.ValidateAndRegisterColumns(db, merged);
         var shardDir = _shardManager.ShardDir(db, rp, shard.Id);
         var mergedPath = Path.Combine(shardDir, $"l{outputLevel}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
-        SegmentWriter.WriteSegment(mergedPath, points);
-        _manifest.UpdateIndexes(db, points.Select(p => (p.Measurement, SeriesKey.From(p).TagsCanonical, p.Tags)));
+        SegmentWriter.WriteColumns(mergedPath, merged);
+        _manifest.UpdateIndexes(db, merged
+            .GroupBy(c => (c.Measurement, c.TagsCanonical))
+            .Select(g => (g.Key.Measurement, g.Key.TagsCanonical, ParseTags(g.Key.TagsCanonical))));
         return FinalizeCompaction(db, rp, shard.Id, orderedInputs, mergedPath);
     }
 

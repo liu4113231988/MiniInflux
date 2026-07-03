@@ -142,6 +142,36 @@ public class SegmentTests : IDisposable
     }
 
     [Fact]
+    public void ReadMetadata_V4Footer_DoesNotRequireColumnPayload()
+    {
+        var points = Enumerable.Range(0, 128)
+            .Select(i => new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(i) },
+                TimestampNs = 1_000 + i
+            })
+            .ToList();
+
+        var segPath = Path.Combine(_testDir, "metadata-footer.seg");
+        SegmentWriter.WriteSegment(segPath, points);
+        using (var fs = new FileStream(segPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+        {
+            fs.Position = 32;
+            fs.WriteByte(0xff);
+        }
+
+        var meta = Assert.Single(SegmentReader.ReadMetadata(segPath));
+
+        Assert.Equal("cpu", meta.Measurement);
+        Assert.Equal("host=server01", meta.TagsCanonical);
+        Assert.Equal("value", meta.Field);
+        Assert.Equal(128, meta.PointCount);
+        Assert.Throws<InvalidDataException>(() => SegmentReader.ReadSegment(segPath));
+    }
+
+    [Fact]
     public void ReadSegment_WithColumnPredicatePushdown_SkipsIrrelevantColumnsBeforeDecode()
     {
         var points = new List<Point>

@@ -128,20 +128,21 @@ public sealed class TombstoneStore
             if (!_tombstones.TryGetValue(db, out var list) || list.Count == 0)
                 return (timestamps, values);
 
-            var matching = list.Where(t =>
-                t.Measurement == measurement &&
-                (t.TagsCanonical == null || t.TagsCanonical == tagsCanonical)).ToList();
+            var ranges = BuildMergedRanges(list, measurement, tagsCanonical);
 
-            if (matching.Count == 0) return (timestamps, values);
+            if (ranges.Count == 0) return (timestamps, values);
 
             var filteredTs = new List<long>();
             var filteredVals = new List<FieldValue>();
+            var rangeIndex = 0;
             for (int i = 0; i < timestamps.Count; i++)
             {
                 var ts = timestamps[i];
-                var deleted = matching.Any(t =>
-                    (!t.MinTimeNs.HasValue || t.MinTimeNs.Value <= ts) &&
-                    (!t.MaxTimeNs.HasValue || t.MaxTimeNs.Value >= ts));
+                while (rangeIndex < ranges.Count && ranges[rangeIndex].Max < ts)
+                    rangeIndex++;
+                var deleted = rangeIndex < ranges.Count
+                    && ranges[rangeIndex].Min <= ts
+                    && ranges[rangeIndex].Max >= ts;
                 if (!deleted)
                 {
                     filteredTs.Add(ts);
@@ -169,6 +170,29 @@ public sealed class TombstoneStore
             (t.TagsCanonical == null || t.TagsCanonical == sk.TagsCanonical) &&
             (!t.MinTimeNs.HasValue || t.MinTimeNs.Value <= p.TimestampNs) &&
             (!t.MaxTimeNs.HasValue || t.MaxTimeNs.Value >= p.TimestampNs));
+    }
+
+    private static List<(long Min, long Max)> BuildMergedRanges(List<Tombstone> tombstones, string measurement, string tagsCanonical)
+    {
+        var ranges = tombstones
+            .Where(t => t.Measurement == measurement && (t.TagsCanonical == null || t.TagsCanonical == tagsCanonical))
+            .Select(t => (Min: t.MinTimeNs ?? long.MinValue, Max: t.MaxTimeNs ?? long.MaxValue))
+            .OrderBy(t => t.Min)
+            .ToList();
+        if (ranges.Count <= 1)
+            return ranges;
+
+        var merged = new List<(long Min, long Max)> { ranges[0] };
+        for (var i = 1; i < ranges.Count; i++)
+        {
+            var last = merged[^1];
+            var current = ranges[i];
+            if (current.Min <= last.Max)
+                merged[^1] = (last.Min, Math.Max(last.Max, current.Max));
+            else
+                merged.Add(current);
+        }
+        return merged;
     }
 
     private List<Tombstone> GetList(string db)

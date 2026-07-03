@@ -13,8 +13,7 @@ public sealed class SchemaRegistry
     private readonly string _schemaPath;
     private readonly object _lock = new();
     private readonly int _maxFieldsPerMeasurement;
-    // Key: "db|measurement|fieldKey" -> FieldKind
-    private readonly Dictionary<string, FieldKind> _schema = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Dictionary<string, Dictionary<string, FieldKind>>> _schema = new(StringComparer.Ordinal);
 
     public SchemaRegistry(string dataPath, int maxFieldsPerMeasurement = 1024)
     {
@@ -24,9 +23,6 @@ public sealed class SchemaRegistry
         _maxFieldsPerMeasurement = maxFieldsPerMeasurement;
         Load();
     }
-
-    private string MakeKey(string db, string measurement, string fieldKey) =>
-        $"{db}|{measurement}|{fieldKey}";
 
     /// <summary>
     /// Validate and register field types for a batch of points.
@@ -54,32 +50,35 @@ public sealed class SchemaRegistry
 
         lock (_lock)
         {
-            var changed = false;
-            foreach (var field in batchFields)
+            var changed = RegisterFieldsLocked(db, measurement, batchFields);
+
+            if (changed)
+                Save();
+        }
+    }
+
+    public void ValidateAndRegisterColumns(string db, IEnumerable<SegmentColumn> columns)
+    {
+        var byMeasurement = new Dictionary<string, Dictionary<string, FieldKind>>(StringComparer.Ordinal);
+        foreach (var column in columns)
+        {
+            if (!byMeasurement.TryGetValue(column.Measurement, out var fields))
             {
-                var key = MakeKey(db, measurement, field.Key);
-                if (_schema.TryGetValue(key, out var existing))
-                {
-                    if (existing != field.Value)
-                        throw new FieldConflictException(
-                            $"field type conflict: {measurement}.{field.Key} is {existing}, got {field.Value}");
-                }
-                else
-                {
-                    _schema[key] = field.Value;
-                    changed = true;
-                }
+                fields = new(StringComparer.Ordinal);
+                byMeasurement[column.Measurement] = fields;
             }
 
-            // Enforce max fields per measurement
-            if (_maxFieldsPerMeasurement > 0)
-            {
-                var prefix = $"{db}|{measurement}|";
-                var fieldCount = _schema.Count(k => k.Key.StartsWith(prefix, StringComparison.Ordinal));
-                if (fieldCount > _maxFieldsPerMeasurement)
-                    throw new FieldConflictException(
-                        $"max fields per measurement exceeded: {measurement} has {fieldCount} fields (limit: {_maxFieldsPerMeasurement})");
-            }
+            if (fields.TryGetValue(column.Field, out var existing) && existing != column.Kind)
+                throw new FieldConflictException(
+                    $"field type conflict: {column.Measurement}.{column.Field} is {existing}, got {column.Kind}");
+            fields[column.Field] = column.Kind;
+        }
+
+        lock (_lock)
+        {
+            var changed = false;
+            foreach (var (measurement, fields) in byMeasurement)
+                changed |= RegisterFieldsLocked(db, measurement, fields);
 
             if (changed)
                 Save();
@@ -93,7 +92,11 @@ public sealed class SchemaRegistry
     {
         lock (_lock)
         {
-            return _schema.TryGetValue(MakeKey(db, measurement, fieldKey), out var kind) ? kind : null;
+            return _schema.TryGetValue(db, out var measurements)
+                && measurements.TryGetValue(measurement, out var fields)
+                && fields.TryGetValue(fieldKey, out var kind)
+                ? kind
+                : null;
         }
     }
 
@@ -104,15 +107,13 @@ public sealed class SchemaRegistry
     {
         lock (_lock)
         {
-            var prefix = measurement != null ? $"{db}|{measurement}|" : $"{db}|";
-            return _schema
-                .Where(kv => kv.Key.StartsWith(prefix, StringComparison.Ordinal))
-                .Select(kv =>
-                {
-                    var parts = kv.Key.Split('|');
-                    return (parts[2], kv.Value);
-                })
-                .ToList();
+            if (!_schema.TryGetValue(db, out var measurements))
+                return [];
+            if (measurement != null)
+                return measurements.TryGetValue(measurement, out var fields)
+                    ? fields.Select(kv => (kv.Key, kv.Value)).ToList()
+                    : [];
+            return measurements.Values.SelectMany(fields => fields.Select(kv => (kv.Key, kv.Value))).ToList();
         }
     }
 
@@ -120,13 +121,9 @@ public sealed class SchemaRegistry
     {
         lock (_lock)
         {
-            var prefix = $"{db}|";
-            return _schema.Keys
-                .Where(k => k.StartsWith(prefix, StringComparison.Ordinal))
-                .Select(k => k.Split('|')[1])
-                .Distinct(StringComparer.Ordinal)
-                .Order()
-                .ToArray();
+            return _schema.TryGetValue(db, out var measurements)
+                ? measurements.Keys.Order().ToArray()
+                : [];
         }
     }
 
@@ -139,21 +136,61 @@ public sealed class SchemaRegistry
             var entries = JsonSerializer.Deserialize(json, SchemaJsonContext.Default.ListSchemaEntry);
             if (entries == null) return;
             foreach (var e in entries)
-                _schema[MakeKey(e.Db, e.Measurement, e.Field)] = (FieldKind)e.Kind;
+                GetFieldsMap(e.Db, e.Measurement)[e.Field] = (FieldKind)e.Kind;
         }
         catch { /* corrupted schema, start fresh */ }
     }
 
     private void Save()
     {
-        var entries = _schema.Select(kv =>
-        {
-            var parts = kv.Key.Split('|');
-            return new SchemaEntry(parts[0], parts[1], parts[2], (byte)kv.Value);
-        }).ToList();
+        var entries = _schema.SelectMany(db =>
+            db.Value.SelectMany(measurement =>
+                measurement.Value.Select(field =>
+                    new SchemaEntry(db.Key, measurement.Key, field.Key, (byte)field.Value)))).ToList();
 
         var json = JsonSerializer.Serialize(entries, SchemaJsonContext.Default.ListSchemaEntry);
         File.WriteAllText(_schemaPath, json);
+    }
+
+    private bool RegisterFieldsLocked(string db, string measurement, Dictionary<string, FieldKind> batchFields)
+    {
+        var fields = GetFieldsMap(db, measurement);
+        var changed = false;
+        foreach (var field in batchFields)
+        {
+            if (fields.TryGetValue(field.Key, out var existing))
+            {
+                if (existing != field.Value)
+                    throw new FieldConflictException(
+                        $"field type conflict: {measurement}.{field.Key} is {existing}, got {field.Value}");
+            }
+            else
+            {
+                fields[field.Key] = field.Value;
+                changed = true;
+            }
+        }
+
+        if (_maxFieldsPerMeasurement > 0 && fields.Count > _maxFieldsPerMeasurement)
+            throw new FieldConflictException(
+                $"max fields per measurement exceeded: {measurement} has {fields.Count} fields (limit: {_maxFieldsPerMeasurement})");
+
+        return changed;
+    }
+
+    private Dictionary<string, FieldKind> GetFieldsMap(string db, string measurement)
+    {
+        if (!_schema.TryGetValue(db, out var measurements))
+        {
+            measurements = new(StringComparer.Ordinal);
+            _schema[db] = measurements;
+        }
+        if (!measurements.TryGetValue(measurement, out var fields))
+        {
+            fields = new(StringComparer.Ordinal);
+            measurements[measurement] = fields;
+        }
+        return fields;
     }
 }
 

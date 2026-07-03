@@ -22,9 +22,14 @@ public sealed record SegmentColumnMeta(
     BlockCompressionKind TimestampCompression = BlockCompressionKind.Brotli,
     BlockCompressionKind ValueCompression = BlockCompressionKind.Brotli);
 
+public sealed record SegmentMetadataReadResult(List<SegmentColumnMeta> Metadata, bool UsedFooter);
+
 public static class SegmentReader
 {
     private const uint Magic = 0x4D545344;
+    private const uint MetadataMagic = 0x4D455441;
+    private const uint MetadataFooterMagic = 0x4D455446;
+    private const int MetadataFooterSize = 16;
 
     public static List<SegmentColumn> ReadSegment(string path)
     {
@@ -92,6 +97,14 @@ public static class SegmentReader
 
     public static List<SegmentColumnMeta> ReadMetadata(string path)
     {
+        return ReadMetadataWithInfo(path).Metadata;
+    }
+
+    public static SegmentMetadataReadResult ReadMetadataWithInfo(string path)
+    {
+        if (TryReadFooterMetadata(path, out var metadata))
+            return new SegmentMetadataReadResult(metadata, true);
+
         var allBytes = File.ReadAllBytes(path);
         if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
         var dataBytes = allBytes.AsSpan(0, allBytes.Length - 4);
@@ -118,7 +131,45 @@ public static class SegmentReader
             result.Add(new SegmentColumnMeta(m, tags, f, k, min, max, pc, stats,
                 codecs.TimestampCodec, codecs.ValueCodec, codecs.TimestampCompression, codecs.ValueCompression));
         }
-        return result;
+        return new SegmentMetadataReadResult(result, false);
+    }
+
+    private static bool TryReadFooterMetadata(string path, out List<SegmentColumnMeta> metadata)
+    {
+        metadata = [];
+        var length = new FileInfo(path).Length;
+        if (length < 4 + MetadataFooterSize + 4)
+            return false;
+
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        fs.Position = length - 4 - MetadataFooterSize;
+        Span<byte> footer = stackalloc byte[MetadataFooterSize];
+        if (fs.Read(footer) != MetadataFooterSize)
+            return false;
+        var metadataOffset = BitConverter.ToInt64(footer[..8]);
+        var metadataLength = BitConverter.ToInt32(footer.Slice(8, 4));
+        var footerMagic = BitConverter.ToUInt32(footer.Slice(12, 4));
+        if (footerMagic != MetadataFooterMagic || metadataOffset <= 0 || metadataLength <= 8)
+            return false;
+        if (metadataOffset + metadataLength > length - 4 - MetadataFooterSize)
+            return false;
+
+        var block = new byte[metadataLength];
+        fs.Position = metadataOffset;
+        if (fs.Read(block, 0, block.Length) != block.Length)
+            return false;
+
+        using var ms = new MemoryStream(block);
+        using var br = new BinaryReader(ms, Encoding.UTF8);
+        if (br.ReadUInt32() != MetadataMagic)
+            return false;
+
+        var count = br.ReadInt32();
+        var result = new List<SegmentColumnMeta>(count);
+        for (var i = 0; i < count; i++)
+            result.Add(ReadMetadataEntry(br));
+        metadata = result;
+        return true;
     }
 
     private static (TimestampCodecKind TimestampCodec, BlockCompressionKind TimestampCompression, ValueCodecKind ValueCodec, BlockCompressionKind ValueCompression) ReadCodecInfo(byte version, BinaryReader br)
@@ -136,7 +187,7 @@ public static class SegmentReader
     private static (byte Version, int Count) ReadVersionAndCount(BinaryReader br, MemoryStream ms)
     {
         var nextBytes = br.ReadBytes(5);
-        if (nextBytes[0] is 2 or 3)
+        if (nextBytes[0] is >= 2 and <= 4)
             return (nextBytes[0], BitConverter.ToInt32(nextBytes, 1));
         // v1: no version byte, first 4 bytes are columnCount, 5th byte belongs to first column
         ms.Position -= 1;
@@ -182,4 +233,22 @@ public static class SegmentReader
 
     private static string ReadString(BinaryReader br)
     { int len = br.ReadInt32(); return Encoding.UTF8.GetString(br.ReadBytes(len)); }
+
+    private static SegmentColumnMeta ReadMetadataEntry(BinaryReader br)
+    {
+        var measurement = ReadString(br);
+        var tags = ReadString(br);
+        var field = ReadString(br);
+        var kind = (FieldKind)br.ReadByte();
+        var min = br.ReadInt64();
+        var max = br.ReadInt64();
+        var count = br.ReadInt32();
+        var timestampCodec = (TimestampCodecKind)br.ReadByte();
+        var timestampCompression = (BlockCompressionKind)br.ReadByte();
+        var valueCodec = (ValueCodecKind)br.ReadByte();
+        var valueCompression = (BlockCompressionKind)br.ReadByte();
+        var stats = new BlockStats(br.ReadDouble(), br.ReadDouble(), br.ReadDouble(), br.ReadInt32());
+        return new SegmentColumnMeta(measurement, tags, field, kind, min, max, count, stats,
+            timestampCodec, valueCodec, timestampCompression, valueCompression);
+    }
 }

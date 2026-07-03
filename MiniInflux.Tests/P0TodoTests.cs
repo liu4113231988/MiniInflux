@@ -103,6 +103,65 @@ public class P0TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task RawSelect_UsesStreamingScanForNormalQuery()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+            Enumerable.Range(0, 100).Select(i => Point("cpu", i, "server01", i)).ToList());
+
+        var outcome = new QueryExecutor()
+            .ExecuteWithReport(engine, "testdb", "SELECT value FROM cpu LIMIT 20");
+
+        var rows = outcome.Response.Results[0].Series![0].Values;
+        Assert.True(outcome.Report.UsedStreamingRawSelect);
+        Assert.Equal(20, rows.Count);
+        Assert.Equal(20, outcome.Report.RowsReturned);
+    }
+
+    [Fact]
+    public async Task RawSelect_WithSegments_UsesBufferedMaterializedPath()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0);
+        await engine.WriteAsync("testdb", "autogen", [Point("cpu", 2, "server01", 2)]);
+        await engine.WriteAsync("testdb", "autogen", [Point("cpu", 1, "server01", 1)]);
+        engine.FlushAll();
+
+        var outcome = new QueryExecutor()
+            .ExecuteWithReport(engine, "testdb", "SELECT value FROM cpu LIMIT 2");
+
+        var rows = outcome.Response.Results[0].Series![0].Values;
+        Assert.False(outcome.Report.UsedStreamingRawSelect);
+        Assert.Equal("1970-01-01T00:00:00.000000001Z", rows[0][0]);
+        Assert.Equal("1970-01-01T00:00:00.000000002Z", rows[1][0]);
+    }
+
+    [Fact]
+    public async Task GroupByTimeAndTag_UsesStreamingAggregate()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", 1, "server01", 1),
+            Point("cpu", 3, "server01", 9),
+            Point("cpu", 10, "server01", 11),
+            Point("cpu", 20, "server02", 12)
+        ]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(
+            engine,
+            "testdb",
+            "SELECT mean(value),count(value),max(value) FROM cpu GROUP BY time(10ns),host");
+
+        Assert.True(outcome.Report.UsedStreamingAggregate);
+        var series = outcome.Response.Results[0].Series!;
+        var server01 = Assert.Single(series, s => s.Tags?["host"] == "server01");
+        Assert.Equal(2, server01.Values.Count);
+        Assert.Equal(2.0, server01.Values[0][1]);
+        Assert.Equal(2, server01.Values[0][2]);
+        Assert.Equal(3.0, server01.Values[0][3]);
+    }
+
+    [Fact]
     public void WalReplay_IgnoresInterruptedCheckpointTempFile()
     {
         var walDir = Path.Combine(_testDir, "wal");

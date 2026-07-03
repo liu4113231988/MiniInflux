@@ -433,13 +433,22 @@ public sealed class Manifest
     /// </summary>
     public IReadOnlyList<string> GetSeries(string db, string? measurement)
     {
+        string[] snapshot;
         lock (_lock)
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
             if (measurement != null)
-                return dbInfo.SeriesIndex.TryGetValue(measurement, out var s) ? s.Order().ToArray() : [];
-            return dbInfo.SeriesIndex.Values.SelectMany(s => s).Distinct().Order().ToArray();
+            {
+                if (!dbInfo.SeriesIndex.TryGetValue(measurement, out var s)) return [];
+                snapshot = s.ToArray();
+            }
+            else
+            {
+                snapshot = dbInfo.SeriesIndex.Values.SelectMany(s => s).ToArray();
+            }
         }
+
+        return snapshot.Distinct(StringComparer.Ordinal).Order().ToArray();
     }
 
     public int GetTagValueCardinality(string db, string? measurement, string? tagKey)
@@ -467,11 +476,36 @@ public sealed class Manifest
 
     public IReadOnlyList<string> ListMeasurements(string db)
     {
+        string[] snapshot;
         lock (_lock)
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
-            return dbInfo.SeriesIndex.Keys.Order().ToArray();
+            snapshot = dbInfo.SeriesIndex.Keys.ToArray();
         }
+        return snapshot.Order().ToArray();
+    }
+
+    /// <summary>
+    /// Get tag keys for a measurement (or all measurements if null).
+    /// </summary>
+    public IReadOnlyList<string> GetTagKeys(string db, string? measurement)
+    {
+        string[] snapshot;
+        lock (_lock)
+        {
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
+            if (measurement != null)
+            {
+                if (!dbInfo.TagIndex.TryGetValue(measurement, out var tags)) return [];
+                snapshot = tags.Keys.ToArray();
+            }
+            else
+            {
+                snapshot = dbInfo.TagIndex.Values.SelectMany(tags => tags.Keys).ToArray();
+            }
+        }
+
+        return snapshot.Distinct(StringComparer.Ordinal).Order().ToArray();
     }
 
     /// <summary>
@@ -479,10 +513,11 @@ public sealed class Manifest
     /// </summary>
     public IReadOnlyList<(string Key, string Value)> GetTagValues(string db, string? measurement, string? tagKey)
     {
+        List<(string, string)> snapshot;
         lock (_lock)
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
-            var result = new List<(string, string)>();
+            snapshot = [];
             var measurements = measurement != null
                 ? (dbInfo.TagIndex.ContainsKey(measurement) ? new[] { measurement } : Array.Empty<string>())
                 : dbInfo.TagIndex.Keys.ToArray();
@@ -495,51 +530,61 @@ public sealed class Manifest
                 foreach (var k in keys)
                 {
                     if (!tagMap.TryGetValue(k, out var vals)) continue;
-                    foreach (var v in vals.Order()) result.Add((k, v));
+                    foreach (var v in vals) snapshot.Add((k, v));
                 }
             }
-            return result.Distinct().OrderBy(x => x.Item2).ToArray();
         }
+
+        return snapshot.Distinct().OrderBy(x => x.Item2).ToArray();
     }
 
     public IReadOnlyList<string> GetSeriesForTagValue(string db, string measurement, string tagKey, string tagValue)
     {
+        string[] snapshot;
         lock (_lock)
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
             if (!dbInfo.TagSeriesIndex.TryGetValue(measurement, out var tagMap)) return [];
             if (!tagMap.TryGetValue(tagKey, out var valueMap)) return [];
-            return valueMap.TryGetValue(tagValue, out var series) ? series.Order().ToArray() : [];
+            if (!valueMap.TryGetValue(tagValue, out var series)) return [];
+            snapshot = series.ToArray();
         }
+
+        return snapshot.Order().ToArray();
     }
 
     public IReadOnlyList<string> GetSeriesForTagKey(string db, string measurement, string tagKey)
     {
+        string[] snapshot;
         lock (_lock)
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
             if (!dbInfo.TagSeriesIndex.TryGetValue(measurement, out var tagMap)) return [];
             if (!tagMap.TryGetValue(tagKey, out var valueMap)) return [];
-            return valueMap.Values.SelectMany(v => v).Distinct(StringComparer.Ordinal).Order().ToArray();
+            snapshot = valueMap.Values.SelectMany(v => v).ToArray();
         }
+
+        return snapshot.Distinct(StringComparer.Ordinal).Order().ToArray();
     }
 
     public IReadOnlyList<string> GetSeriesForTagRegex(string db, string measurement, string tagKey, string pattern, bool negate)
     {
+        (string Value, string[] Series)[] snapshot;
         lock (_lock)
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
             if (!dbInfo.TagSeriesIndex.TryGetValue(measurement, out var tagMap)) return [];
             if (!tagMap.TryGetValue(tagKey, out var valueMap)) return [];
-
-            var regex = new Regex(pattern, RegexOptions.CultureInvariant);
-            return valueMap
-                .Where(kv => negate ? !regex.IsMatch(kv.Key) : regex.IsMatch(kv.Key))
-                .SelectMany(kv => kv.Value)
-                .Distinct(StringComparer.Ordinal)
-                .Order()
-                .ToArray();
+            snapshot = valueMap.Select(kv => (kv.Key, kv.Value.ToArray())).ToArray();
         }
+
+        var regex = new Regex(pattern, RegexOptions.CultureInvariant);
+        return snapshot
+            .Where(kv => negate ? !regex.IsMatch(kv.Value) : regex.IsMatch(kv.Value))
+            .SelectMany(kv => kv.Series)
+            .Distinct(StringComparer.Ordinal)
+            .Order()
+            .ToArray();
     }
 
     /// <summary>

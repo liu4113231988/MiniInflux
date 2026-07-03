@@ -92,8 +92,12 @@ public sealed class ShardManager
             var dir = ShardDir(db, rp, shard.Id);
             if (!Directory.Exists(dir)) continue;
 
-            foreach (var seg in Directory.GetFiles(dir, "*.seg").Order())
-                result.Add((seg, shard));
+            foreach (var file in shard.SegmentFiles)
+            {
+                var seg = Path.Combine(dir, file);
+                if (File.Exists(seg))
+                    result.Add((seg, shard));
+            }
         }
         return result
             .OrderByDescending(x => InferSegmentLevel(x.Item1))

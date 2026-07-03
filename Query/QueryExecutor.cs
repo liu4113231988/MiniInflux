@@ -44,6 +44,10 @@ public sealed class QueryExecutionReport
     public bool UsedAggregatePushdown { get; set; }
     public bool UsedRegexPushdown { get; set; }
     public bool UsedSeriesIndexPushdown { get; set; }
+    public bool UsedStreamingRawSelect { get; set; }
+    public bool UsedStreamingAggregate { get; set; }
+    public int SegmentMetadataFooterHits { get; set; }
+    public int SegmentMetadataFullReads { get; set; }
     public long EstimatedInputBytes { get; set; }
     public long EstimatedResultBytes { get; set; }
     public long PeakEstimatedMemoryBytes { get; set; }
@@ -223,10 +227,19 @@ public sealed class QueryExecutor
                 : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             var token = linkedCts.Token;
 
-            var response = new QueryResponse
+            var parsed = InfluxQlParser.Parse(q);
+            QueryResponse response;
+            if (CanStreamRawSelectResponse(e, db, parsed))
             {
-                Results = [new QueryResult { StatementId = 0, Series = Run(e, db, InfluxQlParser.Parse(q), token, report) }]
-            };
+                response = ExecuteStreamingRawSelectResponse(e, db, parsed, report, token);
+            }
+            else
+            {
+                response = new QueryResponse
+                {
+                    Results = [new QueryResult { StatementId = 0, Series = Run(e, db, parsed, token, report) }]
+                };
+            }
             report.RowsReturned = CountRows(response);
             sw.Stop();
             report.DurationMs = sw.ElapsedMilliseconds;
@@ -286,8 +299,27 @@ public sealed class QueryExecutor
             yield return chunk;
     }
 
+    QueryResponse ExecuteStreamingRawSelectResponse(TsdbEngine e, string? db, ParsedQuery q, QueryExecutionReport report, CancellationToken cancellationToken)
+    {
+        report.UsedStreamingRawSelect = true;
+        var rows = new List<List<object?>>();
+        QuerySeries? firstSeries = null;
+        foreach (var chunk in StreamRawSelectChunks(e, db, q, chunkSize: 4096, report, cancellationToken))
+        {
+            var series = chunk.Results[0].Series![0];
+            firstSeries ??= new QuerySeries { Name = series.Name, Columns = [.. series.Columns], Values = rows };
+            rows.AddRange(series.Values);
+        }
+
+        firstSeries ??= new QuerySeries { Name = q.Measurement ?? "", Columns = ["time"], Values = rows };
+        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedResultBytes);
+        EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+        return new QueryResponse { Results = [new QueryResult { StatementId = 0, Series = [firstSeries] }] };
+    }
+
     IEnumerable<QueryResponse> ExecuteStreamingRawSelect(TsdbEngine e, string? db, ParsedQuery q, int chunkSize, QueryExecutionReport report, CancellationToken cancellationToken)
     {
+        report.UsedStreamingRawSelect = true;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         using var timeoutCts = _maxQueryDurationMs > 0 ? new CancellationTokenSource(_maxQueryDurationMs) : null;
         using var linkedCts = timeoutCts != null
@@ -700,6 +732,15 @@ public sealed class QueryExecutor
                 }
             }
 
+            var streamedAggregate = TryGroupByStreamingFunctions(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, cancellationToken, report, resultMeasurement);
+            if (streamedAggregate != null)
+            {
+                report.EstimatedResultBytes = EstimateQuerySeriesBytes(streamedAggregate);
+                report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedResultBytes);
+                EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+                return streamedAggregate;
+            }
+
             var descendingPoints = TryReadBufferedRawDescending(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, _maxResponseRows, cancellationToken);
             if (descendingPoints != null)
             {
@@ -844,6 +885,92 @@ public sealed class QueryExecutor
         return e.TryReadBufferedSeriesDescending(sourceDb, sourceRp, q.Measurement, seriesFilter.First(), q.MinTimeNs, q.MaxTimeNs, requestedFields, readLimit, cancellationToken);
     }
 
+    List<QuerySeries>? TryGroupByStreamingFunctions(TsdbEngine e, string db, string rp, ParsedQuery q,
+        HashSet<string>? requestedFields, HashSet<string>? seriesFilter, CancellationToken cancellationToken,
+        QueryExecutionReport report, string resultMeasurement)
+    {
+        if (!string.IsNullOrWhiteSpace(q.IntoTarget)
+            || q.Subquery != null
+            || (!q.GroupByNs.HasValue && q.GroupByTags.Count == 0 && !q.GroupByAllTags))
+            return null;
+
+        var items = q.Select.Where(x => x.Func != "").ToList();
+        if (items.Count == 0 || items.Count != q.Select.Count)
+            return null;
+        if (items.Any(i => !IsSimpleStreamingAggregate(i) || i.Field == "*"))
+            return null;
+
+        var groups = new Dictionary<(string TagKey, long? BucketTime), StreamingAggregateGroup>();
+        var scanned = 0;
+        foreach (var point in e.EnumeratePoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            scanned++;
+            EnsureQueryPointLimit(scanned);
+            report.ScannedPoints = scanned;
+            report.EstimatedInputBytes += EstimatePointBytes(point);
+            if (!MatchesTagFilters(point, q.TagFilters) || !MatchesFieldFilters(point, q.FieldFilters))
+                continue;
+
+            var tagKey = BuildGroupByTagKey(point.Tags, q.GroupByTags, q.GroupByAllTags);
+            long? bucketTime = q.GroupByNs.HasValue ? point.TimestampNs / q.GroupByNs.Value * q.GroupByNs.Value : null;
+            var key = (tagKey, bucketTime);
+            if (!groups.TryGetValue(key, out var group))
+            {
+                group = new StreamingAggregateGroup(items.Count);
+                groups[key] = group;
+            }
+            group.MaxTime = Math.Max(group.MaxTime, point.TimestampNs);
+
+            for (var i = 0; i < items.Count; i++)
+                if (point.Fields.TryGetValue(items[i].Field, out var value) && value.AsDouble() is { } number)
+                    group.States[i].Add(number);
+        }
+
+        if (groups.Count == 0)
+            return null;
+
+        var seriesMap = new Dictionary<string, QuerySeries>();
+        foreach (var (key, group) in groups.OrderBy(g => g.Key.BucketTime ?? g.Value.MaxTime))
+        {
+            var tagsDict = BuildGroupByTags(key.TagKey, q.GroupByTags, q.GroupByAllTags);
+            var seriesKey = key.TagKey;
+            if (!seriesMap.TryGetValue(seriesKey, out var series))
+            {
+                series = new QuerySeries
+                {
+                    Name = resultMeasurement,
+                    Tags = tagsDict,
+                    Columns = ["time", .. items.Select(x => x.Alias)],
+                    Values = []
+                };
+                seriesMap[seriesKey] = series;
+            }
+
+            var row = new List<object?> { Time(key.BucketTime ?? group.MaxTime) };
+            for (var i = 0; i < items.Count; i++)
+                row.Add(group.States[i].Value(items[i].Func));
+            series.Values.Add(row);
+        }
+
+        if (q.GroupByNs.HasValue && q.Fill != FillMode.None && q.MinTimeNs.HasValue && q.MaxTimeNs.HasValue)
+            ApplyFill(seriesMap, q, q.GroupByNs.Value, items);
+
+        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        foreach (var series in seriesMap.Values)
+        {
+            series.Values = OrderRowsByTime(series.Values, q.Desc);
+            series.Values = series.Values.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
+        }
+
+        var result = ApplySeriesWindow(seriesMap.Values, q.SeriesOffset, q.SeriesLimit);
+        EnsureWithinLimit(result.Sum(s => s.Values.Count));
+        report.UsedStreamingAggregate = true;
+        report.RowsReturned = result.Sum(s => s.Values.Count);
+        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, EstimateQuerySeriesBytes(result));
+        return result;
+    }
+
     List<QuerySeries> AggGroupBy(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken, string resultMeasurement)
     {
         long? step = q.GroupByNs;
@@ -900,6 +1027,49 @@ public sealed class QueryExecutor
         EnsureWithinLimit(seriesList.Sum(s => s.Values.Count));
         return seriesList;
     }
+
+    private sealed class StreamingAggregateGroup(int itemCount)
+    {
+        public readonly StreamingAggregateState[] States = Enumerable.Range(0, itemCount).Select(_ => new StreamingAggregateState()).ToArray();
+        public long MaxTime;
+    }
+
+    private sealed class StreamingAggregateState
+    {
+        private double _sum;
+        private double _min;
+        private double _max;
+        private int _count;
+
+        public void Add(double value)
+        {
+            if (_count == 0)
+            {
+                _min = value;
+                _max = value;
+            }
+            else
+            {
+                if (value < _min) _min = value;
+                if (value > _max) _max = value;
+            }
+
+            _sum += value;
+            _count++;
+        }
+
+        public object? Value(string func) => func switch
+        {
+            "count" => _count,
+            "sum" => _count == 0 ? null : _sum,
+            "mean" => _count == 0 ? null : _sum / _count,
+            "min" => _count == 0 ? null : _min,
+            "max" => _count == 0 ? null : _max,
+            _ => null
+        };
+    }
+
+    static bool IsSimpleStreamingAggregate(SelectItem item) => item.Func is "count" or "sum" or "mean" or "min" or "max";
 
     static List<List<object?>> BuildGroupedRows(List<Point> groupPts, List<SelectItem> items, long? bucketTimeNs, CancellationToken cancellationToken)
     {
@@ -1758,7 +1928,10 @@ public sealed class QueryExecutor
 
         var bufferStats = e.ReadBufferedStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
         report.ScannedPoints += bufferStats.MatchedPointCount;
-        var metas = e.ReadSegmentMetadata(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
+        var metadata = e.ReadSegmentMetadataWithStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
+        report.SegmentMetadataFooterHits += metadata.FooterHits;
+        report.SegmentMetadataFullReads += metadata.FullReads;
+        var metas = metadata.Metas;
         if (metas.Count == 0 && bufferStats.MatchedPointCount == 0) return null;
         if (metas.Count > 0)
         {
@@ -1810,7 +1983,10 @@ public sealed class QueryExecutor
         var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
         report.ScannedPoints += bufferPoints.Count;
 
-        var metas = e.ReadSegmentMetadata(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
+        var metadata = e.ReadSegmentMetadataWithStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
+        report.SegmentMetadataFooterHits += metadata.FooterHits;
+        report.SegmentMetadataFullReads += metadata.FullReads;
+        var metas = metadata.Metas;
         if (metas.Count == 0 && bufferPoints.Count == 0)
             return null;
         if (metas.Count > 0)
@@ -1820,9 +1996,14 @@ public sealed class QueryExecutor
             report.ScannedPoints += metas.Sum(m => m.PointCount);
         }
 
+        var parsedTags = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
         var groupedMetas = metas.GroupBy(meta =>
         {
-            var tags = ParseTagsCanonical(meta.TagsCanonical);
+            if (!parsedTags.TryGetValue(meta.TagsCanonical, out var tags))
+            {
+                tags = ParseTagsCanonical(meta.TagsCanonical);
+                parsedTags[meta.TagsCanonical] = tags;
+            }
             return BuildGroupByTagKey(tags, q.GroupByTags, q.GroupByAllTags);
         }).ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
 
@@ -2012,6 +2193,16 @@ public sealed class QueryExecutor
         && string.IsNullOrWhiteSpace(q.IntoTarget)
         && !q.Desc
         && !string.IsNullOrWhiteSpace(q.Measurement);
+
+    static bool CanStreamRawSelectResponse(TsdbEngine e, string? db, ParsedQuery q)
+    {
+        if (!CanStreamRawSelect(q))
+            return false;
+        Req(q.SourceDatabase ?? db);
+        var sourceDb = q.SourceDatabase ?? db!;
+        var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);
+        return !e.HasSegments(sourceDb, sourceRp, q.MinTimeNs, q.MaxTimeNs);
+    }
 
     static bool CanWriteBufferedRawDescendingJson(ParsedQuery q) =>
         q.Kind == QueryKind.Select
@@ -2334,6 +2525,10 @@ public sealed class QueryExecutor
         target.UsedAggregatePushdown = source.UsedAggregatePushdown;
         target.UsedRegexPushdown = source.UsedRegexPushdown;
         target.UsedSeriesIndexPushdown = source.UsedSeriesIndexPushdown;
+        target.UsedStreamingRawSelect = source.UsedStreamingRawSelect;
+        target.UsedStreamingAggregate = source.UsedStreamingAggregate;
+        target.SegmentMetadataFooterHits = source.SegmentMetadataFooterHits;
+        target.SegmentMetadataFullReads = source.SegmentMetadataFullReads;
         target.EstimatedInputBytes = source.EstimatedInputBytes;
         target.EstimatedResultBytes = source.EstimatedResultBytes;
         target.PeakEstimatedMemoryBytes = source.PeakEstimatedMemoryBytes;

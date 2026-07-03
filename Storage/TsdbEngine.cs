@@ -5,6 +5,8 @@ namespace MiniInflux.Net10.Storage;
 
 public sealed class TsdbEngine : IDisposable
 {
+    public sealed record SegmentMetadataQueryResult(List<SegmentColumnMeta> Metas, int FooterHits, int FullReads);
+
     private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey);
     private sealed class PendingPoint(Point point, SeriesKey seriesKey)
     {
@@ -22,7 +24,7 @@ public sealed class TsdbEngine : IDisposable
     private readonly Compactor _compactor;
     private readonly Dictionary<string, ReaderWriterLockSlim> _locks = new(StringComparer.Ordinal);
     private readonly ReaderWriterLockSlim _globalLock = new();
-    private readonly Dictionary<string, (long Length, DateTime LastWriteUtc, List<SegmentColumnMeta> Metas)> _segmentMetadataCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (long Length, DateTime LastWriteUtc, List<SegmentColumnMeta> Metas, bool UsedFooter)> _segmentMetadataCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, List<BufferedPoint>> _buf = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Dictionary<SeriesKey, List<BufferedPoint>>> _bufBySeries = new(StringComparer.Ordinal);
     private readonly Dictionary<string, WalPosition> _bufferReplayFloors = new(StringComparer.Ordinal);
@@ -99,7 +101,7 @@ public sealed class TsdbEngine : IDisposable
                     result.SegmentsScanned++;
                     try
                     {
-                        var metas = ReadSegmentMetadataCached(segFile);
+                        var metas = ReadSegmentMetadataCached(segFile).Metas;
                         var pointsForIndex = new List<(string Measurement, string TagsCanonical, Dictionary<string, string> Tags)>();
                         foreach (var m in metas)
                         {
@@ -304,7 +306,7 @@ public sealed class TsdbEngine : IDisposable
                 {
                     try
                     {
-                        var metas = ReadSegmentMetadataCached(segPath);
+                        var metas = ReadSegmentMetadataCached(segPath).Metas;
                         if (meas != null && !metas.Any(m => m.Measurement == meas)) continue;
                         if (min.HasValue && !metas.Any(m => m.MaxTime >= min.Value)) continue;
                         if (max.HasValue && !metas.Any(m => m.MinTime <= max.Value)) continue;
@@ -315,15 +317,7 @@ public sealed class TsdbEngine : IDisposable
                     catch { /* fall through to full read */ }
                 }
 
-                var cols = SegmentReader.ReadSegment(segPath, requestedFields, meas, min, max, allowedTagsCanonical);
-                var filtered = new List<SegmentColumn>();
-                foreach (var col in cols)
-                {
-                    if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime)) continue;
-                    var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values);
-                    if (ts.Count > 0) filtered.Add(new SegmentColumn(col.Measurement, col.TagsCanonical, col.Field, col.Kind, ts[0], ts[^1], ts, vals, col.Stats));
-                }
-                res.AddRange(Rebuild(filtered, min, max));
+                res.AddRange(Rebuild(ReadSegmentColumns(db, segPath, requestedFields, meas, min, max, allowedTagsCanonical), min, max));
             }
             catch (InvalidDataException) { }
         }
@@ -446,7 +440,7 @@ public sealed class TsdbEngine : IDisposable
                 {
                     try
                     {
-                        var metas = ReadSegmentMetadataCached(segPath);
+                        var metas = ReadSegmentMetadataCached(segPath).Metas;
                         if (meas != null && !metas.Any(m => m.Measurement == meas)) continue;
                         if (min.HasValue && !metas.Any(m => m.MaxTime >= min.Value)) continue;
                         if (max.HasValue && !metas.Any(m => m.MinTime <= max.Value)) continue;
@@ -457,15 +451,7 @@ public sealed class TsdbEngine : IDisposable
                     catch { }
                 }
 
-                var cols = SegmentReader.ReadSegment(segPath, requestedFields, meas, min, max, allowedTagsCanonical);
-                var filtered = new List<SegmentColumn>();
-                foreach (var col in cols)
-                {
-                    if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime)) continue;
-                    var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values);
-                    if (ts.Count > 0) filtered.Add(new SegmentColumn(col.Measurement, col.TagsCanonical, col.Field, col.Kind, ts[0], ts[^1], ts, vals, col.Stats));
-                }
-                rebuilt = Rebuild(filtered, min, max).OrderBy(x => x.TimestampNs).ToList();
+                rebuilt = Rebuild(ReadSegmentColumns(db, segPath, requestedFields, meas, min, max, allowedTagsCanonical), min, max).OrderBy(x => x.TimestampNs).ToList();
             }
             catch (InvalidDataException) { continue; }
 
@@ -488,13 +474,8 @@ public sealed class TsdbEngine : IDisposable
         return r.Order().ToArray();
     }
 
-    public IReadOnlyList<string> ListTagKeys(string db, string? m) => ReadAllPoints(db, GetDefaultRpName(db), m, null, null).SelectMany(p => p.Tags.Keys).Distinct(StringComparer.Ordinal).Order().ToArray();
-    public IReadOnlyList<(string Key, string Value)> ListTagValues(string db, string? m, string key)
-    {
-        var indexed = _manifest.GetTagValues(db, m, key);
-        if (indexed.Count > 0) return indexed;
-        return ReadAllPoints(db, GetDefaultRpName(db), m, null, null).Where(p => p.Tags.ContainsKey(key)).Select(p => (key, p.Tags[key])).Distinct().OrderBy(x => x.Item2).ToArray();
-    }
+    public IReadOnlyList<string> ListTagKeys(string db, string? m) => _manifest.GetTagKeys(db, m);
+    public IReadOnlyList<(string Key, string Value)> ListTagValues(string db, string? m, string key) => _manifest.GetTagValues(db, m, key);
     public IReadOnlyList<(string Field, FieldKind Kind)> ListFieldKeys(string db, string? m) => _schema.GetFields(db, m);
     public SchemaRegistry Schema => _schema;
     public Manifest Meta => _manifest;
@@ -602,13 +583,24 @@ public sealed class TsdbEngine : IDisposable
     public List<SegmentColumnMeta> ReadSegmentMetadata(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, CancellationToken cancellationToken = default)
     {
+        return ReadSegmentMetadataWithStats(db, rp, meas, min, max, requestedFields, allowedTagsCanonical, cancellationToken).Metas;
+    }
+
+    public SegmentMetadataQueryResult ReadSegmentMetadataWithStats(string db, string rp, string? meas, long? min, long? max,
+        HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, CancellationToken cancellationToken = default)
+    {
         var result = new List<SegmentColumnMeta>();
+        var footerHits = 0;
+        var fullReads = 0;
         foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                result.AddRange(ReadSegmentMetadataCached(segPath)
+                var metadata = ReadSegmentMetadataCached(segPath);
+                if (metadata.UsedFooter) footerHits++;
+                else fullReads++;
+                result.AddRange(metadata.Metas
                     .Where(m => (meas == null || m.Measurement == meas)
                         && (!min.HasValue || m.MaxTime >= min.Value)
                         && (!max.HasValue || m.MinTime <= max.Value)
@@ -617,7 +609,7 @@ public sealed class TsdbEngine : IDisposable
             }
             catch (InvalidDataException) { }
         }
-        return result;
+        return new SegmentMetadataQueryResult(result, footerHits, fullReads);
     }
 
     public CompactionStatsSnapshot GetCompactionStats() => _compactor.GetStats();
@@ -787,7 +779,20 @@ public sealed class TsdbEngine : IDisposable
     private static Dictionary<string, string> ParseTags(string s)
     { var d = new Dictionary<string, string>(StringComparer.Ordinal); if (string.IsNullOrEmpty(s)) return d; foreach (var p in s.Split(',')) { var i = p.IndexOf('='); if (i > 0) d[p[..i]] = p[(i + 1)..]; } return d; }
 
-    private List<SegmentColumnMeta> ReadSegmentMetadataCached(string path)
+    private List<SegmentColumn> ReadSegmentColumns(string db, string segPath, HashSet<string>? requestedFields, string? meas, long? min, long? max, HashSet<string>? allowedTagsCanonical)
+    {
+        var cols = SegmentReader.ReadSegment(segPath, requestedFields, meas, min, max, allowedTagsCanonical);
+        var filtered = new List<SegmentColumn>(cols.Count);
+        foreach (var col in cols)
+        {
+            if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime)) continue;
+            var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values);
+            if (ts.Count > 0) filtered.Add(new SegmentColumn(col.Measurement, col.TagsCanonical, col.Field, col.Kind, ts[0], ts[^1], ts, vals, col.Stats));
+        }
+        return filtered;
+    }
+
+    private (List<SegmentColumnMeta> Metas, bool UsedFooter) ReadSegmentMetadataCached(string path)
     {
         var info = new FileInfo(path);
         var key = info.FullName;
@@ -800,13 +805,13 @@ public sealed class TsdbEngine : IDisposable
             if (_segmentMetadataCache.TryGetValue(key, out var cached)
                 && cached.Length == length
                 && cached.LastWriteUtc == lastWriteUtc)
-                return cached.Metas.ToList();
+                return (cached.Metas.ToList(), cached.UsedFooter);
 
-            var metas = SegmentReader.ReadMetadata(path);
+            var read = SegmentReader.ReadMetadataWithInfo(path);
             _globalLock.EnterWriteLock();
-            try { _segmentMetadataCache[key] = (length, lastWriteUtc, metas); }
+            try { _segmentMetadataCache[key] = (length, lastWriteUtc, read.Metadata, read.UsedFooter); }
             finally { _globalLock.ExitWriteLock(); }
-            return metas.ToList();
+            return (read.Metadata.ToList(), read.UsedFooter);
         }
         finally { _globalLock.ExitUpgradeableReadLock(); }
     }
