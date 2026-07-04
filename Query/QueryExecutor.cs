@@ -1927,25 +1927,27 @@ public sealed class QueryExecutor
             return null;
         if (q.FieldFilters.Count > 0) return null;
 
-        var bufferStats = e.ReadBufferedStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
-        report.ScannedPoints += bufferStats.MatchedPointCount;
+        var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
+        report.ScannedPoints += bufferPoints.Count;
+        var dedupedBufferPoints = DeduplicateAggregatePoints(bufferPoints);
         var metadata = e.ReadSegmentMetadataWithStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
         report.SegmentMetadataFooterHits += metadata.FooterHits;
         report.SegmentMetadataFullReads += metadata.FullReads;
         var metas = metadata.Metas;
-        if (metas.Count == 0 && bufferStats.MatchedPointCount == 0) return null;
+        if (metas.Count == 0 && dedupedBufferPoints.Count == 0) return null;
         if (metas.Count > 0)
         {
             if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null)) return null;
+            if (HasPotentialAggregateDuplicates(metas, dedupedBufferPoints, items)) return null;
             report.ScannedPoints += metas.Sum(m => m.PointCount);
         }
 
-        var row = new List<object?> { Time(MaxTime(metas, bufferStats)) };
+        var row = new List<object?> { Time(MaxTime(metas, dedupedBufferPoints)) };
         foreach (var item in items)
         {
             var relevantMetas = metas.Where(m => m.Field == item.Field).ToList();
-            if (relevantMetas.Count == 0 && !bufferStats.Fields.ContainsKey(item.Field)) return null;
-            row.Add(CalcPushdownValue(item.Func, item.Field, relevantMetas, bufferStats));
+            if (relevantMetas.Count == 0 && !dedupedBufferPoints.Any(p => p.Fields.ContainsKey(item.Field))) return null;
+            row.Add(CalcPushdownValue(item.Func, item.Field, relevantMetas, dedupedBufferPoints));
         }
 
         report.UsedAggregatePushdown = true;
@@ -1983,16 +1985,19 @@ public sealed class QueryExecutor
 
         var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
         report.ScannedPoints += bufferPoints.Count;
+        var dedupedBufferPoints = DeduplicateAggregatePoints(bufferPoints);
 
         var metadata = e.ReadSegmentMetadataWithStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
         report.SegmentMetadataFooterHits += metadata.FooterHits;
         report.SegmentMetadataFullReads += metadata.FullReads;
         var metas = metadata.Metas;
-        if (metas.Count == 0 && bufferPoints.Count == 0)
+        if (metas.Count == 0 && dedupedBufferPoints.Count == 0)
             return null;
         if (metas.Count > 0)
         {
             if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null))
+                return null;
+            if (HasPotentialAggregateDuplicates(metas, dedupedBufferPoints, items))
                 return null;
             report.ScannedPoints += metas.Sum(m => m.PointCount);
         }
@@ -2008,7 +2013,7 @@ public sealed class QueryExecutor
             return BuildGroupByTagKey(tags, q.GroupByTags, q.GroupByAllTags);
         }).ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
 
-        var groupedBufferPoints = bufferPoints.GroupBy(point => BuildGroupByTagKey(point.Tags, q.GroupByTags, q.GroupByAllTags))
+        var groupedBufferPoints = dedupedBufferPoints.GroupBy(point => BuildGroupByTagKey(point.Tags, q.GroupByTags, q.GroupByAllTags))
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
 
         var groupKeys = groupedMetas.Keys.Concat(groupedBufferPoints.Keys).Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
@@ -2047,6 +2052,67 @@ public sealed class QueryExecutor
 
     static bool IsFullCoverage(SegmentColumnMeta meta, long? minTimeNs, long? maxTimeNs) =>
         (!minTimeNs.HasValue || minTimeNs.Value <= meta.MinTime) && (!maxTimeNs.HasValue || maxTimeNs.Value >= meta.MaxTime);
+
+    static bool HasPotentialAggregateDuplicates(List<SegmentColumnMeta> metas, List<Point> bufferPoints, List<SelectItem> items)
+    {
+        var fields = items.Select(i => i.Field).Where(f => f != "*").ToHashSet(StringComparer.Ordinal);
+        foreach (var group in metas
+            .Where(m => fields.Contains(m.Field))
+            .GroupBy(m => (m.Measurement, m.TagsCanonical, m.Field)))
+        {
+            long? maxTime = null;
+            foreach (var meta in group.OrderBy(m => m.MinTime))
+            {
+                if (maxTime.HasValue && meta.MinTime <= maxTime.Value)
+                    return true;
+                maxTime = maxTime.HasValue ? Math.Max(maxTime.Value, meta.MaxTime) : meta.MaxTime;
+            }
+        }
+
+        foreach (var point in bufferPoints)
+        {
+            var tags = ToCanonicalTagKey(point.Tags);
+            foreach (var field in fields)
+            {
+                if (!point.Fields.ContainsKey(field))
+                    continue;
+                if (metas.Any(m => m.Measurement == point.Measurement
+                    && m.TagsCanonical == tags
+                    && m.Field == field
+                    && point.TimestampNs >= m.MinTime
+                    && point.TimestampNs <= m.MaxTime))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    static List<Point> DeduplicateAggregatePoints(List<Point> points)
+    {
+        if (points.Count <= 1) return points;
+        var map = new Dictionary<(string Measurement, string Tags, long Timestamp), Point>();
+        foreach (var point in points)
+        {
+            var key = (point.Measurement, ToCanonicalTagKey(point.Tags), point.TimestampNs);
+            if (map.TryGetValue(key, out var existing))
+            {
+                foreach (var field in point.Fields)
+                    existing.Fields[field.Key] = field.Value;
+            }
+            else
+            {
+                map[key] = new Point
+                {
+                    Measurement = point.Measurement,
+                    Tags = point.Tags,
+                    Fields = new Dictionary<string, FieldValue>(point.Fields, StringComparer.Ordinal),
+                    TimestampNs = point.TimestampNs
+                };
+            }
+        }
+        return map.Values.ToList();
+    }
 
     static long MaxTime(List<SegmentColumnMeta> metas, List<Point> bufferPoints)
     {

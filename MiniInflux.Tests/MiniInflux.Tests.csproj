@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\MiniInflux.Net10.csproj" />
+    <ProjectReference Include="..\MiniInflux.csproj" />
   </ItemGroup>
 
 </Project>

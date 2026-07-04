@@ -187,6 +187,159 @@ public sealed class P2ManagementCliTests : IDisposable
     }
 
     [Fact]
+    public void TombstoneStore_CreatesDirectoryOnlyWhenDeleteIsRecorded()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        _ = new TombstoneStore(dataPath);
+
+        var tombstoneDir = Path.Combine(dataPath, "tombstones");
+        Assert.False(Directory.Exists(tombstoneDir));
+
+        var tombstones = new TombstoneStore(dataPath);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 1, maxTime: 10);
+
+        Assert.True(Directory.Exists(tombstoneDir));
+        Assert.True(File.Exists(Path.Combine(tombstoneDir, "testdb.json")));
+    }
+
+    [Fact]
+    public void TombstoneStore_MergesOverlappingDeletes()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var tombstones = new TombstoneStore(dataPath);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 10, maxTime: 20);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 15, maxTime: 30);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "tombstone", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("tombstones=1", stdout.ToString());
+        Assert.Contains("tombstone db=testdb measurement=cpu tags=* min_time_ns=10 max_time_ns=30", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public void TombstoneStore_MergesDeleteThatBridgesExistingRanges()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var tombstones = new TombstoneStore(dataPath);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 10, maxTime: 20);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 30, maxTime: 40);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 15, maxTime: 35);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "tombstone", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("tombstones=1", stdout.ToString());
+        Assert.Contains("tombstone db=testdb measurement=cpu tags=* min_time_ns=10 max_time_ns=40", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public void TombstoneStore_FullDeleteCollapsesScopedRanges()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var tombstones = new TombstoneStore(dataPath);
+        tombstones.AddSeriesDelete("testdb", "cpu", "host=server01", minTime: 10, maxTime: 20);
+        tombstones.AddSeriesDelete("testdb", "cpu", "host=server01");
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "tombstone", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("tombstones=1", stdout.ToString());
+        Assert.Contains("tombstone db=testdb measurement=cpu tags=host=server01 min_time_ns=* max_time_ns=*", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public void TombstoneStore_SkipsSeriesDeleteCoveredByMeasurementDelete()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var tombstones = new TombstoneStore(dataPath);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 10, maxTime: 30);
+        tombstones.AddSeriesDelete("testdb", "cpu", "host=server01", minTime: 15, maxTime: 20);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "tombstone", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("tombstones=1", stdout.ToString());
+        Assert.Contains("tombstone db=testdb measurement=cpu tags=* min_time_ns=10 max_time_ns=30", stdout.ToString());
+        Assert.DoesNotContain("host=server01", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public void TombstoneStore_MeasurementDeleteRemovesCoveredSeriesDeletes()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var tombstones = new TombstoneStore(dataPath);
+        tombstones.AddSeriesDelete("testdb", "cpu", "host=server01", minTime: 15, maxTime: 20);
+        tombstones.AddSeriesDelete("testdb", "cpu", "host=server02", minTime: 40, maxTime: 50);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 10, maxTime: 30);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "tombstone", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("tombstones=2", stdout.ToString());
+        Assert.Contains("tombstone db=testdb measurement=cpu tags=* min_time_ns=10 max_time_ns=30", stdout.ToString());
+        Assert.Contains("tombstone db=testdb measurement=cpu tags=host=server02 min_time_ns=40 max_time_ns=50", stdout.ToString());
+        Assert.DoesNotContain("host=server01", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public void TombstoneStore_SkipsDeleteCoveredBySameScope()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        var tombstones = new TombstoneStore(dataPath);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 10, maxTime: 30);
+        tombstones.AddMeasurementDelete("testdb", "cpu", minTime: 15, maxTime: 20);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "tombstone", "--data", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("tombstones=1", stdout.ToString());
+        Assert.Contains("tombstone db=testdb measurement=cpu tags=* min_time_ns=10 max_time_ns=30", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
     public async Task Compact_CommandMergesSegments()
     {
         var dataPath = Path.Combine(_testDir, "data");

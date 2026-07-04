@@ -31,7 +31,6 @@ public sealed class TombstoneStore
     public TombstoneStore(string dataPath)
     {
         _dir = Path.Combine(dataPath, "tombstones");
-        Directory.CreateDirectory(_dir);
         LoadAll();
     }
 
@@ -42,15 +41,14 @@ public sealed class TombstoneStore
     {
         lock (_lock)
         {
-            var t = new Tombstone
+            if (AddLocked(db, new Tombstone
             {
                 Measurement = measurement,
                 MinTimeNs = minTime,
                 MaxTimeNs = maxTime,
                 CreatedAtNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000
-            };
-            GetList(db).Add(t);
-            Save(db);
+            }))
+                Save(db);
         }
     }
 
@@ -62,16 +60,38 @@ public sealed class TombstoneStore
     {
         lock (_lock)
         {
-            var t = new Tombstone
+            if (AddLocked(db, new Tombstone
             {
                 Measurement = measurement,
                 TagsCanonical = tagsCanonical,
                 MinTimeNs = minTime,
                 MaxTimeNs = maxTime,
                 CreatedAtNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000
-            };
-            GetList(db).Add(t);
-            Save(db);
+            }))
+                Save(db);
+        }
+    }
+
+    public void AddSeriesDeletes(string db, string measurement, IEnumerable<(string TagsCanonical, long? MinTime, long? MaxTime)> deletes)
+    {
+        lock (_lock)
+        {
+            var changed = false;
+            var createdAtNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+            foreach (var delete in deletes)
+            {
+                changed |= AddLocked(db, new Tombstone
+                {
+                    Measurement = measurement,
+                    TagsCanonical = delete.TagsCanonical,
+                    MinTimeNs = delete.MinTime,
+                    MaxTimeNs = delete.MaxTime,
+                    CreatedAtNs = createdAtNs
+                });
+            }
+
+            if (changed)
+                Save(db);
         }
     }
 
@@ -205,6 +225,61 @@ public sealed class TombstoneStore
         return list;
     }
 
+    private bool AddLocked(string db, Tombstone tombstone)
+    {
+        var list = GetList(db);
+        var min = tombstone.MinTimeNs;
+        var max = tombstone.MaxTimeNs;
+
+        if (list.Any(t => t.Measurement == tombstone.Measurement
+            && t.TagsCanonical == tombstone.TagsCanonical
+            && Covers(t, tombstone)))
+            return false;
+
+        for (var i = list.Count - 1; i >= 0; i--)
+        {
+            var existing = list[i];
+            if (existing.Measurement != tombstone.Measurement || existing.TagsCanonical != tombstone.TagsCanonical)
+                continue;
+
+            var existingMin = existing.MinTimeNs ?? long.MinValue;
+            var existingMax = existing.MaxTimeNs ?? long.MaxValue;
+            var newMin = min ?? long.MinValue;
+            var newMax = max ?? long.MaxValue;
+            if (newMin > existingMax || newMax < existingMin)
+                continue;
+
+            min = MinNullable(existing.MinTimeNs, min);
+            max = MaxNullable(existing.MaxTimeNs, max);
+            list.RemoveAt(i);
+        }
+
+        tombstone.MinTimeNs = min;
+        tombstone.MaxTimeNs = max;
+        if (tombstone.TagsCanonical != null && list.Any(t => t.Measurement == tombstone.Measurement
+            && t.TagsCanonical == null
+            && Covers(t, tombstone)))
+            return false;
+
+        if (tombstone.TagsCanonical == null)
+            list.RemoveAll(t => t.Measurement == tombstone.Measurement
+                && t.TagsCanonical != null
+                && Covers(tombstone, t));
+
+        list.Add(tombstone);
+        return true;
+    }
+
+    private static bool Covers(Tombstone cover, Tombstone covered) =>
+        (cover.MinTimeNs ?? long.MinValue) <= (covered.MinTimeNs ?? long.MinValue)
+        && (cover.MaxTimeNs ?? long.MaxValue) >= (covered.MaxTimeNs ?? long.MaxValue);
+
+    private static long? MinNullable(long? a, long? b) =>
+        !a.HasValue || !b.HasValue ? null : Math.Min(a.Value, b.Value);
+
+    private static long? MaxNullable(long? a, long? b) =>
+        !a.HasValue || !b.HasValue ? null : Math.Max(a.Value, b.Value);
+
     private void LoadAll()
     {
         if (!Directory.Exists(_dir)) return;
@@ -224,6 +299,7 @@ public sealed class TombstoneStore
     private void Save(string db)
     {
         if (!_tombstones.TryGetValue(db, out var list)) return;
+        Directory.CreateDirectory(_dir);
         var path = Path.Combine(_dir, $"{db}.json");
         var tmp = path + ".tmp";
         var json = JsonSerializer.Serialize(list, TombstoneJsonContext.Default.ListTombstone);

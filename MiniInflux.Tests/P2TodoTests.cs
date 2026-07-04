@@ -22,6 +22,54 @@ public class P2TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task MixedWorkload_HighCardinalityMultiMeasurementOutOfOrderDeleteCompact_RemainsQueryable()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 3,
+            maxL1Segments: 2);
+
+        var expectedCpuWest = 0.0;
+        for (var i = 23; i >= 0; i--)
+        {
+            var measurement = i % 2 == 0 ? "cpu" : "mem";
+            var region = i % 3 == 0 ? "west" : "east";
+            var value = i + 1;
+            await engine.WriteAsync("testdb", "autogen",
+            [
+                TaggedPoint(measurement, $"server{i:00}", region, value, i)
+            ]);
+
+            if (measurement == "cpu" && region == "west")
+                expectedCpuWest += value;
+
+            if (i % 5 == 0)
+                compactor.CompactAll();
+        }
+
+        await engine.WriteAsync("testdb", "autogen", [TaggedPoint("cpu", "server06", "west", 600, 6)]);
+        expectedCpuWest += 600 - 7;
+        engine.DeleteFromMeasurement("testdb", "mem", 5, 15);
+
+        compactor.CompactAll();
+        compactor.CompactAll();
+
+        var cpuWest = new QueryExecutor().ExecuteWithReport(engine, "testdb", "SELECT sum(value),count(value) FROM cpu WHERE region='west'");
+        var cpuRow = Assert.Single(Assert.Single(cpuWest.Response.Results[0].Series!).Values);
+        Assert.True(cpuWest.Report.UsedSeriesIndexPushdown);
+        Assert.Equal(expectedCpuWest, Convert.ToDouble(cpuRow[1]));
+        Assert.Equal(4, cpuRow[2]);
+
+        var memPoints = engine.ReadAllPoints("testdb", "autogen", "mem", null, null);
+        Assert.DoesNotContain(memPoints, p => p.TimestampNs is >= 5 and <= 15);
+        Assert.Equal(["east", "west"], engine.ListTagValues("testdb", "cpu", "region").Select(x => x.Value));
+    }
+
+    [Fact]
     public async Task Subquery_AllowsOuterAggregationOverInnerTimeBuckets()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
@@ -734,6 +782,14 @@ public class P2TodoTests : IDisposable
     {
         Measurement = measurement,
         Tags = new Dictionary<string, string> { ["host"] = host },
+        Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(value) },
+        TimestampNs = timestampNs
+    };
+
+    private static Point TaggedPoint(string measurement, string host, string region, double value, long timestampNs) => new()
+    {
+        Measurement = measurement,
+        Tags = new Dictionary<string, string> { ["host"] = host, ["region"] = region },
         Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(value) },
         TimestampNs = timestampNs
     };

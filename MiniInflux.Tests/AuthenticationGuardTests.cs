@@ -53,7 +53,7 @@ public sealed class AuthenticationGuardTests
         Assert.Equal(AuthenticationAttemptStatus.Success, success.Status);
     }
 
-    private static DefaultHttpContext CreateRequest(string ip, string? user = null, string? password = null)
+    private static HttpRequest CreateRequest(string ip, string? user = null, string? password = null)
     {
         var context = new DefaultHttpContext();
         context.Connection.RemoteIpAddress = IPAddress.Parse(ip);
@@ -63,7 +63,7 @@ public sealed class AuthenticationGuardTests
             context.Request.Headers.Authorization = $"Basic {raw}";
         }
 
-        return context;
+        return context.Request;
     }
 
     private sealed class ManualTimeProvider(DateTimeOffset utcNow) : TimeProvider

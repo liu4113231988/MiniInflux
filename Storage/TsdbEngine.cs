@@ -719,8 +719,7 @@ public sealed class TsdbEngine : IDisposable
 
             foreach (var group in matches)
             {
-                foreach (var point in group)
-                    _tombstones.AddSeriesDelete(db, measurement, group.Key, point.TimestampNs, point.TimestampNs);
+                _tombstones.AddSeriesDeletes(db, measurement, group.Select(point => (group.Key, (long?)point.TimestampNs, (long?)point.TimestampNs)));
             }
 
             DeleteBuffered(db, rp, measurement, minTime, maxTime, predicate);
@@ -735,8 +734,7 @@ public sealed class TsdbEngine : IDisposable
 
         foreach (var group in matches)
         {
-            foreach (var point in group)
-                _tombstones.AddSeriesDelete(db, measurement, group.Key, point.TimestampNs, point.TimestampNs);
+            _tombstones.AddSeriesDeletes(db, measurement, group.Select(point => (group.Key, (long?)point.TimestampNs, (long?)point.TimestampNs)));
         }
 
         DeleteBuffered(db, rp, measurement, minTime, maxTime, predicate);
@@ -752,8 +750,7 @@ public sealed class TsdbEngine : IDisposable
         }
 
         var tagSet = new HashSet<string>(tagsCanonical, StringComparer.Ordinal);
-        foreach (var tags in tagSet)
-            _tombstones.AddSeriesDelete(db, measurement, tags);
+        _tombstones.AddSeriesDeletes(db, measurement, tagSet.Select(tags => (tags, (long?)null, (long?)null)));
         _manifest.RemoveSeriesIndex(db, measurement, tagSet);
 
         foreach (var rp in _manifest.ListRetentionPolicies(db).Select(r => r.Name).DefaultIfEmpty("autogen"))
