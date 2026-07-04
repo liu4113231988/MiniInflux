@@ -16,25 +16,70 @@ public static class SegmentWriter
     /// Format v4: [magic:4][version:1][columnCount:4][columns...][metadata...][metadataOffset:8][metadataLength:4][metadataFooterMagic:4][crc32:4]
     /// </summary>
     public static void WriteSegment(string path, IEnumerable<Point> points)
+        => WriteSegment(path, points.Select(point => (point, SeriesKey.From(point))));
+
+    public static void WriteSegment(string path, IEnumerable<(Point Point, SeriesKey SeriesKey)> points)
     {
-        var columns = points
-            .SelectMany(p => p.Fields.Select(f => new { Series = SeriesKey.From(p), Field = f.Key, Value = f.Value, p.TimestampNs }))
-            .GroupBy(x => (x.Series, x.Field))
-            .Select(g =>
+        var builders = new Dictionary<(string Measurement, string TagsCanonical, string Field), ColumnBuilder>();
+        foreach (var (point, series) in points)
+        {
+            foreach (var field in point.Fields)
             {
-                var ordered = g.OrderBy(x => x.TimestampNs).ToList();
-                return new SegmentColumn(
-                    g.Key.Series.Measurement,
-                    g.Key.Series.TagsCanonical,
-                    g.Key.Field,
-                    ordered[0].Value.Kind,
-                    ordered[0].TimestampNs,
-                    ordered[^1].TimestampNs,
-                    ordered.Select(x => x.TimestampNs).ToList(),
-                    ordered.Select(x => x.Value).ToList());
-            })
-            .ToList();
+                var key = (series.Measurement, series.TagsCanonical, field.Key);
+                if (!builders.TryGetValue(key, out var builder))
+                {
+                    builder = new ColumnBuilder(series.Measurement, series.TagsCanonical, field.Key, field.Value.Kind);
+                    builders[key] = builder;
+                }
+                builder.Add(point.TimestampNs, field.Value);
+            }
+        }
+
+        var columns = new List<SegmentColumn>(builders.Count);
+        foreach (var builder in builders.Values)
+            columns.Add(builder.ToColumn());
         WriteColumns(path, columns);
+    }
+
+    private sealed class ColumnBuilder(string measurement, string tagsCanonical, string field, FieldKind kind)
+    {
+        private readonly List<long> _timestamps = [];
+        private readonly List<FieldValue> _values = [];
+        private bool _sorted = true;
+
+        public void Add(long timestamp, FieldValue value)
+        {
+            if (_timestamps.Count > 0 && timestamp < _timestamps[^1])
+                _sorted = false;
+            _timestamps.Add(timestamp);
+            _values.Add(value);
+        }
+
+        public SegmentColumn ToColumn()
+        {
+            if (!_sorted)
+            {
+                var pairs = new List<(long Timestamp, FieldValue Value)>(_timestamps.Count);
+                for (var i = 0; i < _timestamps.Count; i++)
+                    pairs.Add((_timestamps[i], _values[i]));
+                pairs.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
+                for (var i = 0; i < pairs.Count; i++)
+                {
+                    _timestamps[i] = pairs[i].Timestamp;
+                    _values[i] = pairs[i].Value;
+                }
+            }
+
+            return new SegmentColumn(
+                measurement,
+                tagsCanonical,
+                field,
+                kind,
+                _timestamps[0],
+                _timestamps[^1],
+                _timestamps,
+                _values);
+        }
     }
 
     public static void WriteColumns(string path, IReadOnlyList<SegmentColumn> columns)

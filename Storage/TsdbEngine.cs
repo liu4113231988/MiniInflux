@@ -6,6 +6,9 @@ namespace MiniInflux.Net10.Storage;
 public sealed class TsdbEngine : IDisposable
 {
     public sealed record SegmentMetadataQueryResult(List<SegmentColumnMeta> Metas, int FooterHits, int FullReads);
+    public sealed record DescendingSeriesReadResult(List<Point> Points, int SegmentColumnsRead, int PointsMaterialized, string? LimitPushdownStopReason);
+    public sealed record DescendingFieldReadResult(List<long> Timestamps, List<FieldValue> Values, int SegmentColumnsRead, string? LimitPushdownStopReason);
+    public sealed record DescendingFieldsReadResult(List<long> Timestamps, List<FieldValue?[]> Rows, int SegmentColumnsRead, string? LimitPushdownStopReason);
 
     private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey);
     private sealed class PendingPoint(Point point, SeriesKey seriesKey)
@@ -328,7 +331,7 @@ public sealed class TsdbEngine : IDisposable
     public bool HasSegments(string db, string rp, long? min, long? max) =>
         _shards.ListSegments(db, rp, min, max).Count > 0;
 
-    public List<Point>? TryReadBufferedSeriesDescending(string db, string rp, string measurement, string tagsCanonical,
+    public DescendingSeriesReadResult? TryReadBufferedSeriesDescending(string db, string rp, string measurement, string tagsCanonical,
         long? min, long? max, HashSet<string>? requestedFields = null, int? limit = null, CancellationToken cancellationToken = default)
     {
         var key = K(db, rp);
@@ -338,7 +341,7 @@ public sealed class TsdbEngine : IDisposable
         try
         {
             if (!_bufBySeries.TryGetValue(key, out var bySeries) || !bySeries.TryGetValue(seriesKey, out var buffered))
-                return [];
+                return new DescendingSeriesReadResult([], 0, 0, "buffer-empty");
 
             for (var i = 1; i < buffered.Count; i++)
                 if (buffered[i].Point.TimestampNs < buffered[i - 1].Point.TimestampNs)
@@ -393,19 +396,24 @@ public sealed class TsdbEngine : IDisposable
                     break;
             }
 
-            return result.Values.ToList();
+            return new DescendingSeriesReadResult(
+                result.Values.ToList(),
+                0,
+                result.Count,
+                limit.HasValue && result.Count >= limit.Value ? "buffer-limit" : "buffer-exhausted");
         }
         finally { lk.ExitReadLock(); }
     }
 
-    public List<Point>? TryReadSeriesDescending(string db, string rp, string measurement, string tagsCanonical,
+    public DescendingSeriesReadResult? TryReadSeriesDescending(string db, string rp, string measurement, string tagsCanonical,
         long? min, long? max, HashSet<string>? requestedFields = null, int? limit = null, CancellationToken cancellationToken = default)
     {
         var result = new Dictionary<long, Point>();
         var buffered = TryReadBufferedSeriesDescending(db, rp, measurement, tagsCanonical, min, max, requestedFields, limit, cancellationToken);
         if (buffered == null) return null;
-        AddDescendingPoints(result, buffered, limit);
-        if (limit.HasValue && result.Count >= limit.Value) return result.Values.ToList();
+        AddDescendingPoints(result, buffered.Points, limit);
+        if (limit.HasValue && result.Count >= limit.Value)
+            return new DescendingSeriesReadResult(result.Values.ToList(), 0, result.Count, "buffer-limit");
 
         var segments = new List<(string Path, long MaxTime)>();
         foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
@@ -426,14 +434,17 @@ public sealed class TsdbEngine : IDisposable
         }
 
         var allowed = new HashSet<string>(StringComparer.Ordinal) { tagsCanonical };
+        var segmentColumnsRead = 0;
         foreach (var seg in segments.OrderByDescending(s => s.MaxTime))
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
+                var columns = ReadSegmentColumns(db, seg.Path, requestedFields, measurement, min, max, allowed);
+                segmentColumnsRead += columns.Count;
                 AddSegmentColumnsDescending(
                     result,
-                    ReadSegmentColumns(db, seg.Path, requestedFields, measurement, min, max, allowed),
+                    columns,
                     min,
                     max,
                     limit);
@@ -442,7 +453,158 @@ public sealed class TsdbEngine : IDisposable
             catch (InvalidDataException) { }
         }
 
-        return result.Values.ToList();
+        return new DescendingSeriesReadResult(
+            result.Values.ToList(),
+            segmentColumnsRead,
+            result.Count,
+            limit.HasValue && result.Count >= limit.Value ? "segment-limit" : "segments-exhausted");
+    }
+
+    public DescendingFieldReadResult? TryReadFlushedFieldDescending(string db, string rp, string measurement, string tagsCanonical,
+        string field, long? min, long? max, int? limit = null, CancellationToken cancellationToken = default)
+    {
+        var key = K(db, rp);
+        var seriesKey = new SeriesKey(measurement, tagsCanonical);
+        var lk = GetLock(key);
+        lk.EnterReadLock();
+        try
+        {
+            if (_bufBySeries.TryGetValue(key, out var bySeries)
+                && bySeries.TryGetValue(seriesKey, out var buffered)
+                && buffered.Count > 0)
+                return null;
+        }
+        finally { lk.ExitReadLock(); }
+
+        var segments = new List<(string Path, long MaxTime)>();
+        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var maxTime = ReadSegmentMetadataCached(segPath).Metas
+                    .Where(m => m.Measurement == measurement
+                        && m.TagsCanonical == tagsCanonical
+                        && m.Field == field
+                        && (!min.HasValue || m.MaxTime >= min.Value)
+                        && (!max.HasValue || m.MinTime <= max.Value))
+                    .Select(m => (long?)m.MaxTime)
+                    .Max();
+                if (maxTime.HasValue) segments.Add((segPath, maxTime.Value));
+            }
+            catch (InvalidDataException) { }
+        }
+
+        var timestamps = new List<long>(limit ?? 0);
+        var values = new List<FieldValue>(limit ?? 0);
+        var allowed = new HashSet<string>(StringComparer.Ordinal) { tagsCanonical };
+        var fields = new HashSet<string>(StringComparer.Ordinal) { field };
+        var segmentColumnsRead = 0;
+        foreach (var seg in segments.OrderByDescending(s => s.MaxTime))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var columns = ReadSegmentColumns(db, seg.Path, fields, measurement, min, max, allowed);
+                segmentColumnsRead += columns.Count;
+                foreach (var column in columns)
+                {
+                    for (var i = column.Timestamps.Count - 1; i >= 0; i--)
+                    {
+                        var ts = column.Timestamps[i];
+                        if (min.HasValue && ts < min.Value) break;
+                        if (max.HasValue && ts > max.Value) continue;
+                        timestamps.Add(ts);
+                        values.Add(column.Values[i]);
+                        if (limit.HasValue && timestamps.Count >= limit.Value)
+                            return new DescendingFieldReadResult(timestamps, values, segmentColumnsRead, "segment-limit");
+                    }
+                }
+            }
+            catch (InvalidDataException) { }
+        }
+
+        return new DescendingFieldReadResult(timestamps, values, segmentColumnsRead, "segments-exhausted");
+    }
+
+    public DescendingFieldsReadResult? TryReadFlushedFieldsDescending(string db, string rp, string measurement, string tagsCanonical,
+        IReadOnlyList<string> fields, long? min, long? max, int? limit = null, CancellationToken cancellationToken = default)
+    {
+        if (fields.Count == 0) return null;
+        var key = K(db, rp);
+        var seriesKey = new SeriesKey(measurement, tagsCanonical);
+        var lk = GetLock(key);
+        lk.EnterReadLock();
+        try
+        {
+            if (_bufBySeries.TryGetValue(key, out var bySeries)
+                && bySeries.TryGetValue(seriesKey, out var buffered)
+                && buffered.Count > 0)
+                return null;
+        }
+        finally { lk.ExitReadLock(); }
+
+        var fieldSet = new HashSet<string>(fields, StringComparer.Ordinal);
+        var segments = new List<(string Path, long MaxTime)>();
+        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var metas = ReadSegmentMetadataCached(segPath).Metas
+                    .Where(m => m.Measurement == measurement
+                        && m.TagsCanonical == tagsCanonical
+                        && fieldSet.Contains(m.Field)
+                        && (!min.HasValue || m.MaxTime >= min.Value)
+                        && (!max.HasValue || m.MinTime <= max.Value))
+                    .ToList();
+                if (metas.Count == 0) continue;
+                if (metas.Select(m => (m.MinTime, m.MaxTime, m.PointCount)).Distinct().Count() != 1)
+                    return null;
+                segments.Add((segPath, metas.Max(m => m.MaxTime)));
+            }
+            catch (InvalidDataException) { }
+        }
+
+        var timestamps = new List<long>(limit ?? 0);
+        var rows = new List<FieldValue?[]>(limit ?? 0);
+        var rowIndex = new Dictionary<long, int>();
+        var allowed = new HashSet<string>(StringComparer.Ordinal) { tagsCanonical };
+        var fieldIndexes = fields.Select((field, index) => (field, index)).ToDictionary(x => x.field, x => x.index, StringComparer.Ordinal);
+        var segmentColumnsRead = 0;
+        foreach (var seg in segments.OrderByDescending(s => s.MaxTime))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var columns = ReadSegmentColumns(db, seg.Path, fieldSet, measurement, min, max, allowed);
+                segmentColumnsRead += columns.Count;
+                foreach (var column in columns)
+                {
+                    var fieldIndex = fieldIndexes[column.Field];
+                    for (var i = column.Timestamps.Count - 1; i >= 0; i--)
+                    {
+                        var ts = column.Timestamps[i];
+                        if (min.HasValue && ts < min.Value) break;
+                        if (max.HasValue && ts > max.Value) continue;
+                        if (!rowIndex.TryGetValue(ts, out var index))
+                        {
+                            if (limit.HasValue && timestamps.Count >= limit.Value) continue;
+                            index = timestamps.Count;
+                            rowIndex[ts] = index;
+                            timestamps.Add(ts);
+                            rows.Add(new FieldValue?[fields.Count]);
+                        }
+                        rows[index][fieldIndex] = column.Values[i];
+                    }
+                }
+                if (limit.HasValue && timestamps.Count >= limit.Value)
+                    return new DescendingFieldsReadResult(timestamps, rows, segmentColumnsRead, "segment-limit");
+            }
+            catch (InvalidDataException) { }
+        }
+
+        return new DescendingFieldsReadResult(timestamps, rows, segmentColumnsRead, "segments-exhausted");
     }
 
     public IEnumerable<Point> EnumeratePoints(string db, string rp, string? meas, long? min, long? max,
@@ -952,34 +1114,69 @@ public sealed class TsdbEngine : IDisposable
         };
     }
 
-    private void FlushLocked(string db, string rp, List<BufferedPoint> l)
+    private void FlushLocked(string db, string rp, List<BufferedPoint> l, bool updateCheckpoint = true)
     {
         if (l.Count == 0) return;
-        foreach (var group in l.GroupBy(p => { var (id, _) = _shards.GetOrCreateShard(db, rp, p.Point.TimestampNs); return id; }))
+        var byShard = new Dictionary<int, List<(Point Point, SeriesKey SeriesKey)>>();
+        foreach (var buffered in l)
         {
-            var shardDir = _shards.ShardDir(db, rp, group.Key);
+            var (shardId, _) = _shards.GetOrCreateShard(db, rp, buffered.Point.TimestampNs);
+            if (!byShard.TryGetValue(shardId, out var points))
+            {
+                points = [];
+                byShard[shardId] = points;
+            }
+            points.Add((buffered.Point, buffered.SeriesKey));
+        }
+
+        foreach (var (shardId, points) in byShard)
+        {
+            var shardDir = _shards.ShardDir(db, rp, shardId);
             var segPath = Path.Combine(shardDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
-            SegmentWriter.WriteSegment(segPath, group.Select(x => x.Point));
-            _shards.RegisterSegment(db, rp, group.Key, segPath);
+            SegmentWriter.WriteSegment(segPath, points);
+            _shards.RegisterSegment(db, rp, shardId, segPath);
         }
         l.Clear();
         var key = K(db, rp);
         _bufBySeries.Remove(key);
         UpdateBufferReplayFloor(key, l);
-        UpdateWalCheckpoint();
+        if (updateCheckpoint)
+            UpdateWalCheckpoint();
     }
 
     private void FlushDatabase(string db)
     {
         _globalLock.EnterWriteLock();
-        try { foreach (var kv in _buf.Where(kv => kv.Key.StartsWith(db + "|")).ToList()) { var p = kv.Key.Split('|'); var lk = GetLock(kv.Key, alreadyHoldingGlobalWrite: true); lk.EnterWriteLock(); try { FlushLocked(p[0], p[1], kv.Value); } finally { lk.ExitWriteLock(); } } }
+        try
+        {
+            foreach (var kv in _buf.Where(kv => kv.Key.StartsWith(db + "|")).ToList())
+            {
+                var p = kv.Key.Split('|');
+                var lk = GetLock(kv.Key, alreadyHoldingGlobalWrite: true);
+                lk.EnterWriteLock();
+                try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
+                finally { lk.ExitWriteLock(); }
+            }
+            UpdateWalCheckpoint();
+        }
         finally { _globalLock.ExitWriteLock(); }
     }
 
     public void FlushAll()
     {
         _globalLock.EnterWriteLock();
-        try { foreach (var kv in _buf.ToArray()) { var p = kv.Key.Split('|'); var lk = GetLock(kv.Key, alreadyHoldingGlobalWrite: true); lk.EnterWriteLock(); try { FlushLocked(p[0], p[1], kv.Value); } finally { lk.ExitWriteLock(); } } }
+        try
+        {
+            foreach (var kv in _buf.ToArray())
+            {
+                var p = kv.Key.Split('|');
+                var lk = GetLock(kv.Key, alreadyHoldingGlobalWrite: true);
+                lk.EnterWriteLock();
+                try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
+                finally { lk.ExitWriteLock(); }
+            }
+            UpdateWalCheckpoint();
+        }
         finally { _globalLock.ExitWriteLock(); }
     }
 
@@ -1232,9 +1429,10 @@ public sealed class TsdbEngine : IDisposable
                     var p = kv.Key.Split('|');
                     var lk = GetLock(kv.Key, alreadyHoldingGlobalWrite: true);
                     lk.EnterWriteLock();
-                    try { FlushLocked(p[0], p[1], kv.Value); }
+                    try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
                     finally { lk.ExitWriteLock(); }
                 }
+                UpdateWalCheckpoint();
             }
             finally { _globalLock.ExitWriteLock(); }
         }
