@@ -44,6 +44,10 @@ Runs the repeatable local performance comparison. Keep benchmark output as evide
 
 Use idiomatic C# with 4-space indentation. Prefer small, direct methods over new abstractions. Public types and methods use `PascalCase`; locals and private fields use `camelCase` or `_camelCase` following nearby code. Keep Native AOT friendliness in mind: avoid reflection-heavy patterns and unnecessary dependencies.
 
+## Documentation Guidelines
+
+Keep `README.md` organized around completed capabilities and stable usage. Do not add temporary sections such as "recently completed", "next steps", or iteration notes; put detailed benchmark history in `benchmark.md` and planning/status details in `todo-*.md`.
+
 ## Testing Guidelines
 
 Tests use xUnit. Name tests as `MethodOrScenario_Condition_ExpectedResult`, matching existing files such as `LineProtocolParserTests.cs` and `WalTests.cs`. Add one focused test for parser, WAL, storage, or query behavior when changing non-trivial logic. Run the full test command before committing performance or storage changes.
