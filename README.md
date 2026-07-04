@@ -525,7 +525,7 @@ MiniInflux 聚合查询 report：`ScannedPoints=1250`、`UsedAggregatePushdown=t
 
 ### 2026-06-28 写入专项复测
 
-压测脚本会在 MiniInflux 启动时把 `MiniInflux:FlushThreshold` 设置为 `max(points * 2, 50000)`，避免默认 50,000 点同步 flush 把 segment 落盘耗时计入纯写入吞吐。
+当前压测脚本默认会在 MiniInflux 写入计时后显式 flush 并生成 segment 文件，同时单独输出 `FlushAfterWriteMs`，避免把 WAL + 内存 buffer 口径误当成完整落盘；如需复现旧的纯写入/WAL 口径，可显式传入 `-BufferOnly`。
 
 | Metric | MiniInflux | InfluxDB 1.7.9 | Ratio |
 | --- | ---: | ---: | ---: |

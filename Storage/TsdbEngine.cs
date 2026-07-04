@@ -32,6 +32,7 @@ public sealed class TsdbEngine : IDisposable
     private readonly long _maxSeriesPerDb;
     private readonly long _maxBufferPoints;
     private readonly long _maxBufferBytes;
+    private readonly bool _syncFlushOnThreshold;
     private readonly Dictionary<string, HashSet<SeriesKey>> _seriesKeys = new(StringComparer.Ordinal);
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
@@ -42,7 +43,7 @@ public sealed class TsdbEngine : IDisposable
         int rpCheckIntervalMs = 60000, long maxSeriesPerDb = 10_000_000, int maxFieldsPerMeasurement = 1024,
         int flushIntervalMs = 5000, long maxBufferPoints = 1_000_000, long maxBufferBytes = 0, int compactionIntervalMs = 30000)
     {
-        _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
+        _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes; _syncFlushOnThreshold = flushIntervalMs <= 0;
         Directory.CreateDirectory(_root);
         _wal = new WalManager(Path.Combine(_root, "wal"), maxWalFileBytes, walFsync, walFsyncIntervalMs);
         _manifest = new Manifest(_root);
@@ -151,7 +152,7 @@ public sealed class TsdbEngine : IDisposable
             if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
             AddWrittenPoints(db, key, list, pending, walPositions);
             UpdateBufferReplayFloor(key, list);
-            if (list.Count >= _threshold) FlushLocked(db, rp, list);
+            if (_syncFlushOnThreshold && list.Count >= _threshold) FlushLocked(db, rp, list);
         }
         finally { lk.ExitWriteLock(); }
         return Task.CompletedTask;
@@ -395,6 +396,53 @@ public sealed class TsdbEngine : IDisposable
             return result.Values.ToList();
         }
         finally { lk.ExitReadLock(); }
+    }
+
+    public List<Point>? TryReadSeriesDescending(string db, string rp, string measurement, string tagsCanonical,
+        long? min, long? max, HashSet<string>? requestedFields = null, int? limit = null, CancellationToken cancellationToken = default)
+    {
+        var result = new Dictionary<long, Point>();
+        var buffered = TryReadBufferedSeriesDescending(db, rp, measurement, tagsCanonical, min, max, requestedFields, limit, cancellationToken);
+        if (buffered == null) return null;
+        AddDescendingPoints(result, buffered, limit);
+        if (limit.HasValue && result.Count >= limit.Value) return result.Values.ToList();
+
+        var segments = new List<(string Path, long MaxTime)>();
+        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var maxTime = ReadSegmentMetadataCached(segPath).Metas
+                    .Where(m => m.Measurement == measurement && m.TagsCanonical == tagsCanonical
+                        && (!min.HasValue || m.MaxTime >= min.Value)
+                        && (!max.HasValue || m.MinTime <= max.Value)
+                        && (requestedFields == null || requestedFields.Contains(m.Field)))
+                    .Select(m => (long?)m.MaxTime)
+                    .Max();
+                if (maxTime.HasValue) segments.Add((segPath, maxTime.Value));
+            }
+            catch (InvalidDataException) { }
+        }
+
+        var allowed = new HashSet<string>(StringComparer.Ordinal) { tagsCanonical };
+        foreach (var seg in segments.OrderByDescending(s => s.MaxTime))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                AddSegmentColumnsDescending(
+                    result,
+                    ReadSegmentColumns(db, seg.Path, requestedFields, measurement, min, max, allowed),
+                    min,
+                    max,
+                    limit);
+                if (limit.HasValue && result.Count >= limit.Value) break;
+            }
+            catch (InvalidDataException) { }
+        }
+
+        return result.Values.ToList();
     }
 
     public IEnumerable<Point> EnumeratePoints(string db, string rp, string? meas, long? min, long? max,
@@ -774,6 +822,51 @@ public sealed class TsdbEngine : IDisposable
             fs[c.Field] = c.Values[i];
         }
         foreach (var it in map) yield return new Point { Measurement = it.Key.Item1, Tags = ParseTags(it.Key.Item2), TimestampNs = it.Key.Item3, Fields = it.Value };
+    }
+
+    private static void AddDescendingPoints(Dictionary<long, Point> result, IEnumerable<Point> points, int? limit)
+    {
+        foreach (var point in points)
+        {
+            if (result.TryGetValue(point.TimestampNs, out var existing))
+            {
+                foreach (var field in point.Fields)
+                    if (!existing.Fields.ContainsKey(field.Key))
+                        existing.Fields[field.Key] = field.Value;
+            }
+            else
+            {
+                result[point.TimestampNs] = point;
+                if (limit.HasValue && result.Count >= limit.Value) break;
+            }
+        }
+    }
+
+    private static void AddSegmentColumnsDescending(Dictionary<long, Point> result, List<SegmentColumn> columns, long? min, long? max, int? limit)
+    {
+        foreach (var column in columns)
+        {
+            var tags = ParseTags(column.TagsCanonical);
+            for (var i = column.Timestamps.Count - 1; i >= 0; i--)
+            {
+                var ts = column.Timestamps[i];
+                if (min.HasValue && ts < min.Value) break;
+                if (max.HasValue && ts > max.Value) continue;
+                if (!result.TryGetValue(ts, out var point))
+                {
+                    if (limit.HasValue && result.Count >= limit.Value) continue;
+                    point = new Point
+                    {
+                        Measurement = column.Measurement,
+                        Tags = tags,
+                        TimestampNs = ts,
+                        Fields = new Dictionary<string, FieldValue>(StringComparer.Ordinal)
+                    };
+                    result[ts] = point;
+                }
+                point.Fields[column.Field] = column.Values[i];
+            }
+        }
     }
 
     private static Dictionary<string, string> ParseTags(string s)

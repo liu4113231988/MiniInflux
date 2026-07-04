@@ -117,6 +117,31 @@ public class MediumPriorityFixTests : IDisposable
     }
 
     [Fact]
+    public async Task RawDescLimitFastJson_WorksAfterFlush()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 2);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1, "server01", 1),
+            Point("cpu", "value", 2, "server01", 2),
+            Point("cpu", "value", 3, "server01", 3)
+        ]);
+        engine.FlushAll();
+
+        var outcome = new QueryExecutor().TryExecuteBufferedRawDescendingJson(
+            engine,
+            "testdb",
+            "SELECT * FROM cpu WHERE host='server01' ORDER BY time DESC LIMIT 2",
+            "ns");
+
+        Assert.NotNull(outcome);
+        Assert.True(outcome.Report.UsedStreamingRawSelect);
+        var json = Encoding.UTF8.GetString(outcome.Json);
+        Assert.Contains("[3000000000,3", json);
+        Assert.Contains("[2000000000,2", json);
+    }
+
+    [Fact]
     public async Task FillLinear_InterpolatesMissingBucket()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);

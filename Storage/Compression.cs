@@ -643,7 +643,7 @@ public static class CompressionCodec
     private static byte[] CompressBrotli(byte[] input)
     {
         using var ms = new MemoryStream();
-        using (var brotli = new BrotliStream(ms, CompressionLevel.SmallestSize, leaveOpen: true))
+        using (var brotli = new BrotliStream(ms, CompressionLevel.Fastest, leaveOpen: true))
             brotli.Write(input);
         return ms.ToArray();
     }

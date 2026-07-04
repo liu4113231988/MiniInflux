@@ -124,13 +124,13 @@ public sealed class QueryExecutor
             var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);
             var requestedFields = BuildRequestedFields(q);
             var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
-            if (seriesFilter is null || seriesFilter.Count != 1 || e.HasSegments(sourceDb, sourceRp, q.MinTimeNs, q.MaxTimeNs))
+            if (seriesFilter is null || seriesFilter.Count != 1)
                 return null;
 
             var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
             var readLimit = checked(Math.Max(0, q.Offset ?? 0) + rowLimit);
             var tagsCanonical = seriesFilter.First();
-            var points = e.TryReadBufferedSeriesDescending(
+            var points = e.TryReadSeriesDescending(
                 sourceDb,
                 sourceRp,
                 q.Measurement!,
@@ -142,6 +142,7 @@ public sealed class QueryExecutor
                 token);
             if (points is null)
                 return null;
+            report.UsedStreamingRawSelect = true;
 
             var resultMeasurement = ResolveResultMeasurementName(q);
             var fields = ResolveRawFields(e, sourceDb, q, requestedFields);

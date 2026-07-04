@@ -3,7 +3,8 @@ param(
     [int]$BatchSize = 5000,
     [int]$Concurrency = 1,
     [string]$Epoch = '',
-    [int]$QueryIterations = 5
+    [int]$QueryIterations = 5,
+    [switch]$BufferOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -141,6 +142,19 @@ function New-LineProtocolBatch {
     return $builder.ToString()
 }
 
+function Get-StorageStats {
+    param([string]$DataPath)
+
+    $segments = @(Get-ChildItem -LiteralPath $DataPath -Recurse -Filter '*.seg' -File -ErrorAction SilentlyContinue)
+    $wals = @(Get-ChildItem -LiteralPath $DataPath -Recurse -Filter '*.wal' -File -ErrorAction SilentlyContinue)
+    return [pscustomobject]@{
+        SegmentFiles = $segments.Count
+        SegmentBytes = ($segments | Measure-Object -Property Length -Sum).Sum
+        WalFiles = $wals.Count
+        WalBytes = ($wals | Measure-Object -Property Length -Sum).Sum
+    }
+}
+
 function Measure-Server {
     param(
         [string]$Name,
@@ -173,6 +187,9 @@ function Measure-Server {
 
     $writeWatch = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($chunk in $writeChunks) {
+        if (($chunk.Index % 5) -eq 0) {
+            [Console]::Error.WriteLine("[$Name] writing batch $($chunk.Index + 1)/$writeBatchCount")
+        }
         $content = [System.Net.Http.StringContent]::new($chunk.Payload, [System.Text.Encoding]::UTF8, 'text/plain')
         $response = $client.PostAsync("$BaseUrl/write?db=$Database&precision=ns", $content).GetAwaiter().GetResult()
         $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
@@ -181,6 +198,20 @@ function Measure-Server {
         }
     }
     $writeWatch.Stop()
+    [Console]::Error.WriteLine("[$Name] write completed in $([Math]::Round($writeWatch.Elapsed.TotalSeconds, 3))s")
+
+    $flushMs = $null
+    if ($Name -eq 'MiniInflux') {
+        $flushWatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $flushResponse = $client.PostAsync("$BaseUrl/admin/api/maintenance/flush", [System.Net.Http.StringContent]::new('', [System.Text.Encoding]::UTF8, 'application/json')).GetAwaiter().GetResult()
+        $flushBody = $flushResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $flushResponse.IsSuccessStatusCode) {
+            throw "MiniInflux flush failed: $($flushResponse.StatusCode) $flushBody"
+        }
+        $flushWatch.Stop()
+        $flushMs = [Math]::Round($flushWatch.Elapsed.TotalMilliseconds, 2)
+        [Console]::Error.WriteLine("[MiniInflux] flush completed in ${flushMs}ms")
+    }
 
     $aggregateQuery = "SELECT mean(value),count(value) FROM cpu WHERE host='server00' AND region='cn'"
     $rawLimitQuery = "SELECT * FROM cpu WHERE host='server00' AND region='cn' ORDER BY time DESC LIMIT 1000"
@@ -190,6 +221,7 @@ function Measure-Server {
 
     $query1 = Measure-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $aggregateQuery -Epoch $Epoch -Iterations $QueryIterations
     $query2 = Measure-Query -Client $client -BaseUrl $BaseUrl -Database $Database -Query $rawLimitQuery -Epoch $Epoch -Iterations $QueryIterations
+    [Console]::Error.WriteLine("[$Name] queries completed")
     $query1Body = $query1.Body
     $query2Body = $query2.Body
 
@@ -212,6 +244,7 @@ function Measure-Server {
         Concurrency = $Concurrency
         WriteSeconds = [Math]::Round($writeWatch.Elapsed.TotalSeconds, 3)
         WriteThroughput = [Math]::Round($Points / [Math]::Max($writeWatch.Elapsed.TotalSeconds, 0.001), 2)
+        FlushAfterWriteMs = $flushMs
         AggregateQueryMs = $query1.MedianMs
         RawLimitQueryMs = $query2.MedianMs
         AggregateQuerySamplesMs = $query1.SamplesMs
@@ -251,7 +284,8 @@ try {
     $env:Http__SuppressWriteLog = 'true'
     $env:Logging__ConsoleEnabled = 'false'
     $env:Logging__FileEnabled = 'false'
-    $env:MiniInflux__FlushThreshold = [Math]::Max($Points * 2, 50000).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    $miniFlushThreshold = if ($BufferOnly) { [Math]::Max($Points * 2, 50000) } else { [Math]::Max(1, [Math]::Min(50000, [int][Math]::Floor($Points / 2.0))) }
+    $env:MiniInflux__FlushThreshold = $miniFlushThreshold.ToString([System.Globalization.CultureInfo]::InvariantCulture)
     $env:DOTNET_CLI_HOME = (Join-Path $root '.dotnet_home')
     $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
 
@@ -260,6 +294,7 @@ try {
 
     $miniResult = Measure-Server -Name 'MiniInflux' -BaseUrl 'http://127.0.0.1:18086' -Database 'benchmini' -Points $Points -BatchSize $BatchSize -Concurrency $Concurrency -Epoch $Epoch -QueryIterations $QueryIterations
     $influxResult = Measure-Server -Name 'InfluxDB 1.7.9' -BaseUrl 'http://127.0.0.1:18087' -Database 'benchinflux' -Points $Points -BatchSize $BatchSize -Concurrency $Concurrency -Epoch $Epoch -QueryIterations $QueryIterations
+    $miniStorage = Get-StorageStats -DataPath $miniData
 
     [pscustomobject]@{
         TimestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -267,6 +302,9 @@ try {
         Points = $Points
         BatchSize = $BatchSize
         Concurrency = $Concurrency
+        MiniInfluxBufferOnly = [bool]$BufferOnly
+        MiniInfluxFlushThreshold = $miniFlushThreshold
+        MiniInfluxStorage = $miniStorage
         Results = @($miniResult, $influxResult)
     } | ConvertTo-Json -Depth 6
 }
