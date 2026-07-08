@@ -12,5 +12,7 @@
     <Compile Remove="MiniInflux.Tests\**" />
     <Content Remove="MiniInflux.Tests\**" />
     <None Remove="MiniInflux.Tests\**" />
+    <Content Remove="wwwroot\**\*" />
+    <EmbeddedResource Include="wwwroot\**\*" LogicalName="wwwroot/%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 </Project>

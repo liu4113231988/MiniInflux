@@ -99,15 +99,15 @@ public static class SegmentWriter
                 foreach (var column in columns)
                 {
                     var kind = column.Kind;
-                    var ts = column.Timestamps.ToArray();
-                    var vals = column.Values.ToArray();
+                    var ts = column.Timestamps;
+                    var vals = column.Values;
                     var timestampBlock = CompressionCodec.EncodeTimestampsAdaptive(ts);
                     var valueBlock = CompressionCodec.EncodeValuesAdaptive(kind, vals);
                     WriteString(bw, column.Measurement);
                     WriteString(bw, column.TagsCanonical);
                     WriteString(bw, column.Field);
                     bw.Write((byte)kind);
-                    bw.Write(ts[0]); bw.Write(ts[^1]); bw.Write(ts.Length);
+                    bw.Write(ts[0]); bw.Write(ts[^1]); bw.Write(ts.Count);
                     bw.Write((byte)timestampBlock.Codec);
                     bw.Write((byte)timestampBlock.Compression);
                     bw.Write((byte)valueBlock.Codec);
@@ -119,7 +119,7 @@ public static class SegmentWriter
                     bw.Write(stats.Min); bw.Write(stats.Max); bw.Write(stats.Sum); bw.Write(stats.Count);
                     metas.Add(new SegmentColumnMeta(
                         column.Measurement, column.TagsCanonical, column.Field, kind,
-                        ts[0], ts[^1], ts.Length, new BlockStats(stats.Min, stats.Max, stats.Sum, stats.Count),
+                        ts[0], ts[^1], ts.Count, new BlockStats(stats.Min, stats.Max, stats.Sum, stats.Count),
                         timestampBlock.Codec, valueBlock.Codec, timestampBlock.Compression, valueBlock.Compression));
                 }
 
@@ -145,9 +145,9 @@ public static class SegmentWriter
         File.Move(tmpPath, path);
     }
 
-    private static (double Min, double Max, double Sum, int Count) ComputeStats(FieldKind kind, FieldValue[] vals)
+    private static (double Min, double Max, double Sum, int Count) ComputeStats(FieldKind kind, IReadOnlyList<FieldValue> vals)
     {
-        if (vals.Length == 0) return (0, 0, 0, 0);
+        if (vals.Count == 0) return (0, 0, 0, 0);
         double min = 0, max = 0, sum = 0;
         if (kind == FieldKind.Float || kind == FieldKind.Integer)
         {
@@ -156,8 +156,16 @@ public static class SegmentWriter
             foreach (var v in vals) { var d = kind == FieldKind.Float ? v.Float : v.Integer; if (d < min) min = d; if (d > max) max = d; sum += d; }
         }
         else if (kind == FieldKind.Boolean)
-        { int tc = vals.Count(v => v.Boolean); min = tc > 0 ? 0 : 1; max = tc > 0 ? 1 : 0; sum = tc; }
-        return (min, max, sum, vals.Length);
+        {
+            var trueCount = 0;
+            foreach (var value in vals)
+                if (value.Boolean)
+                    trueCount++;
+            min = trueCount > 0 ? 0 : 1;
+            max = trueCount > 0 ? 1 : 0;
+            sum = trueCount;
+        }
+        return (min, max, sum, vals.Count);
     }
 
     private static void WriteString(BinaryWriter bw, string v)

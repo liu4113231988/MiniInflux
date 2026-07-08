@@ -1,10 +1,10 @@
 using System.Globalization;
 using System.IO.Compression;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 using System.Buffers;
-using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
@@ -96,9 +96,10 @@ builder.Services.AddHostedService<ContinuousQueryHostedService>();
 var app = builder.Build();
 var runtimeLogger = app.Logger;
 var accessLogWriter = app.Services.GetRequiredService<AccessLogWriter>();
-var webRoot = Path.Combine(app.Environment.ContentRootPath, "wwwroot");
-var adminIndexPath = Path.Combine(webRoot, "admin", "index.html");
-var adminAssetsRoot = Path.GetFullPath(Path.Combine(webRoot, "admin", "assets"));
+var staticAssets = Assembly.GetExecutingAssembly()
+    .GetManifestResourceNames()
+    .Where(name => name.StartsWith("wwwroot/", StringComparison.Ordinal))
+    .ToDictionary(name => name.Replace('\\', '/'), StringComparer.Ordinal);
 
 engine.Recover();
 runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {BindAddress}, auth {AuthEnabled}, log level {LogLevel}",
@@ -164,15 +165,6 @@ app.Use(async (context, next) =>
     }
 
     await next();
-});
-
-app.UseDefaultFiles(new DefaultFilesOptions
-{
-    FileProvider = new PhysicalFileProvider(webRoot)
-});
-app.UseStaticFiles(new StaticFileOptions
-{
-    FileProvider = new PhysicalFileProvider(webRoot)
 });
 
 app.MapGet("/ping", () => Results.NoContent());
@@ -531,27 +523,19 @@ adminApi.MapPost("/maintenance/cq/run", async (HttpRequest request, ContinuousQu
     }, AppJsonContext.Default.MaintenanceResult);
 });
 
-app.MapGet("/admin", () => File.Exists(adminIndexPath)
-    ? Results.File(adminIndexPath, "text/html; charset=utf-8")
-    : Results.NotFound());
+app.MapGet("/admin", () => EmbeddedFile(staticAssets, "admin/index.html", "text/html; charset=utf-8"));
 
 app.MapGet("/admin/assets/{**assetPath}", (string? assetPath, HttpResponse response) =>
 {
     if (string.IsNullOrWhiteSpace(assetPath))
         return Results.NotFound();
 
-    var candidatePath = Path.GetFullPath(Path.Combine(
-        adminAssetsRoot,
-        assetPath.Replace('/', Path.DirectorySeparatorChar)));
-    var assetsPrefix = adminAssetsRoot.EndsWith(Path.DirectorySeparatorChar)
-        ? adminAssetsRoot
-        : adminAssetsRoot + Path.DirectorySeparatorChar;
-
-    if (!candidatePath.StartsWith(assetsPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(candidatePath))
+    var resourcePath = "admin/assets/" + assetPath.Replace('\\', '/');
+    if (resourcePath.Contains("../", StringComparison.Ordinal) || !staticAssets.ContainsKey("wwwroot/" + resourcePath))
         return Results.NotFound();
 
     response.Headers.CacheControl = "public,max-age=31536000,immutable";
-    return Results.File(candidatePath, GetAdminAssetContentType(candidatePath));
+    return EmbeddedFile(staticAssets, resourcePath, GetAdminAssetContentType(resourcePath));
 });
 
 app.MapGet("/admin/{**path}", (string? path) =>
@@ -562,9 +546,24 @@ app.MapGet("/admin/{**path}", (string? path) =>
         return Results.NotFound();
     if (!string.IsNullOrWhiteSpace(path) && Path.HasExtension(path))
         return Results.NotFound();
-    return File.Exists(adminIndexPath)
-        ? Results.File(adminIndexPath, "text/html; charset=utf-8")
-        : Results.NotFound();
+    return EmbeddedFile(staticAssets, "admin/index.html", "text/html; charset=utf-8");
+});
+
+app.MapGet("/", () => EmbeddedFile(staticAssets, "index.html", "text/html; charset=utf-8"));
+
+app.MapGet("/{**staticPath}", (string? staticPath) =>
+{
+    if (string.IsNullOrWhiteSpace(staticPath))
+        return EmbeddedFile(staticAssets, "index.html", "text/html; charset=utf-8");
+
+    var resourcePath = staticPath.Replace('\\', '/');
+    if (resourcePath.Contains("../", StringComparison.Ordinal))
+        return Results.NotFound();
+
+    if (!Path.HasExtension(resourcePath))
+        resourcePath = resourcePath.TrimEnd('/') + "/index.html";
+
+    return EmbeddedFile(staticAssets, resourcePath, GetAdminAssetContentType(resourcePath));
 });
 
 app.Lifetime.ApplicationStopping.Register(() =>
@@ -892,6 +891,7 @@ static string GetAdminAssetContentType(string path)
         ".css" => "text/css; charset=utf-8",
         ".js" => "text/javascript; charset=utf-8",
         ".json" => "application/json; charset=utf-8",
+        ".html" => "text/html; charset=utf-8",
         ".svg" => "image/svg+xml",
         ".png" => "image/png",
         ".jpg" or ".jpeg" => "image/jpeg",
@@ -901,6 +901,16 @@ static string GetAdminAssetContentType(string path)
         ".woff2" => "font/woff2",
         _ => "application/octet-stream"
     };
+}
+
+static IResult EmbeddedFile(Dictionary<string, string> staticAssets, string path, string contentType)
+{
+    var resourceName = "wwwroot/" + path.TrimStart('/').Replace('\\', '/');
+    if (!staticAssets.TryGetValue(resourceName, out var manifestName))
+        return Results.NotFound();
+
+    var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(manifestName);
+    return stream is null ? Results.NotFound() : Results.Stream(stream, contentType);
 }
 
 public sealed record ErrorResponse([property: System.Text.Json.Serialization.JsonPropertyName("error")] string Error);
