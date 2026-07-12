@@ -761,8 +761,8 @@ public sealed class QueryExecutor
                 {
                     var resultBytes = EstimateQuerySeriesBytes(pushedDown);
                     report.EstimatedResultBytes = resultBytes;
-                    report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, resultBytes);
-                    EnsureQueryMemoryLimit(resultBytes);
+                    report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + resultBytes);
+                    EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
                     if (!string.IsNullOrWhiteSpace(q.IntoTarget))
                     {
                         var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, pushedDown);
@@ -778,7 +778,7 @@ public sealed class QueryExecutor
             if (streamedAggregate != null)
             {
                 report.EstimatedResultBytes = EstimateQuerySeriesBytes(streamedAggregate);
-                report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedResultBytes);
+                report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + report.EstimatedResultBytes);
                 EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
                 return streamedAggregate;
             }

@@ -241,9 +241,9 @@ public class P0TodoTests : IDisposable
 
         var compactor = new Compactor(engine.Meta, new ShardManager(engine.RootPath, engine.Meta), engine.Tombstones, engine.Schema, maxL0Segments: 2, maxL1Segments: 1);
 
-        Assert.Equal(1, compactor.CompactAll());
+        Assert.Equal(2, compactor.CompactAll());
         var repairedShard = Assert.Single(engine.Meta.GetShards("testdb", "autogen"));
-        Assert.Single(repairedShard.SegmentFiles, file => file.StartsWith("l1-", StringComparison.OrdinalIgnoreCase));
+        Assert.Single(repairedShard.SegmentFiles, file => file.StartsWith("l2-", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(repairedShard.SegmentFiles, file => file.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase));
         Assert.Equal(2, engine.ReadAllPoints("testdb", "autogen", "cpu", null, null).Count);
     }

@@ -7,6 +7,7 @@ public class IndexTests : IDisposable
 {
     private readonly string _testDir;
     private readonly TsdbEngine _engine;
+    private bool _engineDisposed;
 
     public IndexTests()
     {
@@ -17,7 +18,8 @@ public class IndexTests : IDisposable
 
     public void Dispose()
     {
-        _engine.Dispose();
+        if (!_engineDisposed)
+            _engine.Dispose();
         if (Directory.Exists(_testDir))
             Directory.Delete(_testDir, true);
     }
@@ -153,9 +155,7 @@ public class IndexTests : IDisposable
     [Fact]
     public async Task Indexes_ArePersistedWhenEngineDisposes()
     {
-        using (var engine = new TsdbEngine(_testDir, flushThreshold: 1000))
-        {
-            await engine.WriteAsync("testdb", "autogen",
+        await _engine.WriteAsync("testdb", "autogen",
             [
                 new Point
                 {
@@ -165,7 +165,8 @@ public class IndexTests : IDisposable
                     TimestampNs = 1000_000_000
                 }
             ]);
-        }
+        _engine.Dispose();
+        _engineDisposed = true;
 
         var reloaded = new Manifest(_testDir);
         Assert.Single(reloaded.GetSeries("testdb", "cpu"));
@@ -175,8 +176,7 @@ public class IndexTests : IDisposable
     [Fact]
     public async Task Indexes_RemainQueryableBeforeManifestFlush()
     {
-        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
-        await engine.WriteAsync("testdb", "autogen",
+        await _engine.WriteAsync("testdb", "autogen",
         [
             new Point
             {
@@ -187,8 +187,8 @@ public class IndexTests : IDisposable
             }
         ]);
 
-        Assert.Single(engine.Meta.GetSeries("testdb", "cpu"));
-        Assert.Single(engine.Meta.GetTagValues("testdb", "cpu", "host"));
+        Assert.Single(_engine.Meta.GetSeries("testdb", "cpu"));
+        Assert.Single(_engine.Meta.GetTagValues("testdb", "cpu", "host"));
     }
 
     [Fact]

@@ -309,6 +309,7 @@ public sealed class Manifest
             return rpInfo.ShardGroups
                 .Where(s => (!maxTimeNs.HasValue || s.EndTimeNs >= maxTimeNs.Value)
                          && (!minTimeNs.HasValue || s.StartTimeNs <= minTimeNs.Value))
+                .Select(CloneShard)
                 .ToList();
         }
     }
@@ -322,10 +323,18 @@ public sealed class Manifest
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
             return dbInfo.RetentionPolicies
-                .SelectMany(kv => kv.Value.ShardGroups.Select(s => (kv.Key, s)))
+                .SelectMany(kv => kv.Value.ShardGroups.Select(s => (kv.Key, CloneShard(s))))
                 .ToList();
         }
     }
+
+    private static ShardGroupInfo CloneShard(ShardGroupInfo shard) => new()
+    {
+        Id = shard.Id,
+        StartTimeNs = shard.StartTimeNs,
+        EndTimeNs = shard.EndTimeNs,
+        SegmentFiles = [.. shard.SegmentFiles]
+    };
 
     public void AddSegmentToShard(string db, string rp, int shardId, string segmentFile)
     {

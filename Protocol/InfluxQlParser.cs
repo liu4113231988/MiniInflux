@@ -270,7 +270,7 @@ public static class InfluxQlParser
         var intoIndex = fieldText.ToUpperInvariant().LastIndexOf(" INTO ", StringComparison.Ordinal);
         if (intoIndex >= 0)
         {
-            intoTarget = Unq(fieldText[(intoIndex + 6)..].Trim());
+            intoTarget = fieldText[(intoIndex + 6)..].Trim();
             fieldText = fieldText[..intoIndex].Trim();
         }
         var rest = q[(fi + 6)..].Trim();

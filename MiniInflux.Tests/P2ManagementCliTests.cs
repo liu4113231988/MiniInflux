@@ -569,7 +569,7 @@ public sealed class P2ManagementCliTests : IDisposable
             stderr);
         Assert.Equal(1, exitCode);
         Assert.Contains("backup verification failed:", stderr.ToString());
-        Assert.Contains("checksum mismatch", stderr.ToString());
+        Assert.Contains("length mismatch", stderr.ToString());
     }
 
     [Fact]

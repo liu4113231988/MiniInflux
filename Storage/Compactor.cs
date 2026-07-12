@@ -288,13 +288,6 @@ public sealed class Compactor
 
     private bool FinalizeCompaction(string db, string rp, int shardId, List<FileCandidate> sourceFiles, string? mergedPath)
     {
-        if (!TryStageSourceFiles(sourceFiles, out var stagedMoves))
-        {
-            if (!string.IsNullOrWhiteSpace(mergedPath))
-                TryDelete(mergedPath);
-            return false;
-        }
-
         try
         {
             _manifest.ReplaceSegmentsInShard(
@@ -307,14 +300,13 @@ public sealed class Compactor
         catch (Exception ex)
         {
             _health?.RecordFailure("compaction_manifest", ex);
-            RollbackStageMoves(stagedMoves);
             if (!string.IsNullOrWhiteSpace(mergedPath))
                 TryDelete(mergedPath);
             return false;
         }
 
-        foreach (var move in stagedMoves)
-            TryDelete(move.StagedPath);
+        foreach (var source in sourceFiles)
+            TryDelete(source.Path);
 
         return true;
     }
@@ -331,42 +323,6 @@ public sealed class Compactor
     {
         try { File.Delete(path); }
         catch (Exception ex) { _health?.RecordFailure("compaction_delete", ex); }
-    }
-
-    private bool TryStageSourceFiles(List<FileCandidate> sourceFiles, out List<StagedMove> stagedMoves)
-    {
-        stagedMoves = [];
-        foreach (var source in sourceFiles)
-        {
-            var stagedPath = source.Path + $".compacted-{Guid.NewGuid():N}";
-            try
-            {
-                File.Move(source.Path, stagedPath);
-                stagedMoves.Add(new StagedMove(source.Path, stagedPath));
-            }
-            catch (Exception ex)
-            {
-                _health?.RecordFailure("compaction_stage", ex);
-                RollbackStageMoves(stagedMoves);
-                stagedMoves = [];
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private void RollbackStageMoves(List<StagedMove> stagedMoves)
-    {
-        for (int i = stagedMoves.Count - 1; i >= 0; i--)
-        {
-            try
-            {
-                if (File.Exists(stagedMoves[i].StagedPath))
-                    File.Move(stagedMoves[i].StagedPath, stagedMoves[i].OriginalPath);
-            }
-            catch (Exception ex) { _health?.RecordFailure("compaction_rollback", ex); }
-        }
     }
 
     private long SafeLength(string path)
@@ -447,7 +403,6 @@ public sealed class Compactor
 
     private sealed record CompactionTask(string Db, string Rp, ShardGroupInfo Shard, int Level, List<FileCandidate> Files);
     private sealed record FileCandidate(string Path, long Length, DateTime LastWriteUtc, int Level, long? MinTimeNs, long? MaxTimeNs);
-    private sealed record StagedMove(string OriginalPath, string StagedPath);
 }
 
 public sealed class CompactionStatsSnapshot

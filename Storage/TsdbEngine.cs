@@ -36,7 +36,6 @@ public sealed class TsdbEngine : IDisposable
     private readonly long _maxSeriesPerDb;
     private readonly long _maxBufferPoints;
     private readonly long _maxBufferBytes;
-    private readonly bool _syncFlushOnThreshold;
     private readonly Dictionary<string, HashSet<SeriesKey>> _seriesKeys = new(StringComparer.Ordinal);
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
@@ -47,7 +46,7 @@ public sealed class TsdbEngine : IDisposable
         int rpCheckIntervalMs = 60000, long maxSeriesPerDb = 10_000_000, int maxFieldsPerMeasurement = 1024,
         int flushIntervalMs = 5000, long maxBufferPoints = 1_000_000, long maxBufferBytes = 0, int compactionIntervalMs = 30000)
     {
-        _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes; _syncFlushOnThreshold = flushIntervalMs <= 0;
+        _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
         Directory.CreateDirectory(_root);
         _wal = new WalManager(Path.Combine(_root, "wal"), maxWalFileBytes, walFsync, walFsyncIntervalMs, _health);
         _manifest = new Manifest(_root);
@@ -158,7 +157,7 @@ public sealed class TsdbEngine : IDisposable
             if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
             AddWrittenPoints(db, key, list, pending, walPositions);
             UpdateBufferReplayFloor(key, list);
-            if (_syncFlushOnThreshold && list.Count >= _threshold) FlushLocked(db, rp, list);
+            if (list.Count >= _threshold) FlushLocked(db, rp, list);
         }
         finally { lk.ExitWriteLock(); }
         return Task.CompletedTask;
@@ -327,6 +326,7 @@ public sealed class TsdbEngine : IDisposable
                 res.AddRange(Rebuild(ReadSegmentColumns(db, segPath, requestedFields, meas, min, max, allowedTagsCanonical), min, max));
             }
             catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
         }
         return DeduplicatePoints(res.OrderBy(x => x.TimestampNs).ToList());
     }
@@ -434,6 +434,7 @@ public sealed class TsdbEngine : IDisposable
                 if (maxTime.HasValue) segments.Add((segPath, maxTime.Value));
             }
             catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
         }
 
         var allowed = new HashSet<string>(StringComparer.Ordinal) { tagsCanonical };
@@ -454,6 +455,7 @@ public sealed class TsdbEngine : IDisposable
                 if (limit.HasValue && result.Count >= limit.Value) break;
             }
             catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
         }
 
         return new DescendingSeriesReadResult(
@@ -496,6 +498,7 @@ public sealed class TsdbEngine : IDisposable
                 if (maxTime.HasValue) segments.Add((segPath, maxTime.Value));
             }
             catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
         }
 
         var timestamps = new List<long>(limit ?? 0);
@@ -525,6 +528,7 @@ public sealed class TsdbEngine : IDisposable
                 }
             }
             catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
         }
 
         return new DescendingFieldReadResult(timestamps, values, segmentColumnsRead, "segments-exhausted");
@@ -567,6 +571,7 @@ public sealed class TsdbEngine : IDisposable
                 segments.Add((segPath, metas.Max(m => m.MaxTime)));
             }
             catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
         }
 
         var timestamps = new List<long>(limit ?? 0);
@@ -605,6 +610,7 @@ public sealed class TsdbEngine : IDisposable
                     return new DescendingFieldsReadResult(timestamps, rows, segmentColumnsRead, "segment-limit");
             }
             catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
         }
 
         return new DescendingFieldsReadResult(timestamps, rows, segmentColumnsRead, "segments-exhausted");
@@ -667,6 +673,7 @@ public sealed class TsdbEngine : IDisposable
                 rebuilt = Rebuild(ReadSegmentColumns(db, segPath, requestedFields, meas, min, max, allowedTagsCanonical), min, max).OrderBy(x => x.TimestampNs).ToList();
             }
             catch (InvalidDataException) { continue; }
+            catch (FileNotFoundException) { continue; }
 
             foreach (var point in rebuilt)
             {
@@ -821,6 +828,7 @@ public sealed class TsdbEngine : IDisposable
                         && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(m.TagsCanonical))));
             }
             catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
         }
         return new SegmentMetadataQueryResult(result, footerHits, fullReads);
     }

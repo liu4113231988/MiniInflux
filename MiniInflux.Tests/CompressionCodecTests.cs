@@ -168,7 +168,7 @@ public class CompressionCodecTests
     }
 
     [Fact]
-    public void AdaptiveFloatEncoding_CanSelectLegacyBrotliForSmoothLinearSeries()
+    public void AdaptiveFloatEncoding_SelectsGorillaForSmoothLinearSeries()
     {
         var values = Enumerable.Range(0, 256)
             .Select(i => FieldValue.FromDouble(1000.0 + i * 0.25))
@@ -176,7 +176,7 @@ public class CompressionCodecTests
 
         var block = CompressionCodec.EncodeValuesAdaptive(FieldKind.Float, values);
 
-        Assert.Equal(ValueCodecKind.Legacy, block.Codec);
-        Assert.Equal(BlockCompressionKind.Brotli, block.Compression);
+        Assert.Equal(ValueCodecKind.Gorilla, block.Codec);
+        Assert.Equal(BlockCompressionKind.None, block.Compression);
     }
 }

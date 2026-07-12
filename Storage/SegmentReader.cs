@@ -53,7 +53,7 @@ public static class SegmentReader
         long? maxTimeNs,
         HashSet<string>? allowedTagsCanonical)
     {
-        var allBytes = File.ReadAllBytes(path);
+        var allBytes = ReadAllBytesShared(path);
         if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
         var dataBytes = allBytes.AsSpan(0, allBytes.Length - 4);
         var storedCrc = BitConverter.ToUInt32(allBytes, allBytes.Length - 4);
@@ -105,7 +105,7 @@ public static class SegmentReader
         if (TryReadFooterMetadata(path, out var metadata))
             return new SegmentMetadataReadResult(metadata, true);
 
-        var allBytes = File.ReadAllBytes(path);
+        var allBytes = ReadAllBytesShared(path);
         if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
         var dataBytes = allBytes.AsSpan(0, allBytes.Length - 4);
         if (BitConverter.ToUInt32(allBytes, allBytes.Length - 4) != Crc32.Compute(dataBytes.ToArray()))
@@ -141,7 +141,7 @@ public static class SegmentReader
         if (length < 4 + MetadataFooterSize + 4)
             return false;
 
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         fs.Position = length - 4 - MetadataFooterSize;
         Span<byte> footer = stackalloc byte[MetadataFooterSize];
         if (fs.Read(footer) != MetadataFooterSize)
@@ -170,6 +170,14 @@ public static class SegmentReader
             result.Add(ReadMetadataEntry(br));
         metadata = result;
         return true;
+    }
+
+    private static byte[] ReadAllBytesShared(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var bytes = new byte[stream.Length];
+        stream.ReadExactly(bytes);
+        return bytes;
     }
 
     private static (TimestampCodecKind TimestampCodec, BlockCompressionKind TimestampCompression, ValueCodecKind ValueCodec, BlockCompressionKind ValueCompression) ReadCodecInfo(byte version, BinaryReader br)
