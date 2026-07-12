@@ -28,6 +28,7 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
         {
             ["Data:Dir"] = "./custom-data",
             ["Data:QueryLogEnabled"] = "false",
+            ["Data:BackupDir"] = "./backups",
             ["Http:Enabled"] = "true",
             ["Http:BindAddress"] = ":18086",
             ["Http:LogEnabled"] = "true",
@@ -40,9 +41,12 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
             ["Auth:Username"] = "root",
             ["Auth:Password"] = "secret",
             ["Auth:AuditFailures"] = "false",
+            ["Auth:AllowQueryCredentials"] = "true",
+            ["Auth:TrustedProxyAddresses:0"] = "127.0.0.1",
             ["Auth:MaxFailedAttempts"] = "3",
             ["Auth:FailureWindowMs"] = "15000",
             ["Auth:LockoutMs"] = "45000",
+            ["Storage:MinFreeDiskBytes"] = "123456",
             ["Logging:Level"] = "Debug",
             ["Logging:ConsoleEnabled"] = "false",
             ["Logging:FileEnabled"] = "true",
@@ -57,6 +61,7 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
 
         Assert.Equal("./custom-data", options.DataPath);
         Assert.False(options.Data.QueryLogEnabled);
+        Assert.Equal("./backups", options.Data.BackupDir);
         Assert.Equal(":18086", options.Http.BindAddress);
         Assert.Equal("http://0.0.0.0:18086", options.Urls);
         Assert.True(options.Http.SuppressWriteLog);
@@ -65,9 +70,12 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
         Assert.Equal("root", options.Auth.Username);
         Assert.Equal("secret", options.Auth.Password);
         Assert.False(options.Auth.AuditFailures);
+        Assert.True(options.Auth.AllowQueryCredentials);
+        Assert.Equal("127.0.0.1", Assert.Single(options.Auth.TrustedProxyAddresses));
         Assert.Equal(3, options.Auth.MaxFailedAttempts);
         Assert.Equal(15_000, options.Auth.FailureWindowMs);
         Assert.Equal(45_000, options.Auth.LockoutMs);
+        Assert.Equal(123456, options.Storage.MinFreeDiskBytes);
         Assert.Equal("Debug", options.Logging.Level);
         Assert.True(options.Logging.FileEnabled);
         Assert.False(options.Logging.ConsoleEnabled);

@@ -37,6 +37,7 @@ public sealed class MiniInfluxOptions
             Data = new DataOptions
             {
                 Dir = dataDir,
+                BackupDir = ReadString(config, "Data:BackupDir", "")!,
                 QueryLogEnabled = ReadBool(config, true, "Data:QueryLogEnabled")
             },
             Http = new HttpOptions
@@ -89,6 +90,7 @@ public sealed class MiniInfluxOptions
                 MaxQueryDurationMs = ReadInt(config, 0, "Storage:MaxQueryDurationMs"),
                 MaxBufferBytes = ReadLong(config, 0, "Storage:MaxBufferBytes"),
                 MaxQueryMemoryBytes = ReadLong(config, 0, "Storage:MaxQueryMemoryBytes")
+                ,MinFreeDiskBytes = ReadLong(config, 0, "Storage:MinFreeDiskBytes")
             },
             Auth = new AuthOptions
             {
@@ -198,6 +200,7 @@ public sealed class MiniInfluxOptions
 public sealed class DataOptions
 {
     public string Dir { get; init; } = "./data";
+    public string BackupDir { get; init; } = "";
     public bool QueryLogEnabled { get; init; } = true;
 }
 
@@ -256,6 +259,7 @@ public sealed class StorageOptions
     public int MaxQueryDurationMs { get; init; }
     public long MaxBufferBytes { get; init; }
     public long MaxQueryMemoryBytes { get; init; }
+    public long MinFreeDiskBytes { get; init; }
 }
 
 public sealed class AuthOptions

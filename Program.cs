@@ -59,6 +59,8 @@ if (isProduction && IsPlaceholderPassword(options.Auth.Password))
     throw new InvalidOperationException("Auth.Password must not use a placeholder value in Production.");
 if (isProduction && !options.Tls.Enabled)
     throw new InvalidOperationException("Tls.Enabled must be true in Production.");
+if (isProduction && (options.Storage.MaxQueryDurationMs <= 0 || options.Storage.MaxQueryMemoryBytes <= 0 || options.Storage.MinFreeDiskBytes <= 0))
+    throw new InvalidOperationException("Production requires non-zero Storage.MaxQueryDurationMs, Storage.MaxQueryMemoryBytes, and Storage.MinFreeDiskBytes.");
 if (options.Tls.Enabled && (string.IsNullOrWhiteSpace(options.Tls.CertPath) || !File.Exists(options.Tls.CertPath)))
     throw new InvalidOperationException("Tls.CertPath must point to an existing certificate when TLS is enabled.");
 
@@ -92,6 +94,7 @@ var engine = new TsdbEngine(
     maxBufferBytes: options.Storage.MaxBufferBytes);
 
 builder.Services.AddSingleton(engine);
+builder.Services.AddSingleton(new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize));
 builder.Services.AddSingleton(new QueryExecutor(
     options.Storage.MaxResponseRows,
     options.Storage.MaxQueryPoints,
@@ -182,13 +185,15 @@ app.MapGet("/ping", () => Results.NoContent());
 app.MapGet("/health", (TsdbEngine tsdbEngine) =>
 {
     var health = tsdbEngine.Health;
+    var availableDiskBytes = GetAvailableDiskBytes(options.DataPath);
+    var diskHealthy = options.Storage.MinFreeDiskBytes <= 0 || availableDiskBytes >= options.Storage.MinFreeDiskBytes;
     var response = new HealthResponse(
-        health.WriteAvailable ? "ready" : "write path unavailable",
-        health.WriteAvailable ? "pass" : "fail",
+        health.WriteAvailable && diskHealthy ? "ready" : health.WriteAvailable ? "insufficient disk space" : "write path unavailable",
+        health.WriteAvailable && diskHealthy ? "pass" : "fail",
         health.FailureCount,
         health.LastFailureComponent,
         health.LastFailureUtc);
-    return Results.Json(response, AppJsonContext.Default.HealthResponse, statusCode: health.WriteAvailable ? 200 : 503);
+    return Results.Json(response, AppJsonContext.Default.HealthResponse, statusCode: health.WriteAvailable && diskHealthy ? 200 : 503);
 });
 
 app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
@@ -207,7 +212,7 @@ app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
     return Results.Text(text, "text/plain; version=0.0.4; charset=utf-8");
 });
 
-app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, MetricsCollector metrics, string db, string? rp, string? precision) =>
+app.MapPost("/write", async (HttpRequest request, WriteQueue writeQueue, MetricsCollector metrics, string db, string? rp, string? precision) =>
 {
     if (string.IsNullOrWhiteSpace(db)) return Results.BadRequest(new ErrorResponse("missing required parameter db"));
     if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
@@ -230,7 +235,7 @@ app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, Metrics
         var points = LineProtocolParser.ParseMany(body, TimestampPrecision.Parse(precision));
         try
         {
-            await tsdbEngine.WriteInternalAsync(db, rp ?? "autogen", points);
+            await writeQueue.EnqueueAsync(db, rp ?? "autogen", points, request.HttpContext.RequestAborted);
             metrics.RecordWrite(points.Count);
             runtimeLogger.LogDebug("write accepted db={Db} rp={Rp} points={PointCount}", db, rp ?? "autogen", points.Count);
             return Results.NoContent();
@@ -249,6 +254,16 @@ app.MapPost("/write", async (HttpRequest request, TsdbEngine tsdbEngine, Metrics
         {
             runtimeLogger.LogWarning("write rejected by memory limit db={Db} rp={Rp}", db, rp ?? "autogen");
             return Results.StatusCode(429);
+        }
+        catch (WriteQueueFullException)
+        {
+            runtimeLogger.LogWarning("write rejected by queue pressure db={Db} rp={Rp}", db, rp ?? "autogen");
+            return Results.StatusCode(429);
+        }
+        catch (IOException ex)
+        {
+            runtimeLogger.LogError(ex, "write rejected because storage is unavailable db={Db} rp={Rp}", db, rp ?? "autogen");
+            return Results.StatusCode(503);
         }
     }
     catch (Exception ex)
@@ -314,9 +329,11 @@ app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string
 {
         if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
             return authResult;
+    if (!TryResolveManagedBackupPath(options, path, out var backupPath))
+        return Results.BadRequest(new ErrorResponse("backup path must be a relative name under Data.BackupDir"));
     tsdbEngine.FlushAll();
-    BackupManager.CreateBackup(tsdbEngine.RootPath, path);
-    runtimeLogger.LogInformation("backup created path={Path}", Path.GetFullPath(path));
+    BackupManager.CreateBackup(tsdbEngine.RootPath, backupPath);
+    runtimeLogger.LogInformation("backup created path={Path}", backupPath);
     return Results.Ok(new AdminMessage("backup completed"));
 });
 
@@ -326,8 +343,10 @@ app.MapPost("/admin/restore", (HttpRequest request, TsdbEngine tsdbEngine, strin
         return authResult;
     try
     {
-        BackupManager.PrepareRestore(path, tsdbEngine.RootPath);
-        runtimeLogger.LogInformation("restore prepared path={Path}", Path.GetFullPath(path));
+        if (!TryResolveManagedBackupPath(options, path, out var backupPath))
+            return Results.BadRequest(new ErrorResponse("backup path must be a relative name under Data.BackupDir"));
+        BackupManager.PrepareRestore(backupPath, tsdbEngine.RootPath);
+        runtimeLogger.LogInformation("restore prepared path={Path}", backupPath);
         return Results.Ok(new AdminMessage("restore prepared; restart required"));
     }
     catch (Exception ex)
@@ -464,19 +483,19 @@ adminApi.MapPost("/backup", async (HttpRequest request) =>
         return authResult;
 
     var payload = await ReadJsonAsync(request, AppJsonContext.Default.BackupPathRequest);
-    if (payload == null || string.IsNullOrWhiteSpace(payload.Path))
-        return Results.BadRequest(new ErrorResponse("path is required"));
+    if (payload == null || !TryResolveManagedBackupPath(options, payload.Path, out var backupPath))
+        return Results.BadRequest(new ErrorResponse("path must be a relative name under Data.BackupDir"));
 
     try
     {
         engine.FlushAll();
-        BackupManager.CreateBackup(engine.RootPath, payload.Path.Trim());
-        runtimeLogger.LogInformation("admin ui backup created path={Path}", Path.GetFullPath(payload.Path.Trim()));
+        BackupManager.CreateBackup(engine.RootPath, backupPath);
+        runtimeLogger.LogInformation("admin ui backup created path={Path}", backupPath);
         return Results.Json(new AdminMessage("backup completed"), AppJsonContext.Default.AdminMessage);
     }
     catch (Exception ex)
     {
-        runtimeLogger.LogWarning(ex, "admin ui backup failed path={Path}", payload.Path.Trim());
+        runtimeLogger.LogWarning(ex, "admin ui backup failed path={Path}", backupPath);
         return Results.BadRequest(new ErrorResponse(ex.Message));
     }
 });
@@ -487,18 +506,18 @@ adminApi.MapPost("/restore", async (HttpRequest request) =>
         return authResult;
 
     var payload = await ReadJsonAsync(request, AppJsonContext.Default.BackupPathRequest);
-    if (payload == null || string.IsNullOrWhiteSpace(payload.Path))
-        return Results.BadRequest(new ErrorResponse("path is required"));
+    if (payload == null || !TryResolveManagedBackupPath(options, payload.Path, out var backupPath))
+        return Results.BadRequest(new ErrorResponse("path must be a relative name under Data.BackupDir"));
 
     try
     {
-        BackupManager.PrepareRestore(payload.Path.Trim(), engine.RootPath);
-        runtimeLogger.LogInformation("admin ui restore prepared path={Path}", Path.GetFullPath(payload.Path.Trim()));
+        BackupManager.PrepareRestore(backupPath, engine.RootPath);
+        runtimeLogger.LogInformation("admin ui restore prepared path={Path}", backupPath);
         return Results.Json(new AdminMessage("restore prepared; restart required"), AppJsonContext.Default.AdminMessage);
     }
     catch (Exception ex)
     {
-        runtimeLogger.LogWarning(ex, "admin ui restore prepare failed path={Path}", payload.Path.Trim());
+        runtimeLogger.LogWarning(ex, "admin ui restore prepare failed path={Path}", backupPath);
         return Results.BadRequest(new ErrorResponse(ex.Message));
     }
 });
@@ -619,6 +638,29 @@ static bool IsPlaceholderPassword(string password) =>
     string.IsNullOrWhiteSpace(password)
     || password.Equals("12345678", StringComparison.Ordinal)
     || password.Equals("replace-with-a-strong-password", StringComparison.OrdinalIgnoreCase);
+
+static bool TryResolveManagedBackupPath(MiniInfluxOptions options, string? name, out string path)
+{
+    path = "";
+    if (string.IsNullOrWhiteSpace(options.Data.BackupDir) || string.IsNullOrWhiteSpace(name) || Path.IsPathRooted(name))
+        return false;
+
+    var root = Path.GetFullPath(options.Data.BackupDir);
+    var candidate = Path.GetFullPath(Path.Combine(root, name));
+    var rootPrefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+    if (!candidate.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+        return false;
+
+    Directory.CreateDirectory(root);
+    path = candidate;
+    return true;
+}
+
+static long GetAvailableDiskBytes(string dataPath)
+{
+    var root = Path.GetPathRoot(Path.GetFullPath(dataPath));
+    return string.IsNullOrWhiteSpace(root) ? 0 : new DriveInfo(root).AvailableFreeSpace;
+}
 
 static void AuditAuthenticationAttempt(ILogger logger, HttpRequest request, AuthenticationAttempt attempt, AuthOptions options)
 {

@@ -315,6 +315,9 @@ public sealed class MetricsCollector
         sb.AppendLine("# HELP mini_influx_storage_failures_total Storage background and durability failures.");
         sb.AppendLine("# TYPE mini_influx_storage_failures_total counter");
         sb.AppendLine($"mini_influx_storage_failures_total {health.FailureCount}");
+        sb.AppendLine("# HELP mini_influx_data_disk_free_bytes Free bytes on the data volume.");
+        sb.AppendLine("# TYPE mini_influx_data_disk_free_bytes gauge");
+        sb.AppendLine($"mini_influx_data_disk_free_bytes {GetAvailableDiskBytes()}");
 
         sb.AppendLine("# HELP mini_influx_series_cardinality Number of unique series per database.");
         sb.AppendLine("# TYPE mini_influx_series_cardinality gauge");
@@ -322,6 +325,12 @@ public sealed class MetricsCollector
             sb.AppendLine($"mini_influx_series_cardinality{{db=\"{db}\"}} {count}");
 
         return sb.ToString();
+    }
+
+    private long GetAvailableDiskBytes()
+    {
+        var root = Path.GetPathRoot(Path.GetFullPath(_engine.RootPath));
+        return string.IsNullOrWhiteSpace(root) ? 0 : new DriveInfo(root).AvailableFreeSpace;
     }
 }
 
