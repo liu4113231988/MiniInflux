@@ -34,7 +34,7 @@ if (options.Logging.ConsoleEnabled)
     });
 }
 if (options.Logging.FileEnabled)
-    builder.Logging.AddProvider(new FileLoggerProvider(options.Logging.FilePath));
+    builder.Logging.AddProvider(new FileLoggerProvider(options.Logging.FilePath, options.Logging.FileMaxBytes, options.Logging.FileRetainedFileCount));
 
 if (!options.Http.Enabled)
 {
@@ -44,7 +44,7 @@ if (!options.Http.Enabled)
         if (options.Logging.ConsoleEnabled)
             logging.AddSimpleConsole();
         if (options.Logging.FileEnabled)
-            logging.AddProvider(new FileLoggerProvider(options.Logging.FilePath));
+            logging.AddProvider(new FileLoggerProvider(options.Logging.FilePath, options.Logging.FileMaxBytes, options.Logging.FileRetainedFileCount));
     }).CreateLogger("MiniInflux.Bootstrap");
     bootstrapLogger.LogWarning("HTTP service disabled by configuration. CLI commands remain available.");
     return;
@@ -94,14 +94,15 @@ var engine = new TsdbEngine(
     maxBufferBytes: options.Storage.MaxBufferBytes);
 
 builder.Services.AddSingleton(engine);
-builder.Services.AddSingleton(new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize));
+var writeQueue = new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize);
+builder.Services.AddSingleton(writeQueue);
 builder.Services.AddSingleton(new QueryExecutor(
     options.Storage.MaxResponseRows,
     options.Storage.MaxQueryPoints,
     options.Storage.MaxQueryDurationMs,
     options.Storage.MaxQueryMemoryBytes));
 builder.Services.AddSingleton(options);
-builder.Services.AddSingleton<MetricsCollector>();
+builder.Services.AddSingleton(new MetricsCollector(engine, writeQueue));
 builder.Services.AddSingleton(new AccessLogWriter(options.Http.AccessLogPath));
 builder.Services.AddSingleton<ContinuousQueryRunner>();
 builder.Services.AddHostedService<ContinuousQueryHostedService>();
@@ -122,6 +123,7 @@ if (options.Http.LogEnabled)
 {
     app.Use(async (context, next) =>
     {
+        context.Response.Headers["X-Request-Id"] = context.TraceIdentifier;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {

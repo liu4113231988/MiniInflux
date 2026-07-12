@@ -169,4 +169,19 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
         Assert.Contains("hello world", text);
         Assert.Contains("MiniInflux.Tests", text);
     }
+
+    [Fact]
+    public void FileLoggerProvider_RotatesAtConfiguredSize()
+    {
+        var logPath = Path.Combine(_testDir, "rotate.log");
+        using (var provider = new FileLoggerProvider(logPath, maxBytes: 1, retainedFileCount: 1))
+        {
+            var logger = provider.CreateLogger("MiniInflux.Tests");
+            logger.LogInformation("first");
+            logger.LogInformation("second");
+        }
+
+        Assert.True(File.Exists(logPath + ".1"));
+        Assert.Contains("second", File.ReadAllText(logPath));
+    }
 }

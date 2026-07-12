@@ -56,7 +56,9 @@ public sealed class MiniInfluxOptions
                 Level = ReadString(config, "Logging:Level", "Information")!,
                 ConsoleEnabled = ReadBool(config, true, "Logging:ConsoleEnabled"),
                 FileEnabled = ReadBool(config, false, "Logging:FileEnabled"),
-                FilePath = ReadString(config, "Logging:FilePath", "./logs/miniinflux.log")!
+                FilePath = ReadString(config, "Logging:FilePath", "./logs/miniinflux.log")!,
+                FileMaxBytes = Math.Max(0, ReadLong(config, 10 * 1024 * 1024, "Logging:FileMaxBytes")),
+                FileRetainedFileCount = Math.Max(1, ReadInt(config, 5, "Logging:FileRetainedFileCount"))
             },
             ContinuousQuery = new ContinuousQueryOptions
             {
@@ -222,6 +224,8 @@ public sealed class LoggingOptions
     public bool ConsoleEnabled { get; init; } = true;
     public bool FileEnabled { get; init; }
     public string FilePath { get; init; } = "./logs/miniinflux.log";
+    public long FileMaxBytes { get; init; } = 10 * 1024 * 1024;
+    public int FileRetainedFileCount { get; init; } = 5;
 }
 
 public sealed class ContinuousQueryOptions

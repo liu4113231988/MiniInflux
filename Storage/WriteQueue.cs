@@ -18,6 +18,7 @@ public sealed class WriteQueue : IDisposable
     private readonly int _batchSize;
     private readonly Task _worker;
     private readonly CancellationTokenSource _cts = new();
+    private long _pendingRequests;
 
     public WriteQueue(TsdbEngine engine, int capacity = 100_000, int batchSize = 10_000)
     {
@@ -37,6 +38,16 @@ public sealed class WriteQueue : IDisposable
     /// </summary>
     public async Task<bool> EnqueueAsync(string db, string rp, List<Point> points, CancellationToken ct = default)
     {
+        if (Interlocked.CompareExchange(ref _pendingRequests, 1, 0) == 0)
+        {
+            try
+            {
+                await _engine.WriteInternalAsync(db, rp, points);
+                return true;
+            }
+            finally { Interlocked.Decrement(ref _pendingRequests); }
+        }
+
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var request = new WriteRequest(db, rp, points, tcs);
 
@@ -45,11 +56,13 @@ public sealed class WriteQueue : IDisposable
 
         try
         {
+            Interlocked.Increment(ref _pendingRequests);
             await _channel.Writer.WriteAsync(request, timeoutCts.Token);
             return await tcs.Task;
         }
         catch (OperationCanceledException)
         {
+            Interlocked.Decrement(ref _pendingRequests);
             throw new WriteQueueFullException("Write queue is full or shutting down");
         }
     }
@@ -92,35 +105,41 @@ public sealed class WriteQueue : IDisposable
             requests.Add(req);
         }
 
-        foreach (var entry in grouped)
+        try
         {
-            var requests = entry.Value;
-            try
+            foreach (var entry in grouped)
             {
-                List<Point> mergedPoints;
-                if (requests.Count == 1)
+                var requests = entry.Value;
+                try
                 {
-                    mergedPoints = requests[0].Points;
-                }
-                else
-                {
-                    var pointCount = requests.Sum(x => x.Points.Count);
-                    mergedPoints = new List<Point>(pointCount);
-                    foreach (var req in requests)
-                        mergedPoints.AddRange(req.Points);
-                }
+                    List<Point> mergedPoints;
+                    if (requests.Count == 1)
+                    {
+                        mergedPoints = requests[0].Points;
+                    }
+                    else
+                    {
+                        var pointCount = requests.Sum(x => x.Points.Count);
+                        mergedPoints = new List<Point>(pointCount);
+                        foreach (var req in requests)
+                            mergedPoints.AddRange(req.Points);
+                    }
 
-                await _engine.WriteInternalAsync(entry.Key.Db, entry.Key.Rp, mergedPoints);
-                foreach (var req in requests)
-                    req.Completion.TrySetResult(true);
-            }
-            catch (Exception ex)
-            {
-                foreach (var req in requests)
-                    req.Completion.TrySetException(ex);
+                    await _engine.WriteInternalAsync(entry.Key.Db, entry.Key.Rp, mergedPoints);
+                    foreach (var req in requests)
+                        req.Completion.TrySetResult(true);
+                }
+                catch (Exception ex)
+                {
+                    foreach (var req in requests)
+                        req.Completion.TrySetException(ex);
+                }
             }
         }
+        finally { Interlocked.Add(ref _pendingRequests, -batch.Count); }
     }
+
+    public long PendingRequests => Math.Max(0, Interlocked.Read(ref _pendingRequests));
 
     public void Dispose()
     {

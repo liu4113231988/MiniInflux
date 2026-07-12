@@ -6,9 +6,9 @@ public sealed class FileLoggerProvider : ILoggerProvider
 {
     private readonly FileLogSink _sink;
 
-    public FileLoggerProvider(string path)
+    public FileLoggerProvider(string path, long maxBytes = 10 * 1024 * 1024, int retainedFileCount = 5)
     {
-        _sink = new FileLogSink(path);
+        _sink = new FileLogSink(path, maxBytes, retainedFileCount);
     }
 
     public ILogger CreateLogger(string categoryName) => new FileLogger(categoryName, _sink);
@@ -55,28 +55,51 @@ public sealed class FileLoggerProvider : ILoggerProvider
     private sealed class FileLogSink : IDisposable
     {
         private readonly object _lock = new();
-        private readonly StreamWriter _writer;
+        private readonly string _path;
+        private readonly long _maxBytes;
+        private readonly int _retainedFileCount;
+        private StreamWriter _writer;
 
-        public FileLogSink(string path)
+        public FileLogSink(string path, long maxBytes, int retainedFileCount)
         {
-            var fullPath = Path.GetFullPath(path);
-            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-            _writer = new StreamWriter(new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
-            {
-                AutoFlush = true
-            };
+            _path = Path.GetFullPath(path);
+            _maxBytes = maxBytes;
+            _retainedFileCount = retainedFileCount;
+            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+            _writer = OpenWriter();
         }
 
         public void Write(string line)
         {
             lock (_lock)
+            {
+                if (_maxBytes > 0 && new FileInfo(_path).Length >= _maxBytes)
+                    Rotate();
                 _writer.WriteLine(line);
+            }
         }
 
         public void Dispose()
         {
             lock (_lock)
                 _writer.Dispose();
+        }
+
+        private StreamWriter OpenWriter() => new(new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true };
+
+        private void Rotate()
+        {
+            _writer.Dispose();
+            for (var index = _retainedFileCount - 1; index >= 1; index--)
+            {
+                var source = $"{_path}.{index}";
+                var destination = $"{_path}.{index + 1}";
+                if (File.Exists(source))
+                    File.Move(source, destination, overwrite: true);
+            }
+            if (File.Exists(_path))
+                File.Move(_path, _path + ".1", overwrite: true);
+            _writer = OpenWriter();
         }
     }
 

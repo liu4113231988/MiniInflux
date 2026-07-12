@@ -88,15 +88,20 @@ public sealed class Compactor
         }
     }
 
-    public CompactionStatsSnapshot GetStats() => new()
+    public CompactionStatsSnapshot GetStats()
     {
-        TotalRuns = Interlocked.Read(ref _totalRuns),
-        TotalTasks = Interlocked.Read(ref _totalTasks),
-        TotalSegmentsMerged = Interlocked.Read(ref _totalSegmentsMerged),
-        Running = Interlocked.CompareExchange(ref _running, 0, 0) == 1,
-        QueuedTasks = Interlocked.CompareExchange(ref _queuedTasks, 0, 0),
-        LastRunUtc = _lastRunUtc
-    };
+        var running = Interlocked.CompareExchange(ref _running, 0, 0) == 1;
+        return new CompactionStatsSnapshot
+        {
+            TotalRuns = Interlocked.Read(ref _totalRuns),
+            TotalTasks = Interlocked.Read(ref _totalTasks),
+            TotalSegmentsMerged = Interlocked.Read(ref _totalSegmentsMerged),
+            Running = running,
+            QueuedTasks = Interlocked.CompareExchange(ref _queuedTasks, 0, 0),
+            BacklogTasks = running ? Interlocked.CompareExchange(ref _queuedTasks, 0, 0) : BuildTasks().Count,
+            LastRunUtc = _lastRunUtc
+        };
+    }
 
     private List<CompactionTask> BuildTasks()
     {
@@ -452,5 +457,6 @@ public sealed class CompactionStatsSnapshot
     public long TotalSegmentsMerged { get; set; }
     public bool Running { get; set; }
     public int QueuedTasks { get; set; }
+    public int BacklogTasks { get; set; }
     public DateTimeOffset? LastRunUtc { get; set; }
 }

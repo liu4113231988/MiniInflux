@@ -44,10 +44,12 @@ curl -G http://localhost:8086/query \
 ### Configuration Notes
 
 - `Data.Dir` controls the data directory and is preferred over legacy `MiniInflux:DataPath`
+- `Data.BackupDir` enables managed online backup/restore paths; leave it empty to disable those HTTP endpoints
 - `Http.BindAddress` is converted into ASP.NET Core `Urls`
 - `Auth.Enabled` is the main auth switch; `Http.AuthEnabled` only exists for backward compatibility
 - `ContinuousQuery.*` controls the CQ scheduler and catch-up behavior
 - `Write.*`, `Wal.*`, and `Storage.*` provide request, durability, and query guardrails
+- `Logging.FileMaxBytes` and `Logging.FileRetainedFileCount` control file-log rotation
 - `Tls.Enabled` uses only the HTTPS listener on `Tls.Port`; it is required in Production
 
 ### Current Scope
@@ -209,6 +211,7 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 
 - `Data.Dir`：数据目录，优先于旧版 `MiniInflux:DataPath`
 - `Data.QueryLogEnabled`：是否记录查询语句
+- `Data.BackupDir`：在线管理接口允许使用的备份根目录；留空时禁用在线备份与恢复
 - `Http.Enabled`：是否启用 HTTP 服务；关闭后仍可使用管理 CLI
 - `Http.BindAddress`：监听地址，会自动映射成 ASP.NET Core 使用的 `Urls`
 - `Auth.Enabled`：认证总开关，启用后 `/write`、`/query`、诊断接口和管理台均要求认证
@@ -230,11 +233,14 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 - `Logging.ConsoleEnabled`：是否输出到控制台
 - `Logging.FileEnabled`：是否输出到文件
 - `Logging.FilePath`：应用日志文件路径
+- `Logging.FileMaxBytes`：单个日志文件触发滚动的大小，`0` 表示关闭大小滚动
+- `Logging.FileRetainedFileCount`：保留的历史滚动日志数量
 - `ContinuousQuery.Enabled`：是否启用 Continuous Query 后台调度器
 - `ContinuousQuery.CheckIntervalMs`：调度扫描周期
 - `ContinuousQuery.MaxCatchUpRunsPerCycle`：单次扫描最多补跑多少个 bucket
 - `ContinuousQuery.RecomputeRecentBuckets`：每轮额外重算最近多少个已关闭 bucket，默认 `0` 关闭
 - `ContinuousQuery.InitialBackfillDuration`：当 CQ 未显式声明 `RESAMPLE FOR` 时，首次创建或长时间停机恢复后默认允许补跑的窗口
+- `Storage.MinFreeDiskBytes`：健康检查要求的数据卷最小剩余空间；Production 必须设置为非零值
 
 环境变量兼容：
 

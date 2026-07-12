@@ -276,6 +276,7 @@ $influxProc = $null
 
 try {
     $env:Auth__Enabled = 'false'
+    $env:ASPNETCORE_ENVIRONMENT = 'Development'
     $env:Urls = 'http://127.0.0.1:18086'
     $env:Data__Dir = $miniData
     $env:Http__BindAddress = '127.0.0.1:18086'

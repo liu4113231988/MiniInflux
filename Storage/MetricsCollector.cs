@@ -29,9 +29,10 @@ public sealed class MetricsCollector
     private readonly long[] _queryDurationBuckets = new long[8];
     private static readonly int[] QueryDurationBoundsMs = [1, 5, 10, 50, 100, 500, 1000, 5000];
     private readonly TsdbEngine _engine;
+    private readonly WriteQueue? _writeQueue;
     private readonly Dictionary<string, ContinuousQueryMetrics> _continuousQueryMetrics = new(StringComparer.Ordinal);
 
-    public MetricsCollector(TsdbEngine engine) { _engine = engine; }
+    public MetricsCollector(TsdbEngine engine, WriteQueue? writeQueue = null) { _engine = engine; _writeQueue = writeQueue; }
 
     public void RecordWrite(int pointCount) => Interlocked.Add(ref _writePointsTotal, pointCount);
     public void RecordQuery() => Interlocked.Increment(ref _queryTotal);
@@ -135,11 +136,13 @@ public sealed class MetricsCollector
             CompactionRunning = compaction.Running || CompactionRunning,
             CompactionCount = compaction.TotalRuns > 0 ? compaction.TotalRuns : CompactionCount,
             CompactionQueuedTasks = compaction.QueuedTasks,
+            CompactionBacklogTasks = compaction.BacklogTasks,
             CompactionTasksTotal = compaction.TotalTasks,
             CompactionSegmentsMergedTotal = compaction.TotalSegmentsMerged,
             SeriesCardinality = cardinality,
             MemoryBufferPoints = _engine.GetBufferedPointCount(),
             MemoryBufferBytes = _engine.GetBufferedByteCount(),
+            WriteQueuePendingRequests = _writeQueue?.PendingRequests ?? 0,
             QueryDurationBuckets = durationBuckets,
             ContinuousQueryMetrics = GetContinuousQueryMetricsSnapshot()
         };
@@ -299,6 +302,9 @@ public sealed class MetricsCollector
         sb.AppendLine("# HELP mini_influx_compaction_queued_tasks Current compaction queue size.");
         sb.AppendLine("# TYPE mini_influx_compaction_queued_tasks gauge");
         sb.AppendLine($"mini_influx_compaction_queued_tasks {stats.CompactionQueuedTasks}");
+        sb.AppendLine("# HELP mini_influx_compaction_backlog_tasks Estimated compaction tasks waiting to run.");
+        sb.AppendLine("# TYPE mini_influx_compaction_backlog_tasks gauge");
+        sb.AppendLine($"mini_influx_compaction_backlog_tasks {stats.CompactionBacklogTasks}");
 
         sb.AppendLine("# HELP mini_influx_buffer_points Current number of points in memory buffer.");
         sb.AppendLine("# TYPE mini_influx_buffer_points gauge");
@@ -307,6 +313,9 @@ public sealed class MetricsCollector
         sb.AppendLine("# HELP mini_influx_buffer_bytes Estimated number of bytes in memory buffer.");
         sb.AppendLine("# TYPE mini_influx_buffer_bytes gauge");
         sb.AppendLine($"mini_influx_buffer_bytes {stats.MemoryBufferBytes}");
+        sb.AppendLine("# HELP mini_influx_write_queue_pending_requests Writes waiting for or running in the queue.");
+        sb.AppendLine("# TYPE mini_influx_write_queue_pending_requests gauge");
+        sb.AppendLine($"mini_influx_write_queue_pending_requests {stats.WriteQueuePendingRequests}");
 
         var health = _engine.Health;
         sb.AppendLine("# HELP mini_influx_storage_write_available Whether the WAL-backed write path is available.");
@@ -356,9 +365,11 @@ public sealed class DebugStats
     public long CompactionTasksTotal { get; set; }
     public long CompactionSegmentsMergedTotal { get; set; }
     public int CompactionQueuedTasks { get; set; }
+    public int CompactionBacklogTasks { get; set; }
     public Dictionary<string, int> SeriesCardinality { get; set; } = new();
     public long MemoryBufferPoints { get; set; }
     public long MemoryBufferBytes { get; set; }
+    public long WriteQueuePendingRequests { get; set; }
     public Dictionary<string, long> QueryDurationBuckets { get; set; } = new();
     public List<ContinuousQueryMetrics> ContinuousQueryMetrics { get; set; } = [];
 }
