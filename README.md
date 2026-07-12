@@ -22,7 +22,7 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 
 Default HTTP listen address is `http://0.0.0.0:8086`.
 
-The checked-in [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) contains no credentials and leaves authentication disabled for local development. Production requires `Auth__Enabled=true`, a non-placeholder `Auth__Password`, and TLS; configure these through environment variables or a secret file.
+The checked-in [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) contains no credentials and leaves authentication disabled for local development. When authentication or TLS is disabled, MiniInflux logs a startup warning; enable them with environment variables or a secret file before exposing the service publicly.
 
 Write a point:
 
@@ -50,7 +50,7 @@ curl -G http://localhost:8086/query \
 - `ContinuousQuery.*` controls the CQ scheduler and catch-up behavior
 - `Write.*`, `Wal.*`, and `Storage.*` provide request, durability, and query guardrails
 - `Logging.FileMaxBytes` and `Logging.FileRetainedFileCount` control file-log rotation
-- `Tls.Enabled` uses only the HTTPS listener on `Tls.Port`; it is required in Production
+- `Tls.Enabled` uses only the HTTPS listener on `Tls.Port`; disabled TLS emits a startup warning
 
 ### Current Scope
 

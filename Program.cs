@@ -53,12 +53,8 @@ if (!options.Http.Enabled)
 var isProduction = builder.Environment.IsProduction();
 if (options.Auth.Enabled && (string.IsNullOrWhiteSpace(options.Auth.Username) || string.IsNullOrEmpty(options.Auth.Password)))
     throw new InvalidOperationException("Auth.Username and Auth.Password are required when Auth.Enabled is true.");
-if (isProduction && !options.Auth.Enabled)
-    throw new InvalidOperationException("Auth.Enabled must be true in Production.");
-if (isProduction && IsPlaceholderPassword(options.Auth.Password))
+if (isProduction && options.Auth.Enabled && IsPlaceholderPassword(options.Auth.Password))
     throw new InvalidOperationException("Auth.Password must not use a placeholder value in Production.");
-if (isProduction && !options.Tls.Enabled)
-    throw new InvalidOperationException("Tls.Enabled must be true in Production.");
 if (isProduction && (options.Storage.MaxQueryDurationMs <= 0 || options.Storage.MaxQueryMemoryBytes <= 0 || options.Storage.MinFreeDiskBytes <= 0))
     throw new InvalidOperationException("Production requires non-zero Storage.MaxQueryDurationMs, Storage.MaxQueryMemoryBytes, and Storage.MinFreeDiskBytes.");
 if (options.Tls.Enabled && (string.IsNullOrWhiteSpace(options.Tls.CertPath) || !File.Exists(options.Tls.CertPath)))
@@ -116,6 +112,10 @@ var staticAssets = Assembly.GetExecutingAssembly()
     .ToDictionary(name => name.Replace('\\', '/'), StringComparer.Ordinal);
 
 engine.Recover();
+if (!options.Auth.Enabled)
+    runtimeLogger.LogWarning("authentication is disabled; all HTTP endpoints are publicly accessible");
+if (!options.Tls.Enabled)
+    runtimeLogger.LogWarning("TLS is disabled; HTTP traffic is unencrypted");
 runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {BindAddress}, auth {AuthEnabled}, log level {LogLevel}",
     Path.GetFullPath(options.DataPath), options.Http.BindAddress, options.Auth.Enabled, options.Logging.Level);
 
