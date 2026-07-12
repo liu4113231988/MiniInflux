@@ -17,12 +17,12 @@ MiniInflux.Net10 is a small single-node time-series database built with .NET 10 
 ### Quick Start
 
 ```bash
-dotnet run -c Release --project MiniInflux.Net10.csproj
+dotnet run -c Release --project .\MiniInflux\MiniInflux.csproj
 ```
 
 Default HTTP listen address is `http://0.0.0.0:8086`.
 
-The checked-in [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) contains no credentials and leaves authentication disabled for local development. When authentication or TLS is disabled, MiniInflux logs a startup warning; enable them with environment variables or a secret file before exposing the service publicly.
+The checked-in [`appsettings.json`](../MiniInflux/appsettings.json) contains no credentials and leaves authentication disabled for local development. When authentication or TLS is disabled, MiniInflux logs a startup warning; enable them with environment variables or a secret file before exposing the service publicly.
 
 Write a point:
 
@@ -110,12 +110,12 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
 ## 运行
 
 ```bash
-dotnet run -c Release --project MiniInflux.Net10.csproj
+dotnet run -c Release --project .\MiniInflux\MiniInflux.csproj
 ```
 
 默认监听 `http://0.0.0.0:8086`。当前配置同时兼容旧版 `MiniInflux:DataPath`，也支持更接近 InfluxDB 1.x 风格的 `Data`、`Http`、`Logging` 段。
 
-仓库内提交的 [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) 当前默认开启了认证，并带有仅供本地开发使用的示例密码。对外暴露服务前，请先改掉 `Auth__Password` 或 `Auth.Password`。
+仓库内提交的 [`appsettings.json`](../MiniInflux/appsettings.json) 不含可用密码，且默认关闭认证；认证或 TLS 关闭时启动会输出 Warning。对外暴露前请通过环境变量或 secret 文件启用认证与 TLS。
 
 ## 查询、写入与调度能力
 

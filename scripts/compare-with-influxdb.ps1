@@ -290,7 +290,7 @@ try {
     $env:DOTNET_CLI_HOME = (Join-Path $root '.dotnet_home')
     $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
 
-    $miniProc = Start-Process -FilePath 'dotnet' -ArgumentList @('run', '-c', 'Release', '--project', 'MiniInflux.csproj', '--no-launch-profile', '--no-restore') -WorkingDirectory $root -WindowStyle Hidden -PassThru
+    $miniProc = Start-Process -FilePath 'dotnet' -ArgumentList @('run', '-c', 'Release', '--project', 'MiniInflux/MiniInflux.csproj', '--no-launch-profile', '--no-restore') -WorkingDirectory $root -WindowStyle Hidden -PassThru
     $influxProc = Start-Process -FilePath 'D:\workingfold\Influxdb\influxdb-1.7.9\influxd.exe' -ArgumentList @('run', '-config', $influxConfig) -WorkingDirectory $root -WindowStyle Hidden -PassThru
 
     $miniResult = Measure-Server -Name 'MiniInflux' -BaseUrl 'http://127.0.0.1:18086' -Database 'benchmini' -Points $Points -BatchSize $BatchSize -Concurrency $Concurrency -Epoch $Epoch -QueryIterations $QueryIterations

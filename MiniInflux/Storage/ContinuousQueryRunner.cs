@@ -13,19 +13,22 @@ public sealed class ContinuousQueryRunner
     private readonly MiniInfluxOptions _options;
     private readonly MetricsCollector _metrics;
     private readonly ILogger<ContinuousQueryRunner> _logger;
+    private readonly TimeProvider _timeProvider;
 
     public ContinuousQueryRunner(
         TsdbEngine engine,
         QueryExecutor executor,
         MiniInfluxOptions options,
         MetricsCollector metrics,
-        ILogger<ContinuousQueryRunner> logger)
+        ILogger<ContinuousQueryRunner> logger,
+        TimeProvider? timeProvider = null)
     {
         _engine = engine;
         _executor = executor;
         _options = options;
         _metrics = metrics;
         _logger = logger;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public Task<int> ExecuteDueQueriesAsync(CancellationToken cancellationToken = default)
@@ -33,7 +36,7 @@ public sealed class ContinuousQueryRunner
         if (!_options.ContinuousQuery.Enabled)
             return Task.FromResult(0);
 
-        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var nowNs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds() * 1_000_000L;
         int executed = 0;
         foreach (var cq in _engine.Meta.ListContinuousQueries())
             executed += ExecuteDueQuery(cq, nowNs, cancellationToken);

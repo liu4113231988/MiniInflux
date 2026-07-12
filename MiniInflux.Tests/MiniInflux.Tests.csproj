@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\MiniInflux.csproj" />
+    <ProjectReference Include="..\MiniInflux\MiniInflux.csproj" />
   </ItemGroup>
 
 </Project>

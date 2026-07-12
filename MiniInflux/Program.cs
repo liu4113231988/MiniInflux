@@ -11,7 +11,11 @@ using MiniInflux.Net10.Protocol;
 using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
 
-var builder = WebApplication.CreateSlimBuilder(args);
+var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
+{
+    Args = args,
+    ContentRootPath = AppContext.BaseDirectory
+});
 var options = MiniInfluxOptions.Load(builder.Configuration);
 BackupManager.ApplyPendingRestore(options.DataPath);
 

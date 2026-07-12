@@ -277,7 +277,8 @@ public class P2TodoTests : IDisposable
                 MaxCatchUpRunsPerCycle = 4
             }
         };
-        var runner = new ContinuousQueryRunner(engine, executor, options, metrics, loggerFactory.CreateLogger<ContinuousQueryRunner>());
+        var runner = new ContinuousQueryRunner(engine, executor, options, metrics, loggerFactory.CreateLogger<ContinuousQueryRunner>(),
+            new FixedTimeProvider(DateTimeOffset.FromUnixTimeMilliseconds(nowNs / 1_000_000L)));
 
         var executed = await runner.ExecuteDueQueriesAsync();
 
@@ -458,7 +459,6 @@ public class P2TodoTests : IDisposable
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
         const long everyNs = 10_000_000_000L;
-        const long forNs = 30_000_000_000L;
         var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
         var latestClosedWindowStart = (nowNs / everyNs) * everyNs - everyNs;
         var oldestBucketStart = latestClosedWindowStart - 2 * everyNs;
@@ -793,4 +793,9 @@ public class P2TodoTests : IDisposable
         Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(value) },
         TimestampNs = timestampNs
     };
+
+    private sealed class FixedTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => utcNow;
+    }
 }

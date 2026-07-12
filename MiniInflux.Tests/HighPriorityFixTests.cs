@@ -24,7 +24,7 @@ public class HighPriorityFixTests : IDisposable
     [Fact]
     public void AppSettings_IsSingleValidJsonObject()
     {
-        var path = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../appsettings.json"));
+        var path = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../MiniInflux/appsettings.json"));
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
 
         Assert.Equal(JsonValueKind.Object, doc.RootElement.ValueKind);

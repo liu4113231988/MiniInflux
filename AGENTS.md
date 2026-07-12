@@ -2,12 +2,12 @@
 
 ## Project Structure & Module Organization
 
-MiniInflux is a .NET 10 time-series database prototype. The main app lives at the repository root, with `Program.cs` wiring HTTP endpoints and services.
+MiniInflux is a .NET 10 time-series database prototype. The main app lives in `MiniInflux/`, with `Program.cs` wiring HTTP endpoints and services.
 
-- `Model/`: point, field, and query result models.
-- `Protocol/`: line protocol parsing and related protocol code.
-- `Query/`: InfluxQL parsing and query execution helpers.
-- `Storage/`: WAL, segment, manifest, schema, compaction, and engine code.
+- `MiniInflux/Model/`: point, field, and query result models.
+- `MiniInflux/Protocol/`: line protocol parsing and related protocol code.
+- `MiniInflux/Query/`: InfluxQL parsing and query execution helpers.
+- `MiniInflux/Storage/`: WAL, segment, manifest, schema, compaction, and engine code.
 - `MiniInflux.Tests/`: xUnit tests for parser, storage, query, WAL, and P0/P1/P2 behaviors.
 - `scripts/compare-with-influxdb.ps1`: local benchmark comparison against InfluxDB 1.x.
 - `wwwroot/` and `web-admin/`: static/admin UI assets.
@@ -29,7 +29,7 @@ dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo --no-restore
 Runs the xUnit test suite.
 
 ```powershell
-dotnet run -c Release --no-restore
+dotnet run -c Release --project .\MiniInflux\MiniInflux.csproj --no-restore
 ```
 
 Starts MiniInflux locally in release mode.
@@ -46,7 +46,7 @@ Use idiomatic C# with 4-space indentation. Prefer small, direct methods over new
 
 ## Documentation Guidelines
 
-Keep `README.md` organized around completed capabilities and stable usage. Do not add temporary sections such as "recently completed", "next steps", or iteration notes; put detailed benchmark history in `benchmark.md` and planning/status details in `todo-*.md`.
+Keep `docs/README.md` organized around completed capabilities and stable usage. Do not add temporary sections such as "recently completed", "next steps", or iteration notes; put detailed benchmark history in `docs/benchmark.md` and planning/status details in `docs/todo-*.md`.
 
 ## Testing Guidelines
 
@@ -60,4 +60,4 @@ Pull requests should include a brief summary, test results, and benchmark result
 
 ## Security & Configuration Tips
 
-Local settings live in `appsettings.json` and `MiniInfluxOptions.cs`. Do not commit secrets, local data directories, or machine-specific benchmark artifacts. When changing write-path settings such as WAL fsync, flush thresholds, or buffer limits, document the durability/performance tradeoff in the PR.
+Local settings live in `MiniInflux/appsettings.json` and `MiniInflux/MiniInfluxOptions.cs`. Do not commit secrets, local data directories, or machine-specific benchmark artifacts. When changing write-path settings such as WAL fsync, flush thresholds, or buffer limits, document the durability/performance tradeoff in the PR.

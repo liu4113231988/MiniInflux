@@ -37,7 +37,7 @@ InfluxDB 1.x 兼容性：子集可用，但不是完整替代
 
 ## 2. 当前最需要注意的文档差异
 
-`README.md` 是当前最接近源码状态的说明；旧版 `project-info.md` 中仍保留了一些已经完成的风险项，例如：
+`docs/README.md` 是当前最接近源码状态的说明；旧版 `docs/project-info.md` 中仍保留了一些已经完成的风险项，例如：
 
 ```text
 WAL 仍是文件粒度 checkpoint
@@ -513,4 +513,4 @@ MiniInflux.Net10 当前已经具备“小型单节点时序数据库”的骨架
 InfluxDB 1.x 兼容性测试矩阵
 ```
 
-具体拆解、优先级和阶段路线见 [todo-202606.md](D:\workingfold\MiniInflux\todo-202606.md)。
+具体拆解、优先级和阶段路线见 [todo-202606.md](todo-202606.md)。
