@@ -20,6 +20,7 @@ public sealed class TsdbEngine : IDisposable
 
     private readonly string _root;
     private readonly WalManager _wal;
+    private readonly StorageHealth _health = new();
     private readonly SchemaRegistry _schema;
     private readonly Manifest _manifest;
     private readonly ShardManager _shards;
@@ -48,14 +49,14 @@ public sealed class TsdbEngine : IDisposable
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes; _syncFlushOnThreshold = flushIntervalMs <= 0;
         Directory.CreateDirectory(_root);
-        _wal = new WalManager(Path.Combine(_root, "wal"), maxWalFileBytes, walFsync, walFsyncIntervalMs);
+        _wal = new WalManager(Path.Combine(_root, "wal"), maxWalFileBytes, walFsync, walFsyncIntervalMs, _health);
         _manifest = new Manifest(_root);
         _schema = new SchemaRegistry(_root, maxFieldsPerMeasurement);
         _shards = new ShardManager(_root, _manifest);
         _tombstones = new TombstoneStore(_root);
-        _compactor = new Compactor(_manifest, _shards, _tombstones, _schema);
+        _compactor = new Compactor(_manifest, _shards, _tombstones, _schema, health: _health);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
-        if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => _compactor.CompactAll(), null, compactionIntervalMs, compactionIntervalMs);
+        if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => RunCompaction(), null, compactionIntervalMs, compactionIntervalMs);
         if (flushIntervalMs > 0) _flushTimer = new Timer(_ => PeriodicFlush(), null, flushIntervalMs, flushIntervalMs);
     }
 
@@ -140,6 +141,8 @@ public sealed class TsdbEngine : IDisposable
 
     public Task WriteInternalAsync(string db, string rp, List<Point> pts)
     {
+        if (!_health.WriteAvailable)
+            throw new IOException("write path is unavailable after a WAL persistence failure");
         CreateDatabase(db); _manifest.EnsureRp(db, rp);
         var pending = DeduplicateWritePoints(pts);
         var writePoints = pending.Count == pts.Count ? pts : MaterializePendingPoints(pending);
@@ -823,7 +826,14 @@ public sealed class TsdbEngine : IDisposable
     }
 
     public CompactionStatsSnapshot GetCompactionStats() => _compactor.GetStats();
+    public StorageHealth Health => _health;
     public int CompactNow() => _compactor.CompactAll();
+
+    private void RunCompaction()
+    {
+        try { _compactor.CompactAll(); }
+        catch (Exception ex) { _health.RecordFailure("compaction", ex); }
+    }
 
     public void DropDatabase(string db)
     {
@@ -1406,7 +1416,11 @@ public sealed class TsdbEngine : IDisposable
         finally { _globalLock.ExitUpgradeableReadLock(); }
     }
 
-    private void CleanupExpiredShards() { try { _shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000); } catch { } }
+    private void CleanupExpiredShards()
+    {
+        try { _shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000); }
+        catch (Exception ex) { _health.RecordFailure("retention_cleanup", ex); }
+    }
 
     private static string K(string db, string rp) => db + "|" + rp;
 
@@ -1436,7 +1450,7 @@ public sealed class TsdbEngine : IDisposable
             }
             finally { _globalLock.ExitWriteLock(); }
         }
-        catch { /* best effort */ }
+        catch (Exception ex) { _health.RecordFailure("periodic_flush", ex, blocksWrites: true); }
     }
 }
 

@@ -53,6 +53,48 @@ public sealed class AuthenticationGuardTests
         Assert.Equal(AuthenticationAttemptStatus.Success, success.Status);
     }
 
+    [Fact]
+    public void AuthorizationSupport_AllowsDisabledAuth_AndValidBasicCredentials()
+    {
+        var disabled = new AuthOptions { Enabled = false };
+        var disabledGuard = new AuthenticationGuard(disabled);
+        Assert.True(AuthorizationSupport.IsAuthorized(CreateRequest("127.0.0.1"), disabled, disabledGuard, out var disabledFailure));
+        Assert.Null(disabledFailure);
+
+        var enabled = new AuthOptions { Enabled = true, Username = "admin", Password = "secret" };
+        var enabledGuard = new AuthenticationGuard(enabled);
+        Assert.True(AuthorizationSupport.IsAuthorized(CreateRequest("127.0.0.1", "admin", "secret"), enabled, enabledGuard, out var successFailure));
+        Assert.Null(successFailure);
+        Assert.False(AuthorizationSupport.IsAuthorized(CreateRequest("127.0.0.1", "admin", "wrong"), enabled, enabledGuard, out var failedAttempt));
+        Assert.Equal(AuthenticationAttemptStatus.InvalidCredentials, failedAttempt?.Status);
+    }
+
+    [Fact]
+    public void AuthenticationGuard_IgnoresForwardedFor_UnlessRemoteIsTrustedProxy()
+    {
+        var untrusted = new AuthenticationGuard(new AuthOptions { Username = "admin", Password = "secret" });
+        var request = CreateRequest("127.0.0.1", "admin", "wrong");
+        request.Headers["X-Forwarded-For"] = "203.0.113.10";
+        Assert.Equal("127.0.0.1", untrusted.Evaluate(request).ClientId);
+
+        var trusted = new AuthenticationGuard(new AuthOptions
+        {
+            Username = "admin",
+            Password = "secret",
+            TrustedProxyAddresses = ["127.0.0.1"]
+        });
+        Assert.Equal("203.0.113.10", trusted.Evaluate(request).ClientId);
+    }
+
+    [Fact]
+    public void AuthenticationGuard_DisablesQueryCredentialsByDefault()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.QueryString = new QueryString("?u=admin&p=secret");
+        var guard = new AuthenticationGuard(new AuthOptions { Username = "admin", Password = "secret" });
+        Assert.Equal(AuthenticationAttemptStatus.MissingCredentials, guard.Evaluate(context.Request).Status);
+    }
+
     private static HttpRequest CreateRequest(string ip, string? user = null, string? password = null)
     {
         var context = new DefaultHttpContext();

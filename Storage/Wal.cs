@@ -16,6 +16,7 @@ public sealed class WalManager : IDisposable
     private readonly long _maxFileBytes;
     private readonly bool _fsync;
     private readonly int _fsyncIntervalMs;
+    private readonly StorageHealth _health;
     private readonly object _lock = new();
     private FileStream? _currentStream;
     private int _currentFileId;
@@ -24,12 +25,14 @@ public sealed class WalManager : IDisposable
     private Timer? _fsyncTimer;
     private bool _disposed;
 
-    public WalManager(string walDir, long maxFileBytes = 16 * 1024 * 1024, bool fsync = true, int fsyncIntervalMs = 1000)
+    public WalManager(string walDir, long maxFileBytes = 16 * 1024 * 1024, bool fsync = true, int fsyncIntervalMs = 1000,
+        StorageHealth? health = null)
     {
         _walDir = walDir;
         _maxFileBytes = maxFileBytes;
         _fsync = fsync;
         _fsyncIntervalMs = fsyncIntervalMs;
+        _health = health ?? new StorageHealth();
         Directory.CreateDirectory(walDir);
         LoadCheckpoint();
         OpenOrCreateCurrentFile();
@@ -98,17 +101,28 @@ public sealed class WalManager : IDisposable
         var positions = new List<WalPosition>(pointList.Count);
         lock (_lock)
         {
-            if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
-            var payload = Encoding.UTF8.GetBytes(FormatRecord(db, rp, pointList));
-            var position = WriteRecord(payload);
-            for (var i = 0; i < pointList.Count; i++)
-                positions.Add(position);
+            try
+            {
+                if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
+                var payload = Encoding.UTF8.GetBytes(FormatRecord(db, rp, pointList));
+                var position = WriteRecord(payload);
+                for (var i = 0; i < pointList.Count; i++)
+                    positions.Add(position);
 
-            if (_currentFileSize >= _maxFileBytes)
-                RotateLocked();
+                if (_currentFileSize >= _maxFileBytes)
+                    RotateLocked();
 
-            if (!_fsync || _fsyncIntervalMs <= 0)
-                _currentStream?.Flush(false);
+                if (!_fsync || _fsyncIntervalMs <= 0)
+                {
+                    _currentStream?.Flush(_fsync);
+                    _health.RecordWriteSuccess();
+                }
+            }
+            catch (Exception ex)
+            {
+                _health.RecordFailure("wal_append", ex, blocksWrites: true);
+                throw;
+            }
         }
         return positions;
     }
@@ -187,7 +201,15 @@ public sealed class WalManager : IDisposable
         lock (_lock)
         {
             if (_disposed) return;
-            try { _currentStream?.Flush(true); } catch { /* ignore */ }
+            try
+            {
+                _currentStream?.Flush(true);
+                _health.RecordWriteSuccess();
+            }
+            catch (Exception ex)
+            {
+                _health.RecordFailure("wal_fsync", ex, blocksWrites: true);
+            }
         }
     }
 

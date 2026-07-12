@@ -50,19 +50,29 @@ if (!options.Http.Enabled)
     return;
 }
 
+var isProduction = builder.Environment.IsProduction();
 if (options.Auth.Enabled && (string.IsNullOrWhiteSpace(options.Auth.Username) || string.IsNullOrEmpty(options.Auth.Password)))
     throw new InvalidOperationException("Auth.Username and Auth.Password are required when Auth.Enabled is true.");
+if (isProduction && !options.Auth.Enabled)
+    throw new InvalidOperationException("Auth.Enabled must be true in Production.");
+if (isProduction && IsPlaceholderPassword(options.Auth.Password))
+    throw new InvalidOperationException("Auth.Password must not use a placeholder value in Production.");
+if (isProduction && !options.Tls.Enabled)
+    throw new InvalidOperationException("Tls.Enabled must be true in Production.");
+if (options.Tls.Enabled && (string.IsNullOrWhiteSpace(options.Tls.CertPath) || !File.Exists(options.Tls.CertPath)))
+    throw new InvalidOperationException("Tls.CertPath must point to an existing certificate when TLS is enabled.");
 
 var authenticationGuard = new AuthenticationGuard(options.Auth);
 
-builder.WebHost.UseUrls(options.Urls);
-if (options.Tls.Enabled && !string.IsNullOrWhiteSpace(options.Tls.CertPath))
+if (options.Tls.Enabled)
 {
     builder.WebHost.ConfigureKestrel(k =>
     {
-        k.ListenAnyIP(options.Tls.Port, listen => listen.UseHttps(options.Tls.CertPath, options.Tls.Password));
+        k.ListenAnyIP(options.Tls.Port, listen => listen.UseHttps(options.Tls.CertPath!, options.Tls.Password));
     });
 }
+else
+    builder.WebHost.UseUrls(options.Urls);
 
 builder.Services.ConfigureHttpJsonOptions(jsonOptions =>
 {
@@ -169,7 +179,17 @@ app.Use(async (context, next) =>
 
 app.MapGet("/ping", () => Results.NoContent());
 
-app.MapGet("/health", () => Results.Ok(new { name = "miniinflux", message = "ready", status = "pass" }));
+app.MapGet("/health", (TsdbEngine tsdbEngine) =>
+{
+    var health = tsdbEngine.Health;
+    var response = new HealthResponse(
+        health.WriteAvailable ? "ready" : "write path unavailable",
+        health.WriteAvailable ? "pass" : "fail",
+        health.FailureCount,
+        health.LastFailureComponent,
+        health.LastFailureUtc);
+    return Results.Json(response, AppJsonContext.Default.HealthResponse, statusCode: health.WriteAvailable ? 200 : 503);
+});
 
 app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
 {
@@ -575,30 +595,30 @@ app.Run();
 
 static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, AuthenticationGuard authenticationGuard, ILogger logger, out IResult result)
 {
-    if (!options.Auth.Enabled)
+    if (AuthorizationSupport.IsAuthorized(request, options.Auth, authenticationGuard, out var attempt))
     {
-        result = Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
+        result = Results.Empty;
         return true;
     }
 
-    var attempt = authenticationGuard.Evaluate(request);
-    AuditAuthenticationAttempt(logger, request, attempt, options.Auth);
-    if (attempt.Authenticated)
-    {
-        result = Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
-        return true;
-    }
+    var failedAttempt = attempt!;
+    AuditAuthenticationAttempt(logger, request, failedAttempt, options.Auth);
 
-    if (attempt.IsRateLimited)
+    if (failedAttempt.IsRateLimited)
     {
-        ApplyRetryAfterHeader(request.HttpContext.Response, attempt);
-        result = Results.Json(new ErrorResponse(BuildRateLimitMessage(attempt)), AppJsonContext.Default.ErrorResponse, statusCode: 429);
+        ApplyRetryAfterHeader(request.HttpContext.Response, failedAttempt);
+        result = Results.Json(new ErrorResponse(BuildRateLimitMessage(failedAttempt)), AppJsonContext.Default.ErrorResponse, statusCode: 429);
         return false;
     }
 
     result = Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
     return false;
 }
+
+static bool IsPlaceholderPassword(string password) =>
+    string.IsNullOrWhiteSpace(password)
+    || password.Equals("12345678", StringComparison.Ordinal)
+    || password.Equals("replace-with-a-strong-password", StringComparison.OrdinalIgnoreCase);
 
 static void AuditAuthenticationAttempt(ILogger logger, HttpRequest request, AuthenticationAttempt attempt, AuthOptions options)
 {
@@ -916,3 +936,7 @@ static IResult EmbeddedFile(Dictionary<string, string> staticAssets, string path
 public sealed record ErrorResponse([property: System.Text.Json.Serialization.JsonPropertyName("error")] string Error);
 public sealed record AdminMessage([property: System.Text.Json.Serialization.JsonPropertyName("message")] string Message);
 public sealed record BenchmarkSnapshot(int DatabaseCount, long BufferedPoints, long BufferedBytes, double MetadataScanMs);
+public sealed record HealthResponse(string Message, string Status, long StorageFailures, string? LastFailureComponent, DateTimeOffset? LastFailureUtc)
+{
+    public string Name { get; init; } = "miniinflux";
+}

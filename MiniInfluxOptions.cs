@@ -96,6 +96,8 @@ public sealed class MiniInfluxOptions
                 Username = ReadString(config, "Auth:Username", "admin")!,
                 Password = ReadString(config, "Auth:Password", "")!,
                 AuditFailures = ReadBool(config, true, "Auth:AuditFailures"),
+                AllowQueryCredentials = ReadBool(config, false, "Auth:AllowQueryCredentials"),
+                TrustedProxyAddresses = ReadStringList(config, "Auth:TrustedProxyAddresses"),
                 MaxFailedAttempts = Math.Max(0, ReadInt(config, 5, "Auth:MaxFailedAttempts")),
                 FailureWindowMs = Math.Max(1000, ReadInt(config, 60_000, "Auth:FailureWindowMs")),
                 LockoutMs = Math.Max(0, ReadInt(config, 300_000, "Auth:LockoutMs"))
@@ -262,6 +264,8 @@ public sealed class AuthOptions
     public string Username { get; init; } = "admin";
     public string Password { get; init; } = "";
     public bool AuditFailures { get; init; } = true;
+    public bool AllowQueryCredentials { get; init; }
+    public List<string> TrustedProxyAddresses { get; init; } = [];
     public int MaxFailedAttempts { get; init; } = 5;
     public int FailureWindowMs { get; init; } = 60_000;
     public int LockoutMs { get; init; } = 300_000;

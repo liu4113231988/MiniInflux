@@ -9,6 +9,7 @@ using MiniInflux.Net10.Storage;
 [JsonSerializable(typeof(ErrorResponse))]
 [JsonSerializable(typeof(AdminMessage))]
 [JsonSerializable(typeof(BenchmarkSnapshot))]
+[JsonSerializable(typeof(HealthResponse))]
 [JsonSerializable(typeof(BenchmarkRunResult))]
 [JsonSerializable(typeof(BenchmarkPhaseTimings))]
 [JsonSerializable(typeof(CodecComparisonBenchmark))]

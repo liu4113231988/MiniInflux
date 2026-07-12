@@ -308,6 +308,14 @@ public sealed class MetricsCollector
         sb.AppendLine("# TYPE mini_influx_buffer_bytes gauge");
         sb.AppendLine($"mini_influx_buffer_bytes {stats.MemoryBufferBytes}");
 
+        var health = _engine.Health;
+        sb.AppendLine("# HELP mini_influx_storage_write_available Whether the WAL-backed write path is available.");
+        sb.AppendLine("# TYPE mini_influx_storage_write_available gauge");
+        sb.AppendLine($"mini_influx_storage_write_available {(health.WriteAvailable ? 1 : 0)}");
+        sb.AppendLine("# HELP mini_influx_storage_failures_total Storage background and durability failures.");
+        sb.AppendLine("# TYPE mini_influx_storage_failures_total counter");
+        sb.AppendLine($"mini_influx_storage_failures_total {health.FailureCount}");
+
         sb.AppendLine("# HELP mini_influx_series_cardinality Number of unique series per database.");
         sb.AppendLine("# TYPE mini_influx_series_cardinality gauge");
         foreach (var (db, count) in stats.SeriesCardinality)

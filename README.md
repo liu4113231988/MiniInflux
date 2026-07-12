@@ -22,7 +22,7 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 
 Default HTTP listen address is `http://0.0.0.0:8086`.
 
-The checked-in [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) currently enables authentication with a sample local password. Change `Auth__Password` or `Auth.Password` before exposing the service anywhere outside local development.
+The checked-in [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) contains no credentials and leaves authentication disabled for local development. Production requires `Auth__Enabled=true`, a non-placeholder `Auth__Password`, and TLS; configure these through environment variables or a secret file.
 
 Write a point:
 
@@ -48,7 +48,7 @@ curl -G http://localhost:8086/query \
 - `Auth.Enabled` is the main auth switch; `Http.AuthEnabled` only exists for backward compatibility
 - `ContinuousQuery.*` controls the CQ scheduler and catch-up behavior
 - `Write.*`, `Wal.*`, and `Storage.*` provide request, durability, and query guardrails
-- `Tls.Enabled` adds an HTTPS listener on `Tls.Port` when a certificate path is configured
+- `Tls.Enabled` uses only the HTTPS listener on `Tls.Port`; it is required in Production
 
 ### Current Scope
 
@@ -96,7 +96,7 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
 - 写入保护
   - `MaxRequestBodyBytes`、`MaxBufferPoints`、`MaxBufferBytes`
 - 权限与认证
-  - HTTP Basic / query 参数认证
+  - HTTP Basic 认证；query 参数认证默认关闭，仅兼容模式启用
   - 配置文件中的单一超级管理员账号
   - 不支持运行时创建用户、改密或细粒度授权
 - WAL + Segment 存储
@@ -202,7 +202,7 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 
 说明：
 
-- 这里的密码占位符使用的是文档推荐值；仓库里真实的 [`appsettings.json`](/D:/workingfold/MiniInflux/appsettings.json) 可能为了本地测试保留了不同的示例密码
+- 仓库配置不含可用密码；生产环境请通过 `Auth__Password` 注入 secret
 - `Http.AuthEnabled` 仍然保留在示例中，是为了说明旧配置兼容路径；实际优先读取的是 `Auth.Enabled`
 
 设计参考了 InfluxDB 官方配置/日志项思路，但当前只实现了与 MiniInflux 现阶段能力匹配的子集：
@@ -216,6 +216,8 @@ dotnet run -c Release --project MiniInflux.Net10.csproj
 - `Auth.Username`：唯一超级管理员用户名
 - `Auth.Password`：唯一超级管理员密码；启用认证时不能为空
 - `Auth.AuditFailures`：是否记录认证失败和限流审计日志
+- `Auth.AllowQueryCredentials`：允许 `u` / `p` query 参数认证的兼容开关，默认关闭
+- `Auth.TrustedProxyAddresses`：允许使用 `X-Forwarded-For` 的反向代理 IP 白名单；留空时只使用连接 IP
 - `Auth.MaxFailedAttempts`：单个客户端地址在窗口期内允许的最大失败次数，`0` 表示关闭限流
 - `Auth.FailureWindowMs`：失败计数窗口，默认 `60000`
 - `Auth.LockoutMs`：触发限流后的锁定时长，默认 `300000`
@@ -254,17 +256,15 @@ MiniInflux 使用配置驱动的单一超级管理员模型，不维护数据库
 }
 ```
 
-启用后，`/write`、`/query`、诊断接口和 `/admin` 管理台均使用同一账号认证。支持 InfluxDB 1.x 客户端常用的两种传递方式：
+启用后，`/write`、`/query`、诊断接口和 `/admin` 管理台均使用同一账号认证。默认只支持 HTTP Basic：
 
 ```bash
 curl -u admin:replace-with-a-strong-password \
   "http://localhost:8086/query?q=SHOW%20DATABASES"
 
-curl -G http://localhost:8086/query \
-  --data-urlencode "u=admin" \
-  --data-urlencode "p=replace-with-a-strong-password" \
-  --data-urlencode "q=SHOW DATABASES"
 ```
+
+若必须兼容旧客户端，可显式配置 `Auth.AllowQueryCredentials=true`；此模式会增加 URL 泄露风险，不建议在生产环境使用。
 
 账号或密码修改后需要重启服务。`CREATE USER`、`ALTER USER`、`DROP USER`、`GRANT`、`REVOKE`、`SHOW USERS` 和 `SHOW GRANTS` 不受支持。
 

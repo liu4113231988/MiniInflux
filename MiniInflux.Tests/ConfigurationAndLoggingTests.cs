@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Microsoft.AspNetCore.Http;
 using MiniInflux.Net10.Storage;
 
 namespace MiniInflux.Tests;
@@ -127,6 +128,22 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
         Assert.True(HttpLoggingSupport.ShouldLogRequest(options, "/query", 404));
         Assert.True(HttpLoggingSupport.ShouldLogRequest(options, "/query", 503));
         Assert.False(HttpLoggingSupport.ShouldLogRequest(options, "/query", 200));
+    }
+
+    [Fact]
+    public void HttpLoggingSupport_RedactsCredentialQueryParameters()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = "GET";
+        context.Request.Path = "/query";
+        context.Request.QueryString = new QueryString("?u=admin&p=secret&token=abc&q=SELECT%201");
+
+        var line = HttpLoggingSupport.FormatAccessLogLine(context, 1);
+
+        Assert.DoesNotContain("secret", line);
+        Assert.DoesNotContain("token=abc", line);
+        Assert.Contains("p=[REDACTED]", line);
+        Assert.Contains("q=SELECT%201", line);
     }
 
     [Fact]

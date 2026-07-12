@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
+using System.Net;
 using System.Text;
 
 public enum AuthenticationAttemptStatus
@@ -150,11 +151,11 @@ public sealed class AuthenticationGuard
         && _failureWindow > TimeSpan.Zero
         && _lockoutDuration > TimeSpan.Zero;
 
-    private static (string? UserName, string? Password, string Source) ExtractCredentials(HttpRequest request)
+    private (string? UserName, string? Password, string Source) ExtractCredentials(HttpRequest request)
     {
         var userName = request.Query["u"].ToString();
         var password = request.Query["p"].ToString();
-        if (!string.IsNullOrEmpty(userName) || !string.IsNullOrEmpty(password))
+        if (_options.AllowQueryCredentials && (!string.IsNullOrEmpty(userName) || !string.IsNullOrEmpty(password)))
             return (userName, password, "query");
 
         var authorization = request.Headers.Authorization.ToString();
@@ -178,8 +179,12 @@ public sealed class AuthenticationGuard
         return (null, null, "none");
     }
 
-    private static string GetClientId(HttpRequest request)
+    private string GetClientId(HttpRequest request)
     {
+        var remoteIp = request.HttpContext.Connection.RemoteIpAddress;
+        if (!IsTrustedProxy(remoteIp))
+            return remoteIp?.ToString() ?? "unknown";
+
         var forwardedFor = request.Headers["X-Forwarded-For"].ToString();
         if (!string.IsNullOrWhiteSpace(forwardedFor))
         {
@@ -188,8 +193,12 @@ public sealed class AuthenticationGuard
                 return first;
         }
 
-        return request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        return remoteIp?.ToString() ?? "unknown";
     }
+
+    private bool IsTrustedProxy(IPAddress? remoteIp) =>
+        remoteIp != null && _options.TrustedProxyAddresses.Any(value =>
+            IPAddress.TryParse(value, out var trusted) && trusted.Equals(remoteIp));
 
     private static int GetRetryAfterSeconds(DateTimeOffset now, DateTimeOffset lockedUntilUtc)
     {

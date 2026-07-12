@@ -12,6 +12,7 @@ public sealed class Compactor
     private readonly ShardManager _shardManager;
     private readonly TombstoneStore _tombstones;
     private readonly SchemaRegistry _schema;
+    private readonly StorageHealth? _health;
     private readonly int _maxL0Segments;
     private readonly int _maxL1Segments;
     private readonly long _maxL0Bytes;
@@ -29,12 +30,13 @@ public sealed class Compactor
     public Compactor(Manifest manifest, ShardManager shardManager, TombstoneStore tombstones,
         SchemaRegistry schema, int maxL0Segments = 10, int maxL1Segments = 4,
         long maxL0Bytes = 32 * 1024 * 1024, long maxL1Bytes = 128 * 1024 * 1024,
-        int minFilesPerCompaction = 2, int maxPassesPerRun = 8)
+        int minFilesPerCompaction = 2, int maxPassesPerRun = 8, StorageHealth? health = null)
     {
         _manifest = manifest;
         _shardManager = shardManager;
         _tombstones = tombstones;
         _schema = schema;
+        _health = health;
         _maxL0Segments = maxL0Segments;
         _maxL1Segments = maxL1Segments;
         _maxL0Bytes = maxL0Bytes;
@@ -143,13 +145,13 @@ public sealed class Compactor
         return tasks;
     }
 
-    private static List<FileCandidate> DescribeFiles(List<string> segFiles) =>
+    private List<FileCandidate> DescribeFiles(List<string> segFiles) =>
         segFiles.Select(DescribeFile)
             .OrderBy(x => x.LastWriteUtc)
             .ThenBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-    private static FileCandidate DescribeFile(string path)
+    private FileCandidate DescribeFile(string path)
     {
         long? minTimeNs = null;
         long? maxTimeNs = null;
@@ -162,7 +164,7 @@ public sealed class Compactor
                 maxTimeNs = metadata.Max(m => m.MaxTime);
             }
         }
-        catch { }
+        catch (Exception ex) { _health?.RecordFailure("compaction_metadata", ex); }
 
         return new FileCandidate(path, SafeLength(path), SafeWriteTime(path), InferLevel(path), minTimeNs, maxTimeNs);
     }
@@ -242,7 +244,7 @@ public sealed class Compactor
         foreach (var file in orderedInputs)
         {
             try { allColumns.AddRange(SegmentReader.ReadSegment(file.Path)); }
-            catch { }
+            catch (Exception ex) { _health?.RecordFailure("compaction_read", ex); return false; }
         }
 
         if (allColumns.Count == 0) return false;
@@ -297,8 +299,9 @@ public sealed class Compactor
                 sourceFiles.Select(f => f.Path),
                 string.IsNullOrWhiteSpace(mergedPath) ? [] : [mergedPath]);
         }
-        catch
+        catch (Exception ex)
         {
+            _health?.RecordFailure("compaction_manifest", ex);
             RollbackStageMoves(stagedMoves);
             if (!string.IsNullOrWhiteSpace(mergedPath))
                 TryDelete(mergedPath);
@@ -319,12 +322,13 @@ public sealed class Compactor
         return 0;
     }
 
-    private static void TryDelete(string path)
+    private void TryDelete(string path)
     {
-        try { File.Delete(path); } catch { }
+        try { File.Delete(path); }
+        catch (Exception ex) { _health?.RecordFailure("compaction_delete", ex); }
     }
 
-    private static bool TryStageSourceFiles(List<FileCandidate> sourceFiles, out List<StagedMove> stagedMoves)
+    private bool TryStageSourceFiles(List<FileCandidate> sourceFiles, out List<StagedMove> stagedMoves)
     {
         stagedMoves = [];
         foreach (var source in sourceFiles)
@@ -335,8 +339,9 @@ public sealed class Compactor
                 File.Move(source.Path, stagedPath);
                 stagedMoves.Add(new StagedMove(source.Path, stagedPath));
             }
-            catch
+            catch (Exception ex)
             {
+                _health?.RecordFailure("compaction_stage", ex);
                 RollbackStageMoves(stagedMoves);
                 stagedMoves = [];
                 return false;
@@ -346,7 +351,7 @@ public sealed class Compactor
         return true;
     }
 
-    private static void RollbackStageMoves(List<StagedMove> stagedMoves)
+    private void RollbackStageMoves(List<StagedMove> stagedMoves)
     {
         for (int i = stagedMoves.Count - 1; i >= 0; i--)
         {
@@ -355,20 +360,20 @@ public sealed class Compactor
                 if (File.Exists(stagedMoves[i].StagedPath))
                     File.Move(stagedMoves[i].StagedPath, stagedMoves[i].OriginalPath);
             }
-            catch { }
+            catch (Exception ex) { _health?.RecordFailure("compaction_rollback", ex); }
         }
     }
 
-    private static long SafeLength(string path)
+    private long SafeLength(string path)
     {
         try { return new FileInfo(path).Length; }
-        catch { return 0; }
+        catch (Exception ex) { _health?.RecordFailure("compaction_file_length", ex); return 0; }
     }
 
-    private static DateTime SafeWriteTime(string path)
+    private DateTime SafeWriteTime(string path)
     {
         try { return File.GetLastWriteTimeUtc(path); }
-        catch { return DateTime.MinValue; }
+        catch (Exception ex) { _health?.RecordFailure("compaction_file_timestamp", ex); return DateTime.MinValue; }
     }
 
     private static List<SegmentColumn> MergeColumns(List<SegmentColumn> columns)

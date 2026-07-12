@@ -22,12 +22,27 @@ public static class HttpLoggingSupport
     {
         var remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? "-";
         var method = context.Request.Method;
-        var target = context.Request.Path + context.Request.QueryString;
+        var target = context.Request.Path + RedactQueryString(context.Request.Query);
         var protocol = context.Request.Protocol;
         var status = context.Response.StatusCode;
         var length = context.Response.ContentLength ?? 0;
         return $"{DateTimeOffset.UtcNow:O} {remoteIp} \"{method} {target} {protocol}\" {status} {length} {elapsedMs}ms";
     }
+
+    private static string RedactQueryString(IQueryCollection query)
+    {
+        if (query.Count == 0)
+            return string.Empty;
+
+        return "?" + string.Join("&", query.Select(pair =>
+            $"{Uri.EscapeDataString(pair.Key)}={(IsSensitiveKey(pair.Key) ? "[REDACTED]" : Uri.EscapeDataString(pair.Value.ToString()))}"));
+    }
+
+    private static bool IsSensitiveKey(string key) =>
+        key.Equals("p", StringComparison.OrdinalIgnoreCase)
+        || key.Contains("password", StringComparison.OrdinalIgnoreCase)
+        || key.Contains("secret", StringComparison.OrdinalIgnoreCase)
+        || key.Contains("token", StringComparison.OrdinalIgnoreCase);
 
     private static bool MatchesStatusFilter(string filter, int statusCode)
     {
