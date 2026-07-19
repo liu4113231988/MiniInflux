@@ -76,7 +76,11 @@ public static class InfluxQlParser
             return new() { Kind = QueryKind.DropShard, Limit = int.Parse(q["DROP SHARD ".Length..].Trim(), CultureInfo.InvariantCulture) };
         if (q.StartsWith("DELETE FROM ", StringComparison.OrdinalIgnoreCase)) return ParseDelete(q);
         if (q.StartsWith("CREATE DATABASE ", StringComparison.OrdinalIgnoreCase))
-            return new() { Kind = QueryKind.CreateDatabase, Database = Unq(q[16..].Trim()) };
+        {
+            var database = q[16..].Trim();
+            if (database.StartsWith("IF NOT EXISTS ", StringComparison.OrdinalIgnoreCase)) database = database[14..].Trim();
+            return new() { Kind = QueryKind.CreateDatabase, Database = Unq(database) };
+        }
         if (q.Equals("SHOW DATABASES", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowDatabases };
         if (q.Equals("SHOW MEASUREMENTS", StringComparison.OrdinalIgnoreCase))

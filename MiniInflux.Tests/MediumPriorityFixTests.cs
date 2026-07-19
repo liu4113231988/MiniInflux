@@ -94,6 +94,71 @@ public class MediumPriorityFixTests : IDisposable
     }
 
     [Fact]
+    public async Task Select_StringPredicate_MatchesLegacyFieldAndCurrentTag()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "INDEX",
+                Tags = [],
+                Fields = new Dictionary<string, FieldValue>
+                {
+                    ["tag"] = FieldValue.FromString("00CJA056301.OUT"),
+                    ["value"] = FieldValue.FromDouble(1)
+                },
+                TimestampNs = 1
+            },
+            new Point
+            {
+                Measurement = "INDEX",
+                Tags = new Dictionary<string, string> { ["tag"] = "00CJA056301.OUT" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(2) },
+                TimestampNs = 2
+            }
+        ]);
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb",
+            "SELECT * FROM \"INDEX\" WHERE \"tag\"='00CJA056301.OUT'");
+
+        var series = response.Results[0].Series![0];
+        Assert.Equal(2, series.Values.Count);
+        Assert.Equal(1, series.Columns.Count(column => column == "tag"));
+        Assert.All(series.Values, row => Assert.Equal("00CJA056301.OUT", row[1]));
+    }
+
+    [Fact]
+    public async Task Select_LegacyTagFieldsAtSameTimestamp_RetainsEachLogicalSeries()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await WriteLegacyTagPoint(engine, "tag-a", 1);
+        engine.FlushAll();
+        await WriteLegacyTagPoint(engine, "tag-b", 2);
+        engine.FlushAll();
+
+        var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "SELECT * FROM \"INDEX\"");
+
+        Assert.Equal(2, response.Results[0].Series![0].Values.Count);
+    }
+
+    private static Task WriteLegacyTagPoint(TsdbEngine engine, string tag, double value) =>
+        engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "INDEX",
+                Tags = [],
+                Fields = new Dictionary<string, FieldValue>
+                {
+                    ["tag"] = FieldValue.FromString(tag),
+                    ["value"] = FieldValue.FromDouble(value)
+                },
+                TimestampNs = 1
+            }
+        ]);
+
+    [Fact]
     public async Task RawDescLimitFastJson_UsesEpochNs()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
@@ -112,6 +177,8 @@ public class MediumPriorityFixTests : IDisposable
 
         Assert.NotNull(outcome);
         var json = Encoding.UTF8.GetString(outcome.Json);
+        Assert.Contains("\"results\"", json);
+        Assert.DoesNotContain("\"Tags\":null", json);
         Assert.Contains("[3000000000,3", json);
         Assert.DoesNotContain("1970-", json);
     }

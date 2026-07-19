@@ -84,6 +84,22 @@ public class DuplicatePointTests : IDisposable
     }
 
     [Fact]
+    public async Task WriteDuplicatePoint_AfterFlush_OverwritesExistingValue()
+    {
+        await _engine.WriteAsync("testdb", "autogen", [Point(1.5, 1000_000_000)]);
+        _engine.FlushAll();
+        await _engine.WriteAsync("testdb", "autogen", [Point(9.9, 1000_000_000)]);
+
+        var read = _engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
+        var streamed = _engine.EnumeratePoints("testdb", "autogen", "cpu", null, null).ToList();
+
+        Assert.Single(read);
+        Assert.Equal(9.9, read[0].Fields["value"].Float);
+        Assert.Single(streamed);
+        Assert.Equal(9.9, streamed[0].Fields["value"].Float);
+    }
+
+    [Fact]
     public async Task WriteDuplicatePoints_DifferentTimestamps_NotMerged()
     {
         // Points with different timestamps should NOT be merged
@@ -138,4 +154,12 @@ public class DuplicatePointTests : IDisposable
         var result = _engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
         Assert.Equal(2, result.Count);
     }
+
+    private static Point Point(double value, long timestampNs) => new()
+    {
+        Measurement = "cpu",
+        Tags = new Dictionary<string, string> { { "host", "server01" } },
+        Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(value) } },
+        TimestampNs = timestampNs
+    };
 }

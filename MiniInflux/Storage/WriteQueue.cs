@@ -38,16 +38,6 @@ public sealed class WriteQueue : IDisposable
     /// </summary>
     public async Task<bool> EnqueueAsync(string db, string rp, List<Point> points, CancellationToken ct = default)
     {
-        if (Interlocked.CompareExchange(ref _pendingRequests, 1, 0) == 0)
-        {
-            try
-            {
-                await _engine.WriteInternalAsync(db, rp, points);
-                return true;
-            }
-            finally { Interlocked.Decrement(ref _pendingRequests); }
-        }
-
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var request = new WriteRequest(db, rp, points, tcs);
 

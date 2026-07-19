@@ -123,6 +123,16 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
     }
 
     [Fact]
+    public void MiniInfluxOptions_UsesProductionSafeResourceDefaults()
+    {
+        var options = MiniInfluxOptions.Load(new ConfigurationBuilder().Build());
+
+        Assert.Equal(30_000, options.Storage.MaxQueryDurationMs);
+        Assert.Equal(512L * 1024 * 1024, options.Storage.MaxQueryMemoryBytes);
+        Assert.Equal(1L * 1024 * 1024 * 1024, options.Storage.MinFreeDiskBytes);
+    }
+
+    [Fact]
     public void HttpLoggingSupport_HonorsWriteSuppression_AndStatusFilters()
     {
         var options = new HttpOptions

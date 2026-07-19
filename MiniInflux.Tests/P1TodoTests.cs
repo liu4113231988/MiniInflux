@@ -239,6 +239,43 @@ public class P1TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task Compactor_LegacyTagField_PreservesSeriesAtSameTimestamp()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        foreach (var tag in new[] { "tag-a", "tag-b" })
+        {
+            await engine.WriteAsync("testdb", "autogen",
+            [
+                new Point
+                {
+                    Measurement = "INDEX",
+                    Tags = [],
+                    Fields = new Dictionary<string, FieldValue>
+                    {
+                        ["tag"] = FieldValue.FromString(tag),
+                        ["value"] = FieldValue.FromDouble(tag == "tag-a" ? 1 : 2)
+                    },
+                    TimestampNs = 1
+                }
+            ]);
+        }
+
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 2,
+            maxL1Segments: 99);
+
+        Assert.Equal(1, compactor.CompactAll());
+        var points = engine.ReadAllPoints("testdb", "autogen", "INDEX", null, null);
+        Assert.Equal(2, points.Count);
+        Assert.Contains(points, point => point.Tags["tag"] == "tag-a");
+        Assert.Contains(points, point => point.Tags["tag"] == "tag-b");
+    }
+
+    [Fact]
     public async Task SelectInto_WritesQueryResultToTargetMeasurement()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);

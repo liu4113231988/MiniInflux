@@ -430,6 +430,7 @@ public sealed class QueryExecutor
         var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
         var fields = ResolveRawFields(e, sourceDb, q, requestedFields);
         var tags = ResolveRawTags(e, sourceDb, q.Measurement);
+        fields.RemoveAll(field => tags.Contains(field, StringComparer.Ordinal));
         var cols = new List<string> { "time" };
         cols.AddRange(tags);
         cols.AddRange(fields);
@@ -870,6 +871,7 @@ public sealed class QueryExecutor
         var tags = pointsAreDescending && pts.Count > 0
             ? pts[0].Tags.Keys.Order().ToList()
             : pts.SelectMany(p => p.Tags.Keys).Distinct().Order().ToList();
+        fields.RemoveAll(field => tags.Contains(field, StringComparer.Ordinal));
         var cols = new List<string> { "time" };
         cols.AddRange(tags);
         cols.AddRange(fields);
@@ -881,7 +883,12 @@ public sealed class QueryExecutor
         {
             cancellationToken.ThrowIfCancellationRequested();
             var row = new List<object?>(rowCapacity) { Time(p.TimestampNs) };
-            foreach (var t in tags) row.Add(p.Tags.TryGetValue(t, out var v) ? v : null);
+            foreach (var t in tags)
+                row.Add(p.Tags.TryGetValue(t, out var v)
+                    ? v
+                    : p.Fields.TryGetValue(t, out var legacyTag) && legacyTag.Kind == FieldKind.String
+                        ? legacyTag.String
+                        : null);
             foreach (var f in fields) row.Add(p.Fields.TryGetValue(f, out var v) ? v.ToObject() : null);
             vals.Add(row);
             rawResultBytes += 32 + EstimateRowBytes(row);
@@ -1256,9 +1263,14 @@ public sealed class QueryExecutor
         if (string.IsNullOrWhiteSpace(q.Measurement) || q.TagFilters.Count == 0)
             return null;
 
+        var fieldKeys = e.ListFieldKeys(db, q.Measurement)
+            .Select(field => field.Field)
+            .ToHashSet(StringComparer.Ordinal);
         HashSet<string>? candidates = null;
         foreach (var filter in q.TagFilters)
         {
+            // A quoted string predicate can target a string field. Do not apply tag-index pushdown when ambiguous.
+            if (fieldKeys.Contains(filter.Key)) continue;
             IReadOnlyList<string>? matches = filter.Op switch
             {
                 TagOp.Eq => e.GetSeriesForTagValue(db, q.Measurement, filter.Key, filter.Value),
@@ -1740,21 +1752,7 @@ public sealed class QueryExecutor
     static List<Point> ApplyTagFilters(List<Point> pts, List<TagFilter> filters)
     {
         if (filters.Count == 0) return pts;
-        return pts.Where(p =>
-        {
-            foreach (var f in filters)
-            {
-                var tagVal = p.Tags.TryGetValue(f.Key, out var v) ? v : null;
-                switch (f.Op)
-                {
-                    case TagOp.Eq: if (tagVal != f.Value) return false; break;
-                    case TagOp.Neq: if (tagVal == f.Value) return false; break;
-                    case TagOp.Regex: if (tagVal == null || !Regex.IsMatch(tagVal, f.Value)) return false; break;
-                    case TagOp.NotRegex: if (tagVal != null && Regex.IsMatch(tagVal, f.Value)) return false; break;
-                }
-            }
-            return true;
-        }).ToList();
+        return pts.Where(point => MatchesTagFilters(point, filters)).ToList();
     }
 
     static List<Point> ApplyFieldFilters(List<Point> pts, List<FieldFilter> filters)
@@ -2419,13 +2417,11 @@ public sealed class QueryExecutor
         using (var writer = new System.Text.Json.Utf8JsonWriter(buffer))
         {
             writer.WriteStartObject();
-            writer.WritePropertyName(nameof(QueryResponse.Results));
+            writer.WritePropertyName("results");
             writer.WriteStartArray();
             writer.WriteStartObject();
-            writer.WriteNumber(nameof(QueryResult.StatementId), 0);
-            writer.WritePropertyName(nameof(QueryResult.Series));
-            writer.WriteNullValue();
-            writer.WriteString(nameof(QueryResult.Error), report.Error);
+            writer.WriteNumber("statement_id", 0);
+            writer.WriteString("error", report.Error);
             writer.WriteEndObject();
             writer.WriteEndArray();
             writer.WriteEndObject();
@@ -2447,32 +2443,28 @@ public sealed class QueryExecutor
         ref long resultBytes)
     {
         writer.WriteStartObject();
-        writer.WritePropertyName(nameof(QueryResponse.Results));
+        writer.WritePropertyName("results");
         writer.WriteStartArray();
         writer.WriteStartObject();
-        writer.WriteNumber(nameof(QueryResult.StatementId), 0);
-        writer.WritePropertyName(nameof(QueryResult.Series));
+        writer.WriteNumber("statement_id", 0);
+        writer.WritePropertyName("series");
         writer.WriteStartArray();
         writer.WriteStartObject();
-        writer.WriteString(nameof(QuerySeries.Name), measurement);
-        writer.WritePropertyName(nameof(QuerySeries.Tags));
-        if (seriesTags.Count == 0)
+        writer.WriteString("name", measurement);
+        if (seriesTags.Count > 0)
         {
-            writer.WriteNullValue();
-        }
-        else
-        {
+            writer.WritePropertyName("tags");
             writer.WriteStartObject();
             foreach (var (key, value) in seriesTags)
                 writer.WriteString(key, value);
             writer.WriteEndObject();
         }
-        writer.WritePropertyName(nameof(QuerySeries.Columns));
+        writer.WritePropertyName("columns");
         writer.WriteStartArray();
         foreach (var column in columns)
             writer.WriteStringValue(column);
         writer.WriteEndArray();
-        writer.WritePropertyName(nameof(QuerySeries.Values));
+        writer.WritePropertyName("values");
         writer.WriteStartArray();
 
         var emitted = 0;
@@ -2508,8 +2500,6 @@ public sealed class QueryExecutor
         writer.WriteEndArray();
         writer.WriteEndObject();
         writer.WriteEndArray();
-        writer.WritePropertyName(nameof(QueryResult.Error));
-        writer.WriteNullValue();
         writer.WriteEndObject();
         writer.WriteEndArray();
         writer.WriteEndObject();
@@ -2529,33 +2519,29 @@ public sealed class QueryExecutor
         ref long resultBytes)
     {
         writer.WriteStartObject();
-        writer.WritePropertyName(nameof(QueryResponse.Results));
+        writer.WritePropertyName("results");
         writer.WriteStartArray();
         writer.WriteStartObject();
-        writer.WriteNumber(nameof(QueryResult.StatementId), 0);
-        writer.WritePropertyName(nameof(QueryResult.Series));
+        writer.WriteNumber("statement_id", 0);
+        writer.WritePropertyName("series");
         writer.WriteStartArray();
         writer.WriteStartObject();
-        writer.WriteString(nameof(QuerySeries.Name), measurement);
-        writer.WritePropertyName(nameof(QuerySeries.Tags));
-        if (seriesTags.Count == 0)
+        writer.WriteString("name", measurement);
+        if (seriesTags.Count > 0)
         {
-            writer.WriteNullValue();
-        }
-        else
-        {
+            writer.WritePropertyName("tags");
             writer.WriteStartObject();
             foreach (var (key, value) in seriesTags)
                 writer.WriteString(key, value);
             writer.WriteEndObject();
         }
 
-        writer.WritePropertyName(nameof(QuerySeries.Columns));
+        writer.WritePropertyName("columns");
         writer.WriteStartArray();
         foreach (var column in columns)
             writer.WriteStringValue(column);
         writer.WriteEndArray();
-        writer.WritePropertyName(nameof(QuerySeries.Values));
+        writer.WritePropertyName("values");
         writer.WriteStartArray();
 
         var emitted = 0;
@@ -2590,8 +2576,6 @@ public sealed class QueryExecutor
         writer.WriteEndArray();
         writer.WriteEndObject();
         writer.WriteEndArray();
-        writer.WritePropertyName(nameof(QueryResult.Error));
-        writer.WriteNullValue();
         writer.WriteEndObject();
         writer.WriteEndArray();
         writer.WriteEndObject();
@@ -2683,7 +2667,11 @@ public sealed class QueryExecutor
         if (filters.Count == 0) return true;
         foreach (var f in filters)
         {
-            var tagVal = point.Tags.TryGetValue(f.Key, out var v) ? v : null;
+            var tagVal = point.Tags.TryGetValue(f.Key, out var v)
+                ? v
+                : point.Fields.TryGetValue(f.Key, out var field) && field.Kind == FieldKind.String
+                    ? field.String
+                    : null;
             switch (f.Op)
             {
                 case TagOp.Eq: if (tagVal != f.Value) return false; break;
@@ -2722,7 +2710,11 @@ public sealed class QueryExecutor
     {
         var row = new List<object?>(1 + tags.Count + fields.Count) { Time(point.TimestampNs) };
         foreach (var tag in tags)
-            row.Add(point.Tags.TryGetValue(tag, out var value) ? value : null);
+            row.Add(point.Tags.TryGetValue(tag, out var value)
+                ? value
+                : point.Fields.TryGetValue(tag, out var legacyTag) && legacyTag.Kind == FieldKind.String
+                    ? legacyTag.String
+                    : null);
         foreach (var field in fields)
             row.Add(point.Fields.TryGetValue(field, out var value) ? value.ToObject() : null);
         return row;

@@ -14,6 +14,15 @@ public class InfluxQlParserTests
     }
 
     [Fact]
+    public void Parse_CreateDatabaseIfNotExists_ReturnsDatabaseName()
+    {
+        var query = InfluxQlParser.Parse("CREATE DATABASE IF NOT EXISTS ofm_tsdb");
+
+        Assert.Equal(QueryKind.CreateDatabase, query.Kind);
+        Assert.Equal("ofm_tsdb", query.Database);
+    }
+
+    [Fact]
     public void Parse_ShowDatabases_ReturnsShowDatabasesQuery()
     {
         var query = InfluxQlParser.Parse("SHOW DATABASES");

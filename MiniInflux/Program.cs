@@ -54,15 +54,15 @@ if (!options.Http.Enabled)
     return;
 }
 
-var isProduction = builder.Environment.IsProduction();
-if (options.Auth.Enabled && (string.IsNullOrWhiteSpace(options.Auth.Username) || string.IsNullOrEmpty(options.Auth.Password)))
-    throw new InvalidOperationException("Auth.Username and Auth.Password are required when Auth.Enabled is true.");
-if (isProduction && options.Auth.Enabled && IsPlaceholderPassword(options.Auth.Password))
-    throw new InvalidOperationException("Auth.Password must not use a placeholder value in Production.");
-if (isProduction && (options.Storage.MaxQueryDurationMs <= 0 || options.Storage.MaxQueryMemoryBytes <= 0 || options.Storage.MinFreeDiskBytes <= 0))
-    throw new InvalidOperationException("Production requires non-zero Storage.MaxQueryDurationMs, Storage.MaxQueryMemoryBytes, and Storage.MinFreeDiskBytes.");
-if (options.Tls.Enabled && (string.IsNullOrWhiteSpace(options.Tls.CertPath) || !File.Exists(options.Tls.CertPath)))
-    throw new InvalidOperationException("Tls.CertPath must point to an existing certificate when TLS is enabled.");
+var authenticationConfigurationMissing = options.Auth.Enabled
+    && (string.IsNullOrWhiteSpace(options.Auth.Username) || string.IsNullOrEmpty(options.Auth.Password));
+if (authenticationConfigurationMissing)
+    options.Auth.Enabled = false;
+
+var tlsConfigurationMissing = options.Tls.Enabled
+    && (string.IsNullOrWhiteSpace(options.Tls.CertPath) || !File.Exists(options.Tls.CertPath));
+if (tlsConfigurationMissing)
+    options.Tls.Enabled = false;
 
 var authenticationGuard = new AuthenticationGuard(options.Auth);
 
@@ -118,10 +118,16 @@ var staticAssets = Assembly.GetExecutingAssembly()
 engine.Recover();
 if (!options.Auth.Enabled)
     runtimeLogger.LogWarning("authentication is disabled; all HTTP endpoints are publicly accessible");
+if (authenticationConfigurationMissing)
+    runtimeLogger.LogWarning("authentication was requested but credentials are missing; authentication has been disabled");
 if (!options.Tls.Enabled)
     runtimeLogger.LogWarning("TLS is disabled; HTTP traffic is unencrypted");
+if (tlsConfigurationMissing)
+    runtimeLogger.LogWarning("TLS was requested but Tls.CertPath is missing or unreadable; TLS has been disabled");
 runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {BindAddress}, auth {AuthEnabled}, log level {LogLevel}",
     Path.GetFullPath(options.DataPath), options.Http.BindAddress, options.Auth.Enabled, options.Logging.Level);
+runtimeLogger.LogInformation("Performance tuning: adjust Write.QueueCapacity={QueueCapacity}, Write.BatchSize={BatchSize}, Storage.MaxBufferPoints={MaxBufferPoints}, Storage.MaxQueryDurationMs={MaxQueryDurationMs}, Storage.MaxQueryMemoryBytes={MaxQueryMemoryBytes}, and Wal.Fsync={WalFsync} as needed",
+    options.Write.QueueCapacity, options.Write.BatchSize, options.Storage.MaxBufferPoints, options.Storage.MaxQueryDurationMs, options.Storage.MaxQueryMemoryBytes, options.Wal.Fsync);
 
 if (options.Http.LogEnabled)
 {
@@ -640,11 +646,6 @@ static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, Aut
     return false;
 }
 
-static bool IsPlaceholderPassword(string password) =>
-    string.IsNullOrWhiteSpace(password)
-    || password.Equals("12345678", StringComparison.Ordinal)
-    || password.Equals("replace-with-a-strong-password", StringComparison.OrdinalIgnoreCase);
-
 static bool TryResolveManagedBackupPath(MiniInfluxOptions options, string? name, out string path)
 {
     path = "";
@@ -750,7 +751,7 @@ static async Task WriteQueryResponseAsync(Stream stream, QueryResponse response,
 static void WriteQueryResponse(Utf8JsonWriter writer, QueryResponse response, long epochDivisor)
 {
     writer.WriteStartObject();
-    writer.WritePropertyName(nameof(QueryResponse.Results));
+    writer.WritePropertyName("results");
     writer.WriteStartArray();
     foreach (var result in response.Results)
         WriteQueryResult(writer, result, epochDivisor);
@@ -761,52 +762,41 @@ static void WriteQueryResponse(Utf8JsonWriter writer, QueryResponse response, lo
 static void WriteQueryResult(Utf8JsonWriter writer, QueryResult result, long epochDivisor)
 {
     writer.WriteStartObject();
-    writer.WriteNumber(nameof(QueryResult.StatementId), result.StatementId);
-    writer.WritePropertyName(nameof(QueryResult.Series));
-    if (result.Series is null)
+    writer.WriteNumber("statement_id", result.StatementId);
+    if (result.Series is not null)
     {
-        writer.WriteNullValue();
-    }
-    else
-    {
+        writer.WritePropertyName("series");
         writer.WriteStartArray();
         foreach (var series in result.Series)
             WriteQuerySeries(writer, series, epochDivisor);
         writer.WriteEndArray();
     }
 
-    writer.WritePropertyName(nameof(QueryResult.Error));
-    if (result.Error is null)
-        writer.WriteNullValue();
-    else
-        writer.WriteStringValue(result.Error);
+    if (result.Error is not null)
+        writer.WriteString("error", result.Error);
     writer.WriteEndObject();
 }
 
 static void WriteQuerySeries(Utf8JsonWriter writer, QuerySeries series, long epochDivisor)
 {
     writer.WriteStartObject();
-    writer.WriteString(nameof(QuerySeries.Name), series.Name);
-    writer.WritePropertyName(nameof(QuerySeries.Tags));
-    if (series.Tags is null)
+    writer.WriteString("name", series.Name);
+    if (series.Tags is not null)
     {
-        writer.WriteNullValue();
-    }
-    else
-    {
+        writer.WritePropertyName("tags");
         writer.WriteStartObject();
         foreach (var (key, value) in series.Tags)
             writer.WriteString(key, value);
         writer.WriteEndObject();
     }
 
-    writer.WritePropertyName(nameof(QuerySeries.Columns));
+    writer.WritePropertyName("columns");
     writer.WriteStartArray();
     foreach (var column in series.Columns)
         writer.WriteStringValue(column);
     writer.WriteEndArray();
 
-    writer.WritePropertyName(nameof(QuerySeries.Values));
+    writer.WritePropertyName("values");
     writer.WriteStartArray();
     var timeColumnIndex = epochDivisor > 0 ? series.Columns.FindIndex(x => string.Equals(x, "time", StringComparison.OrdinalIgnoreCase)) : -1;
     foreach (var row in series.Values)

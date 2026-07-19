@@ -19,6 +19,9 @@ public static class SegmentWriter
         => WriteSegment(path, points.Select(point => (point, SeriesKey.From(point))));
 
     public static void WriteSegment(string path, IEnumerable<(Point Point, SeriesKey SeriesKey)> points)
+        => WriteColumns(path, BuildColumns(points));
+
+    internal static List<SegmentColumn> BuildColumns(IEnumerable<(Point Point, SeriesKey SeriesKey)> points)
     {
         var builders = new Dictionary<(string Measurement, string TagsCanonical, string Field), ColumnBuilder>();
         foreach (var (point, series) in points)
@@ -38,7 +41,7 @@ public static class SegmentWriter
         var columns = new List<SegmentColumn>(builders.Count);
         foreach (var builder in builders.Values)
             columns.Add(builder.ToColumn());
-        WriteColumns(path, columns);
+        return columns;
     }
 
     private sealed class ColumnBuilder(string measurement, string tagsCanonical, string field, FieldKind kind)

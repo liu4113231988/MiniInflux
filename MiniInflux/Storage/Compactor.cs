@@ -248,7 +248,7 @@ public sealed class Compactor
         var allColumns = new List<SegmentColumn>();
         foreach (var file in orderedInputs)
         {
-            try { allColumns.AddRange(SegmentReader.ReadSegment(file.Path)); }
+            try { allColumns.AddRange(NormalizeLegacyTagColumns(SegmentReader.ReadSegment(file.Path))); }
             catch (Exception ex) { _health?.RecordFailure("compaction_read", ex); return false; }
         }
 
@@ -360,6 +360,31 @@ public sealed class Compactor
         }
 
         return result;
+    }
+
+    private static List<SegmentColumn> NormalizeLegacyTagColumns(List<SegmentColumn> columns)
+    {
+        if (!columns.Any(column => column.TagsCanonical.Length == 0
+            && column.Field == "tag"
+            && column.Kind == FieldKind.String))
+            return columns;
+
+        var points = ColumnsToPoints(columns);
+        var normalized = false;
+        foreach (var point in points)
+        {
+            if (point.Tags.Count != 0
+                || !point.Fields.Remove("tag", out var tag)
+                || tag.Kind != FieldKind.String
+                || string.IsNullOrEmpty(tag.String))
+                continue;
+            point.Tags["tag"] = tag.String;
+            normalized = true;
+        }
+
+        return normalized
+            ? SegmentWriter.BuildColumns(points.Select(point => (point, SeriesKey.From(point))))
+            : columns;
     }
 
     private static List<Point> ColumnsToPoints(List<SegmentColumn> columns)

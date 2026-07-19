@@ -1,4 +1,6 @@
 <Solution>
-  <Project Path="MiniInflux/MiniInflux.csproj" />
+  <Folder Name="/解决方案项/" />
+  <Project Path="InfluxMigrator/InfluxdbDataSync.csproj" />
   <Project Path="MiniInflux.Tests/MiniInflux.Tests.csproj" />
+  <Project Path="MiniInflux/MiniInflux.csproj" />
 </Solution>
