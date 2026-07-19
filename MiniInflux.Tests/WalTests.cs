@@ -195,4 +195,58 @@ public class WalTests : IDisposable
         var only = Assert.Single(replayed);
         Assert.Equal(2, only.Points[0].Fields["value"].Float);
     }
+
+    [Fact]
+    public void Checkpoint_CurrentPosition_ReclaimsCheckpointedCurrentFile()
+    {
+        var walDir = Path.Combine(_testDir, "wal");
+        using var wal = new WalManager(walDir, maxFileBytes: 1024 * 1024);
+
+        wal.Append("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string>(),
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(1) },
+                TimestampNs = 1
+            }
+        ]);
+        wal.Checkpoint(wal.CurrentPosition);
+
+        var file = Assert.Single(Directory.GetFiles(walDir, "*.wal"));
+        Assert.Equal("000002.wal", Path.GetFileName(file));
+        Assert.Equal(0, new FileInfo(file).Length);
+        Assert.Empty(wal.Replay());
+    }
+
+    [Fact]
+    public void Checkpoint_LoadedCurrentPosition_ReclaimsCheckpointedCurrentFile()
+    {
+        var walDir = Path.Combine(_testDir, "wal");
+        WalPosition checkpoint;
+        using (var wal = new WalManager(walDir, maxFileBytes: 1024 * 1024))
+        {
+            wal.Append("testdb", "autogen",
+            [
+                new Point
+                {
+                    Measurement = "cpu",
+                    Tags = new Dictionary<string, string>(),
+                    Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(1) },
+                    TimestampNs = 1
+                }
+            ]);
+            checkpoint = wal.CurrentPosition;
+            File.WriteAllText(Path.Combine(walDir, "checkpoint.dat"), $"{checkpoint.FileId}:{checkpoint.Offset}");
+        }
+
+        using var reopened = new WalManager(walDir, maxFileBytes: 1024 * 1024);
+        reopened.Checkpoint(reopened.CurrentPosition);
+
+        var file = Assert.Single(Directory.GetFiles(walDir, "*.wal"));
+        Assert.Equal("000002.wal", Path.GetFileName(file));
+        Assert.Equal(0, new FileInfo(file).Length);
+        Assert.Empty(reopened.Replay());
+    }
 }

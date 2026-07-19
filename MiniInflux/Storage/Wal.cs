@@ -221,7 +221,18 @@ public sealed class WalManager : IDisposable
     {
         lock (_lock)
         {
-            if (Compare(position, _checkpoint) <= 0) return;
+            var compare = Compare(position, _checkpoint);
+            var canReclaimCurrentFile = _currentStream != null
+                && position.FileId == _currentFileId
+                && position.Offset >= _currentFileSize
+                && _currentFileSize > 0;
+            if (compare < 0 || (compare == 0 && !canReclaimCurrentFile)) return;
+            if (canReclaimCurrentFile)
+            {
+                RotateLocked();
+                position = new WalPosition(_currentFileId, 0);
+            }
+
             _checkpoint = position;
 
             // Atomic checkpoint write: write to .tmp then rename (same pattern as segment writes)
