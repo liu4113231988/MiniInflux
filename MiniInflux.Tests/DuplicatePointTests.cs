@@ -193,6 +193,22 @@ public class DuplicatePointTests : IDisposable
         Assert.Equal(2, result.Count);
     }
 
+    [Fact]
+    public async Task ReadAllPoints_TimeRangeAcrossShards_ReturnsAllMatchingPoints()
+    {
+        const long weekNs = 604_800_000_000_000L;
+        await _engine.WriteAsync("testdb", "autogen",
+        [
+            Point(1, 1_000_000_000),
+            Point(2, weekNs + 1_000_000_000)
+        ]);
+        _engine.FlushAll();
+
+        var result = _engine.ReadAllPoints("testdb", "autogen", "cpu", 0, weekNs + 2_000_000_000);
+
+        Assert.Equal([1.0, 2.0], result.Select(point => point.Fields["value"].AsDouble()));
+    }
+
     private static Point Point(double value, long timestampNs) => new()
     {
         Measurement = "cpu",

@@ -307,8 +307,8 @@ public sealed class Manifest
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return [];
             if (!dbInfo.RetentionPolicies.TryGetValue(rp, out var rpInfo)) return [];
             return rpInfo.ShardGroups
-                .Where(s => (!maxTimeNs.HasValue || s.EndTimeNs >= maxTimeNs.Value)
-                         && (!minTimeNs.HasValue || s.StartTimeNs <= minTimeNs.Value))
+                .Where(s => (!minTimeNs.HasValue || s.EndTimeNs > minTimeNs.Value)
+                         && (!maxTimeNs.HasValue || s.StartTimeNs <= maxTimeNs.Value))
                 .Select(CloneShard)
                 .ToList();
         }
