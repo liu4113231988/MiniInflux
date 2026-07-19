@@ -52,6 +52,11 @@ public static class SegmentWriter
 
         public void Add(long timestamp, FieldValue value)
         {
+            if (_timestamps.Count > 0 && timestamp == _timestamps[^1])
+            {
+                _values[^1] = value;
+                return;
+            }
             if (_timestamps.Count > 0 && timestamp < _timestamps[^1])
                 _sorted = false;
             _timestamps.Add(timestamp);
@@ -62,14 +67,15 @@ public static class SegmentWriter
         {
             if (!_sorted)
             {
-                var pairs = new List<(long Timestamp, FieldValue Value)>(_timestamps.Count);
+                var latest = new SortedDictionary<long, FieldValue>();
                 for (var i = 0; i < _timestamps.Count; i++)
-                    pairs.Add((_timestamps[i], _values[i]));
-                pairs.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
-                for (var i = 0; i < pairs.Count; i++)
+                    latest[_timestamps[i]] = _values[i];
+                _timestamps.Clear();
+                _values.Clear();
+                foreach (var pair in latest)
                 {
-                    _timestamps[i] = pairs[i].Timestamp;
-                    _values[i] = pairs[i].Value;
+                    _timestamps.Add(pair.Key);
+                    _values.Add(pair.Value);
                 }
             }
 

@@ -124,6 +124,20 @@ public class DuplicatePointTests : IDisposable
     }
 
     [Fact]
+    public async Task WriteOutOfOrderDuplicateAcrossBatches_FlushesOnlyNewestValue()
+    {
+        await _engine.WriteAsync("testdb", "autogen", [Point(2, 2_000_000_000)]);
+        await _engine.WriteAsync("testdb", "autogen", [Point(1, 1_000_000_000)]);
+        await _engine.WriteAsync("testdb", "autogen", [Point(99, 2_000_000_000)]);
+        _engine.FlushAll();
+
+        var segment = Assert.Single(Directory.GetFiles(Path.Combine(_testDir, "db"), "*.seg", SearchOption.AllDirectories));
+        var column = Assert.Single(SegmentReader.ReadSegment(segment));
+        Assert.Equal([1_000_000_000, 2_000_000_000], column.Timestamps);
+        Assert.Equal([1.0, 99.0], column.Values.Select(value => value.AsDouble()));
+    }
+
+    [Fact]
     public async Task WriteDuplicatePoints_DifferentTimestamps_NotMerged()
     {
         // Points with different timestamps should NOT be merged
