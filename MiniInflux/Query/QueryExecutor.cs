@@ -1862,6 +1862,13 @@ public sealed class QueryExecutor
 
     static SortedDictionary<long, object?> BuildFunctionSeries(List<Point> pts, SelectItem item)
     {
+        if (item.Func == "count" && item.Field == "*")
+        {
+            var countResult = new SortedDictionary<long, object?>();
+            if (pts.Count > 0) countResult[pts.Max(p => p.TimestampNs)] = pts.Count;
+            return countResult;
+        }
+
         var values = pts
             .Where(p => p.Fields.TryGetValue(item.Field, out var v) && v.AsDouble().HasValue)
             .Select(p => (p.TimestampNs, Value: p.Fields[item.Field].AsDouble()!.Value))
@@ -2628,7 +2635,10 @@ public sealed class QueryExecutor
     {
         HashSet<string>? requestedFields = null;
         if (q.Select.Count > 0 && !(q.Select.Count == 1 && q.Select[0].Field == "*"))
-            requestedFields = new HashSet<string>(q.Select.Select(x => x.Field), StringComparer.Ordinal);
+        {
+            requestedFields = new HashSet<string>(q.Select.Select(x => x.Field).Where(field => field != "*"), StringComparer.Ordinal);
+            if (requestedFields.Count == 0) requestedFields = null;
+        }
         if (requestedFields != null)
             foreach (var filter in q.FieldFilters)
                 requestedFields.Add(filter.Field);

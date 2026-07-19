@@ -98,6 +98,18 @@ public class AggregationTests : IDisposable
     }
 
     [Fact]
+    public async Task CountStar_ReturnsPointCount()
+    {
+        _engine.FlushAll();
+
+        var result = await _executor.ExecuteAsync(_engine, "testdb", "SELECT count(*) FROM cpu");
+
+        Assert.Null(result.Results[0].Error);
+        var row = Assert.Single(result.Results[0].Series![0].Values);
+        Assert.Equal(10, Convert.ToInt32(row[1]));
+    }
+
+    [Fact]
     public void ParsePercentile_WithSecondArg()
     {
         var q = InfluxQlParser.Parse("SELECT percentile(value, 95) FROM cpu");
