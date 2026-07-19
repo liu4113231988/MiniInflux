@@ -1,4 +1,5 @@
 using MiniInflux.Net10.Model;
+using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
 
 namespace MiniInflux.Tests;
@@ -12,7 +13,7 @@ public class DuplicatePointTests : IDisposable
     {
         _testDir = Path.Combine(Path.GetTempPath(), $"miniinflux_dup_{Guid.NewGuid():N}");
         Directory.CreateDirectory(_testDir);
-        _engine = new TsdbEngine(_testDir, flushThreshold: 100);
+        _engine = new TsdbEngine(_testDir, flushThreshold: 100, compactionIntervalMs: 0);
     }
 
     public void Dispose()
@@ -97,6 +98,29 @@ public class DuplicatePointTests : IDisposable
         Assert.Equal(9.9, read[0].Fields["value"].Float);
         Assert.Single(streamed);
         Assert.Equal(9.9, streamed[0].Fields["value"].Float);
+    }
+
+    [Fact]
+    public async Task WriteDuplicatePoint_AfterFlush_DescendingReadUsesNewerValue()
+    {
+        // Regression: when a point is flushed to a segment, then a new value for the same
+        // timestamp arrives in the buffer, the descending read path must return the newer
+        // buffer value instead of overwriting it with the older segment value.
+        await _engine.WriteAsync("testdb", "autogen", [Point(1.5, 1000_000_000)]);
+        _engine.FlushAll();
+        await _engine.WriteAsync("testdb", "autogen", [Point(9.9, 1000_000_000)]);
+
+        // Use the streaming descending path (TryReadSeriesDescending), which is where the bug manifested.
+        var descending = _engine.TryReadSeriesDescending("testdb", "autogen", "cpu", "host=server01", null, null);
+        Assert.NotNull(descending);
+        var dp = Assert.Single(descending.Points);
+        Assert.Equal(9.9, dp.Fields["value"].Float);
+
+        // The QueryExecutor descending path must also return the newer value.
+        var response = await new QueryExecutor().ExecuteAsync(_engine, "testdb", "SELECT value FROM cpu");
+        var series = Assert.Single(response.Results[0].Series!);
+        var row = Assert.Single(series.Values);
+        Assert.Equal(9.9, row[^1]);
     }
 
     [Fact]

@@ -1019,7 +1019,9 @@ public sealed class TsdbEngine : IDisposable
                     };
                     result[ts] = point;
                 }
-                point.Fields[column.Field] = column.Values[i];
+                // Buffer data is always newer than flushed segment data, so never overwrite existing fields.
+                if (!point.Fields.ContainsKey(column.Field))
+                    point.Fields[column.Field] = column.Values[i];
             }
         }
     }
