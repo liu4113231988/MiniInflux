@@ -22,6 +22,14 @@ public sealed record SegmentColumnMeta(
     BlockCompressionKind TimestampCompression = BlockCompressionKind.Brotli,
     BlockCompressionKind ValueCompression = BlockCompressionKind.Brotli);
 
+/// <summary>
+/// Lightweight column read that contains only decoded timestamps (no field values).
+/// Used by the fast count path to avoid decoding value blocks.
+/// </summary>
+public sealed record SegmentTimestampColumn(
+    string Measurement, string TagsCanonical, string Field, FieldKind Kind,
+    long MinTime, long MaxTime, List<long> Timestamps);
+
 public sealed record SegmentMetadataReadResult(List<SegmentColumnMeta> Metadata, bool UsedFooter);
 
 public static class SegmentReader
@@ -91,6 +99,59 @@ public static class SegmentReader
                 CompressionCodec.DecodeTimestamps(codecs.TimestampCodec, codecs.TimestampCompression, tb),
                 CompressionCodec.DecodeValues(k, codecs.ValueCodec, codecs.ValueCompression, vb), stats,
                 codecs.TimestampCodec, codecs.ValueCodec, codecs.TimestampCompression, codecs.ValueCompression));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Read only timestamp columns from a segment, skipping the expensive value block decoding.
+    /// This is used by the fast count path where field values are not needed.
+    /// </summary>
+    public static List<SegmentTimestampColumn> ReadSegmentTimestampsOnly(
+        string path,
+        HashSet<string>? requestedFields,
+        string? measurement,
+        long? minTimeNs,
+        long? maxTimeNs,
+        HashSet<string>? allowedTagsCanonical)
+    {
+        var allBytes = ReadAllBytesShared(path);
+        if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
+        var dataBytes = allBytes.AsSpan(0, allBytes.Length - 4);
+        var storedCrc = BitConverter.ToUInt32(allBytes, allBytes.Length - 4);
+        if (storedCrc != Crc32.Compute(dataBytes.ToArray()))
+            throw new InvalidDataException("segment CRC mismatch");
+
+        var result = new List<SegmentTimestampColumn>();
+        using var ms = new MemoryStream(dataBytes.ToArray());
+        using var br = new BinaryReader(ms, Encoding.UTF8);
+        if (br.ReadUInt32() != Magic) throw new InvalidDataException("invalid segment magic");
+
+        var (version, count) = ReadVersionAndCount(br, ms);
+
+        for (int i = 0; i < count; i++)
+        {
+            var m = ReadString(br); var tags = ReadString(br); var f = ReadString(br);
+            var k = (FieldKind)br.ReadByte();
+            var min = br.ReadInt64(); var max = br.ReadInt64();
+            br.ReadInt32(); // point count (unused)
+
+            // Projection and predicate pushdown: skip reading compressed data for irrelevant columns.
+            if (!ShouldReadColumn(requestedFields, measurement, minTimeNs, maxTimeNs, allowedTagsCanonical, m, tags, f, min, max))
+            {
+                SkipColumnPayload(version, br, ms);
+                continue;
+            }
+
+            var codecs = ReadCodecInfo(version, br);
+            var tl = br.ReadInt32(); var tb = br.ReadBytes(tl);
+            // Skip value block instead of decoding it.
+            var vl = br.ReadInt32(); ms.Position += vl;
+            // Skip stats block if present.
+            if (version >= 2) ms.Position += 28; // 3 doubles + 1 int
+
+            result.Add(new SegmentTimestampColumn(m, tags, f, k, min, max,
+                CompressionCodec.DecodeTimestamps(codecs.TimestampCodec, codecs.TimestampCompression, tb)));
         }
         return result;
     }

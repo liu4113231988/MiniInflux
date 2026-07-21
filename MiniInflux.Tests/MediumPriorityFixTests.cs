@@ -94,6 +94,29 @@ public class MediumPriorityFixTests : IDisposable
     }
 
     [Fact]
+    public async Task RawDescLimit_WithMultipleSeries_UsesLimitPushdown()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 2);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("INDEX", "value", 1, "series01", 1),
+            Point("INDEX", "value", 2, "series02", 2),
+            Point("INDEX", "value", 3, "series01", 3),
+            Point("INDEX", "value", 4, "series02", 4)
+        ]);
+        engine.FlushAll();
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb", "SELECT * FROM \"INDEX\" ORDER BY time DESC LIMIT 2");
+
+        var rows = Assert.Single(outcome.Response.Results[0].Series!).Values;
+        Assert.True(outcome.Report.UsedStreamingRawSelect);
+        Assert.Equal(0, outcome.Report.PointsMaterialized);
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(4.0, rows[0][^1]);
+        Assert.Equal(3.0, rows[1][^1]);
+    }
+
+    [Fact]
     public async Task Select_StringPredicate_MatchesLegacyFieldAndCurrentTag()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);

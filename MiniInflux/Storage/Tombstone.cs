@@ -125,6 +125,48 @@ public sealed class TombstoneStore
     }
 
     /// <summary>
+    /// Check if any tombstones exist for the given database (fast path to skip filtering when clean).
+    /// </summary>
+    public bool HasTombstones(string db)
+    {
+        lock (_lock)
+        {
+            return _tombstones.TryGetValue(db, out var list) && list.Count > 0;
+        }
+    }
+
+    /// <summary>
+    /// Filter a list of timestamps against active tombstones, returning only non-deleted timestamps.
+    /// Used by the fast count path which reads timestamps without field values.
+    /// </summary>
+    public List<long> FilterTimestampsDeleted(string db, string measurement, string tagsCanonical, List<long> timestamps)
+    {
+        lock (_lock)
+        {
+            if (!_tombstones.TryGetValue(db, out var list) || list.Count == 0)
+                return timestamps;
+
+            var ranges = BuildMergedRanges(list, measurement, tagsCanonical);
+            if (ranges.Count == 0) return timestamps;
+
+            var filteredTs = new List<long>(timestamps.Count);
+            var rangeIndex = 0;
+            for (int i = 0; i < timestamps.Count; i++)
+            {
+                var ts = timestamps[i];
+                while (rangeIndex < ranges.Count && ranges[rangeIndex].Max < ts)
+                    rangeIndex++;
+                var deleted = rangeIndex < ranges.Count
+                    && ranges[rangeIndex].Min <= ts
+                    && ranges[rangeIndex].Max >= ts;
+                if (!deleted)
+                    filteredTs.Add(ts);
+            }
+            return filteredTs;
+        }
+    }
+
+    /// <summary>
     /// Filter points against active tombstones. Returns only non-deleted points.
     /// </summary>
     public List<Point> FilterDeleted(string db, List<Point> points)

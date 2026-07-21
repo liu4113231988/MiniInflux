@@ -773,6 +773,29 @@ public sealed class QueryExecutor
                     }
                     return pushedDown;
                 }
+
+                // Fast count fallback: read only timestamps from segments, skip value-block decoding.
+                // This avoids the expensive ReadAllPoints path when the metadata pushdown fails due
+                // to overlapping segments, missing stats, or buffered-point conflicts.
+                if (q.GroupByTags.Count == 0 && !q.GroupByAllTags)
+                {
+                    var fastCount = TryFastCountFallback(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, cancellationToken, report);
+                    if (fastCount != null)
+                    {
+                        var resultBytes = EstimateQuerySeriesBytes(fastCount);
+                        report.EstimatedResultBytes = resultBytes;
+                        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + resultBytes);
+                        EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+                        if (!string.IsNullOrWhiteSpace(q.IntoTarget))
+                        {
+                            var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, fastCount);
+                            report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, resultBytes + selectIntoBytes);
+                            EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+                            ExecuteSelectInto(e, sourceDb, q, fastCount);
+                        }
+                        return fastCount;
+                    }
+                }
             }
 
             var streamedAggregate = TryGroupByStreamingFunctions(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, cancellationToken, report, resultMeasurement);
@@ -930,8 +953,7 @@ public sealed class QueryExecutor
             || q.Select.Any(s => !string.IsNullOrEmpty(s.Func))
             || !string.IsNullOrWhiteSpace(q.IntoTarget)
             || string.IsNullOrWhiteSpace(q.Measurement)
-            || seriesFilter == null
-            || seriesFilter.Count != 1
+            || (seriesFilter == null && q.TagFilters.Count != 0)
             || q.FieldFilters.Count != 0)
             return null;
 
@@ -939,44 +961,57 @@ public sealed class QueryExecutor
         if (fields.Count == 0)
             return null;
 
+        var series = seriesFilter ?? e.ListSeries(sourceDb, q.Measurement).ToHashSet(StringComparer.Ordinal);
+        if (series.Count == 0)
+            return null;
+
         var rowLimit = Math.Min(q.Limit ?? maxResponseRows, maxResponseRows);
         var offset = Math.Max(0, q.Offset ?? 0);
         var readLimit = checked(offset + rowLimit);
-        var tagsCanonical = seriesFilter.First();
-        var read = e.TryReadFlushedFieldsDescending(sourceDb, sourceRp, q.Measurement, tagsCanonical, fields, q.MinTimeNs, q.MaxTimeNs, readLimit, cancellationToken);
-        if (read == null)
-            return null;
-
-        var tags = ParseTagsCanonical(tagsCanonical);
-        var tagKeys = tags.Keys.Order(StringComparer.Ordinal).ToList();
+        var tagKeys = ResolveRawTags(e, sourceDb, q.Measurement);
         var columns = new List<string> { "time" };
         columns.AddRange(tagKeys);
         columns.AddRange(fields);
-        var values = new List<List<object?>>(Math.Min(rowLimit, Math.Max(0, read.Timestamps.Count - offset)));
+        var rows = new List<(long Timestamp, List<object?> Row)>();
         long resultBytes = EstimateRawSeriesShellBytes(resultMeasurement, columns);
-        var emitted = 0;
-        for (var i = offset; i < read.Timestamps.Count && emitted < rowLimit; i++)
+        long inputBytes = 0;
+        var scanned = 0;
+        var segmentColumnsRead = 0;
+        foreach (var tagsCanonical in series)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var row = new List<object?>(columns.Count) { Time(read.Timestamps[i]) };
-            foreach (var tag in tagKeys)
-                row.Add(tags[tag]);
-            foreach (var value in read.Rows[i])
-                row.Add(value.HasValue ? value.Value.ToObject() : null);
-            values.Add(row);
-            resultBytes += 16 + row.Sum(EstimateObjectBytes);
-            emitted++;
+            var read = e.TryReadFlushedFieldsDescending(sourceDb, sourceRp, q.Measurement, tagsCanonical, fields, q.MinTimeNs, q.MaxTimeNs, readLimit, cancellationToken);
+            if (read == null)
+                return null;
+
+            var tags = ParseTagsCanonical(tagsCanonical);
+            scanned += read.Timestamps.Count;
+            inputBytes += EstimateFieldRowsBytes(read.Timestamps, read.Rows);
+            segmentColumnsRead += read.SegmentColumnsRead;
+            for (var i = 0; i < read.Timestamps.Count; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var row = new List<object?>(columns.Count) { Time(read.Timestamps[i]) };
+                foreach (var tag in tagKeys)
+                    row.Add(tags.TryGetValue(tag, out var value) ? value : null);
+                foreach (var value in read.Rows[i])
+                    row.Add(value.HasValue ? value.Value.ToObject() : null);
+                rows.Add((read.Timestamps[i], row));
+            }
         }
 
+        var values = rows.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit).Select(row => row.Row).ToList();
+        foreach (var row in values)
+            resultBytes += 16 + row.Sum(EstimateObjectBytes);
+
         report.UsedStreamingRawSelect = true;
-        report.ScannedPoints += read.Timestamps.Count;
-        report.RowsReturned = emitted;
-        report.SegmentColumnsRead += read.SegmentColumnsRead;
+        report.ScannedPoints += scanned;
+        report.RowsReturned = values.Count;
+        report.SegmentColumnsRead += segmentColumnsRead;
         report.PointsMaterialized = 0;
-        report.LimitPushdownStopReason = read.LimitPushdownStopReason;
-        report.EstimatedInputBytes = EstimateFieldRowsBytes(read.Timestamps, read.Rows);
+        report.LimitPushdownStopReason = series.Count == 1 ? "segment-limit" : "series-limit";
+        report.EstimatedInputBytes = inputBytes;
         report.EstimatedResultBytes = resultBytes;
-        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + resultBytes);
+        report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, inputBytes + resultBytes);
         EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
 
         return
@@ -984,7 +1019,6 @@ public sealed class QueryExecutor
             new()
             {
                 Name = resultMeasurement,
-                Tags = tags.Count == 0 ? null : tags,
                 Columns = columns,
                 Values = values,
                 TagColumns = new HashSet<string>(tagKeys, StringComparer.Ordinal)
@@ -1017,15 +1051,16 @@ public sealed class QueryExecutor
         HashSet<string>? requestedFields, HashSet<string>? seriesFilter, CancellationToken cancellationToken,
         QueryExecutionReport report, string resultMeasurement)
     {
+        var items = q.Select.Where(x => x.Func != "").ToList();
+        var countStar = items.Count > 0 && items.All(i => i.Func == "count" && i.Field == "*");
         if (!string.IsNullOrWhiteSpace(q.IntoTarget)
             || q.Subquery != null
-            || (!q.GroupByNs.HasValue && q.GroupByTags.Count == 0 && !q.GroupByAllTags))
+            || (!countStar && !q.GroupByNs.HasValue && q.GroupByTags.Count == 0 && !q.GroupByAllTags))
             return null;
 
-        var items = q.Select.Where(x => x.Func != "").ToList();
         if (items.Count == 0 || items.Count != q.Select.Count)
             return null;
-        if (items.Any(i => !IsSimpleStreamingAggregate(i) || i.Field == "*"))
+        if (items.Any(i => !IsSimpleStreamingAggregate(i) || (i.Field == "*" && i.Func != "count")))
             return null;
 
         var groups = new Dictionary<(string TagKey, long? BucketTime), StreamingAggregateGroup>();
@@ -1034,7 +1069,8 @@ public sealed class QueryExecutor
         {
             cancellationToken.ThrowIfCancellationRequested();
             scanned++;
-            EnsureQueryPointLimit(scanned);
+            if (!countStar)
+                EnsureQueryPointLimit(scanned);
             report.ScannedPoints = scanned;
             report.EstimatedInputBytes += EstimatePointBytes(point);
             if (!MatchesTagFilters(point, q.TagFilters) || !MatchesFieldFilters(point, q.FieldFilters))
@@ -1051,8 +1087,12 @@ public sealed class QueryExecutor
             group.MaxTime = Math.Max(group.MaxTime, point.TimestampNs);
 
             for (var i = 0; i < items.Count; i++)
-                if (point.Fields.TryGetValue(items[i].Field, out var value) && value.AsDouble() is { } number)
+            {
+                if (items[i].Field == "*")
+                    group.States[i].AddCount();
+                else if (point.Fields.TryGetValue(items[i].Field, out var value) && value.AsDouble() is { } number)
                     group.States[i].Add(number);
+            }
         }
 
         if (groups.Count == 0)
@@ -1185,6 +1225,8 @@ public sealed class QueryExecutor
             _sum += value;
             _count++;
         }
+
+        public void AddCount() => _count++;
 
         public object? Value(string func) => func switch
         {
@@ -2062,10 +2104,19 @@ public sealed class QueryExecutor
             return null;
         if (q.FieldFilters.Count > 0) return null;
 
-        var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
+        var countStarFields = IsCountStar(items)
+            ? e.Schema.GetFields(db, q.Measurement).Select(field => field.FieldKey).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList()
+            : [];
+        if (IsCountStar(items) && countStarFields.Count == 0) return null;
+        var aggregateFields = countStarFields.Count == 0 ? requestedFields : new HashSet<string>(countStarFields, StringComparer.Ordinal);
+        var aggregateItems = countStarFields.Count == 0
+            ? items
+            : countStarFields.Select(field => new SelectItem("count", field, CountStarAlias(field))).ToList();
+
+        var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, aggregateFields, seriesFilter);
         report.ScannedPoints += bufferPoints.Count;
         var dedupedBufferPoints = DeduplicateAggregatePoints(bufferPoints);
-        var metadata = e.ReadSegmentMetadataWithStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
+        var metadata = e.ReadSegmentMetadataWithStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, aggregateFields, seriesFilter, cancellationToken);
         report.SegmentMetadataFooterHits += metadata.FooterHits;
         report.SegmentMetadataFullReads += metadata.FullReads;
         var metas = metadata.Metas;
@@ -2073,12 +2124,12 @@ public sealed class QueryExecutor
         if (metas.Count > 0)
         {
             if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null)) return null;
-            if (HasPotentialAggregateDuplicates(metas, dedupedBufferPoints, items)) return null;
+            if (HasPotentialAggregateDuplicates(metas, dedupedBufferPoints, aggregateItems)) return null;
             report.ScannedPoints += metas.Sum(m => m.PointCount);
         }
 
         var row = new List<object?> { Time(MaxTime(metas, dedupedBufferPoints)) };
-        foreach (var item in items)
+        foreach (var item in aggregateItems)
         {
             var relevantMetas = metas.Where(m => m.Field == item.Field).ToList();
             if (relevantMetas.Count == 0 && !dedupedBufferPoints.Any(p => p.Fields.ContainsKey(item.Field))) return null;
@@ -2089,7 +2140,58 @@ public sealed class QueryExecutor
         return [new QuerySeries
         {
             Name = q.Measurement ?? "",
-            Columns = ["time", .. items.Select(i => i.Alias)],
+            Columns = ["time", .. aggregateItems.Select(i => i.Alias)],
+            Values = [row]
+        }];
+    }
+
+    /// <summary>
+    /// Fast count fallback used when the metadata-based aggregate pushdown fails (e.g. due to
+    /// overlapping segments or missing stats). Reads only timestamp blocks from segments,
+    /// skipping the expensive value-block decoding that ReadAllPoints performs.
+    /// Handles count(*) and count(field) without GROUP BY time/tags.
+    /// </summary>
+    List<QuerySeries>? TryFastCountFallback(
+        TsdbEngine e,
+        string db,
+        string rp,
+        ParsedQuery q,
+        HashSet<string>? requestedFields,
+        HashSet<string>? seriesFilter,
+        CancellationToken cancellationToken,
+        QueryExecutionReport report)
+    {
+        var items = q.Select.Where(s => s.Func != "").ToList();
+        if (items.Count == 0) return null;
+        // Only handle count queries (not sum, min, max, mean, etc.)
+        if (items.Any(i => i.Func != "count")) return null;
+        if (q.FieldFilters.Count > 0) return null;
+
+        // For count(*), expand to per-field counts (InfluxDB 1.x semantics).
+        var countStarFields = IsCountStar(items)
+            ? e.Schema.GetFields(db, q.Measurement).Select(field => field.FieldKey).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList()
+            : [];
+        if (IsCountStar(items) && countStarFields.Count == 0) return null;
+
+        var aggregateFields = countStarFields.Count == 0 ? requestedFields : new HashSet<string>(countStarFields, StringComparer.Ordinal);
+        var aggregateItems = countStarFields.Count == 0
+            ? items
+            : countStarFields.Select(field => new SelectItem("count", field, CountStarAlias(field))).ToList();
+
+        var countResult = e.CountPointsByField(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, aggregateFields, seriesFilter, cancellationToken);
+        if (countResult == null) return null;
+
+        report.ScannedPoints += countResult.ScannedPoints;
+        report.UsedAggregatePushdown = true;
+
+        var row = new List<object?> { Time(countResult.MaxTimestampNs) };
+        foreach (var item in aggregateItems)
+            row.Add(countResult.FieldCounts.TryGetValue(item.Field, out var count) ? (object?)count : 0);
+
+        return [new QuerySeries
+        {
+            Name = q.Measurement ?? "",
+            Columns = ["time", .. aggregateItems.Select(i => i.Alias)],
             Values = [row]
         }];
     }
@@ -2115,14 +2217,23 @@ public sealed class QueryExecutor
             return null;
         if (q.FieldFilters.Count > 0)
             return null;
-        if (items.Any(i => i.Field == "*"))
+        var countStarFields = IsCountStar(items)
+            ? e.Schema.GetFields(db, q.Measurement).Select(field => field.FieldKey).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList()
+            : [];
+        if (IsCountStar(items) && countStarFields.Count == 0)
             return null;
+        if (items.Any(i => i.Field == "*") && countStarFields.Count == 0)
+            return null;
+        var aggregateFields = countStarFields.Count == 0 ? requestedFields : new HashSet<string>(countStarFields, StringComparer.Ordinal);
+        var aggregateItems = countStarFields.Count == 0
+            ? items
+            : countStarFields.Select(field => new SelectItem("count", field, CountStarAlias(field))).ToList();
 
-        var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter);
+        var bufferPoints = e.ReadBufferedPoints(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, aggregateFields, seriesFilter);
         report.ScannedPoints += bufferPoints.Count;
         var dedupedBufferPoints = DeduplicateAggregatePoints(bufferPoints);
 
-        var metadata = e.ReadSegmentMetadataWithStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, cancellationToken);
+        var metadata = e.ReadSegmentMetadataWithStats(db, rp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, aggregateFields, seriesFilter, cancellationToken);
         report.SegmentMetadataFooterHits += metadata.FooterHits;
         report.SegmentMetadataFullReads += metadata.FullReads;
         var metas = metadata.Metas;
@@ -2132,7 +2243,7 @@ public sealed class QueryExecutor
         {
             if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null))
                 return null;
-            if (HasPotentialAggregateDuplicates(metas, dedupedBufferPoints, items))
+            if (HasPotentialAggregateDuplicates(metas, dedupedBufferPoints, aggregateItems))
                 return null;
             report.ScannedPoints += metas.Sum(m => m.PointCount);
         }
@@ -2164,7 +2275,7 @@ public sealed class QueryExecutor
             groupBufferPoints ??= [];
 
             var row = new List<object?> { Time(MaxTime(groupMetas, groupBufferPoints)) };
-            foreach (var item in items)
+            foreach (var item in aggregateItems)
             {
                 var relevantMetas = groupMetas.Where(m => m.Field == item.Field).ToList();
                 if (relevantMetas.Count == 0 && !groupBufferPoints.Any(p => p.Fields.ContainsKey(item.Field)))
@@ -2176,7 +2287,7 @@ public sealed class QueryExecutor
             {
                 Name = resultMeasurement,
                 Tags = BuildGroupByTags(groupKey, q.GroupByTags, q.GroupByAllTags),
-                Columns = ["time", .. items.Select(i => i.Alias)],
+                Columns = ["time", .. aggregateItems.Select(i => i.Alias)],
                 Values = [row]
             });
         }
@@ -2294,6 +2405,11 @@ public sealed class QueryExecutor
             _ => null
         };
     }
+
+    static bool IsCountStar(List<SelectItem> items) =>
+        items.Count == 1 && items[0].Func == "count" && items[0].Field == "*";
+
+    static string CountStarAlias(string field) => $"count_{field}";
 
     static string BuildGroupByTagKey(IReadOnlyDictionary<string, string> tags, List<string> groupByTags, bool groupByAllTags)
     {

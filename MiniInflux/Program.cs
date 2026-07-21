@@ -16,6 +16,7 @@ var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
     Args = args,
     ContentRootPath = AppContext.BaseDirectory
 });
+builder.Host.UseConsoleLifetime();
 var options = MiniInfluxOptions.Load(builder.Configuration);
 BackupManager.ApplyPendingRestore(options.DataPath);
 
@@ -620,6 +621,12 @@ app.MapGet("/{**staticPath}", (string? staticPath) =>
 app.Lifetime.ApplicationStopping.Register(() =>
 {
     runtimeLogger.LogInformation("MiniInflux shutting down");
+});
+app.Lifetime.ApplicationStopped.Register(() =>
+{
+    writeQueue.Dispose();
+    engine.Dispose();
+    accessLogWriter.Dispose();
 });
 
 app.Run();

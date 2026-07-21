@@ -772,28 +772,152 @@ public sealed class TsdbEngine : IDisposable
     public SegmentMetadataQueryResult ReadSegmentMetadataWithStats(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, CancellationToken cancellationToken = default)
     {
+        var reads = new System.Collections.Concurrent.ConcurrentBag<(List<SegmentColumnMeta> Metas, bool UsedFooter)>();
+        Parallel.ForEach(
+            _shards.ListSegments(db, rp, min, max),
+            new ParallelOptions { CancellationToken = cancellationToken, MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8) },
+            segment =>
+            {
+                try
+                {
+                    reads.Add(ReadSegmentMetadataCached(segment.SegPath));
+                }
+                catch (InvalidDataException) { }
+                catch (FileNotFoundException) { }
+            });
+
         var result = new List<SegmentColumnMeta>();
         var footerHits = 0;
         var fullReads = 0;
-        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var metadata in reads)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
+            if (metadata.UsedFooter) footerHits++;
+            else fullReads++;
+            result.AddRange(metadata.Metas
+                .Where(m => (meas == null || m.Measurement == meas)
+                    && (!min.HasValue || m.MaxTime >= min.Value)
+                    && (!max.HasValue || m.MinTime <= max.Value)
+                    && (requestedFields == null || requestedFields.Contains(m.Field))
+                    && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(m.TagsCanonical))));
+        }
+        return new SegmentMetadataQueryResult(result, footerHits, fullReads);
+    }
+
+    public sealed record PointCountResult(Dictionary<string, long> FieldCounts, long MaxTimestampNs, int ScannedPoints);
+
+    /// <summary>
+    /// Count non-null field values per field using timestamp-only reads (skips value block decoding).
+    /// This is a fast fallback when the metadata-based aggregate pushdown fails due to overlapping
+    /// segments or missing stats. It avoids the expensive field-value decoding that ReadAllPoints performs.
+    /// </summary>
+    public PointCountResult? CountPointsByField(
+        string db, string rp, string? measurement, long? min, long? max,
+        HashSet<string>? requestedFields, HashSet<string>? allowedTagsCanonical,
+        CancellationToken cancellationToken)
+    {
+        var hasTombstones = _tombstones.HasTombstones(db);
+        var segments = _shards.ListSegments(db, rp, min, max);
+
+        // Read timestamps from segments in parallel; value blocks are skipped.
+        var bag = new System.Collections.Concurrent.ConcurrentBag<List<SegmentTimestampColumn>>();
+
+        if (segments.Count > 0)
+        {
+            Parallel.ForEach(segments, new ParallelOptions
             {
-                var metadata = ReadSegmentMetadataCached(segPath);
-                if (metadata.UsedFooter) footerHits++;
-                else fullReads++;
-                result.AddRange(metadata.Metas
-                    .Where(m => (meas == null || m.Measurement == meas)
+                CancellationToken = cancellationToken,
+                MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8)
+            }, segment =>
+            {
+                try
+                {
+                    // Use cached metadata to skip segments that have no matching columns.
+                    var metas = ReadSegmentMetadataCached(segment.SegPath).Metas;
+                    var hasMatch = metas.Any(m =>
+                        (measurement == null || m.Measurement == measurement)
                         && (!min.HasValue || m.MaxTime >= min.Value)
                         && (!max.HasValue || m.MinTime <= max.Value)
                         && (requestedFields == null || requestedFields.Contains(m.Field))
-                        && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(m.TagsCanonical))));
-            }
-            catch (InvalidDataException) { }
-            catch (FileNotFoundException) { }
+                        && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(m.TagsCanonical)));
+
+                    if (!hasMatch) return;
+
+                    var tsColumns = SegmentReader.ReadSegmentTimestampsOnly(
+                        segment.SegPath, requestedFields, measurement, min, max, allowedTagsCanonical);
+                    bag.Add(tsColumns);
+                }
+                catch (InvalidDataException) { }
+                catch (FileNotFoundException) { }
+            });
         }
-        return new SegmentMetadataQueryResult(result, footerHits, fullReads);
+
+        // Merge timestamps per (measurement, tags, field) using HashSet for last-write-wins deduplication.
+        var fieldTsMap = new Dictionary<(string Measurement, string Tags, string Field), HashSet<long>>();
+        var maxTime = 0L;
+        var scannedPoints = 0;
+
+        foreach (var columns in bag)
+        {
+            foreach (var col in columns)
+            {
+                // Apply tombstone filtering.
+                var timestamps = col.Timestamps;
+                if (hasTombstones)
+                {
+                    if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime))
+                        continue;
+                    timestamps = _tombstones.FilterTimestampsDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps);
+                }
+
+                if (timestamps.Count == 0) continue;
+
+                var key = (col.Measurement, col.TagsCanonical, col.Field);
+                if (!fieldTsMap.TryGetValue(key, out var tsSet))
+                {
+                    tsSet = new HashSet<long>();
+                    fieldTsMap[key] = tsSet;
+                }
+
+                foreach (var ts in timestamps)
+                {
+                    tsSet.Add(ts);
+                    if (ts > maxTime) maxTime = ts;
+                }
+
+                scannedPoints += timestamps.Count;
+            }
+        }
+
+        // Add buffered points (newest writes that haven't been flushed to segments yet).
+        var bufferPoints = ReadBufferedPoints(db, rp, measurement, min, max, requestedFields, allowedTagsCanonical);
+        foreach (var p in bufferPoints)
+        {
+            var tags = SeriesKey.From(p).TagsCanonical;
+            if (p.TimestampNs > maxTime) maxTime = p.TimestampNs;
+
+            foreach (var field in p.Fields.Keys)
+            {
+                if (requestedFields != null && !requestedFields.Contains(field))
+                    continue;
+                var key = (p.Measurement, tags, field);
+                if (!fieldTsMap.TryGetValue(key, out var tsSet))
+                {
+                    tsSet = new HashSet<long>();
+                    fieldTsMap[key] = tsSet;
+                }
+                tsSet.Add(p.TimestampNs);
+            }
+            scannedPoints++;
+        }
+
+        // Aggregate unique timestamp counts per field.
+        var result = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var group in fieldTsMap.GroupBy(kv => kv.Key.Field, StringComparer.Ordinal))
+            result[group.Key] = group.Sum(kv => kv.Value.Count);
+
+        if (result.Count == 0) return null;
+
+        return new PointCountResult(result, maxTime, scannedPoints);
     }
 
     public CompactionStatsSnapshot GetCompactionStats() => _compactor.GetStats();
@@ -1049,21 +1173,21 @@ public sealed class TsdbEngine : IDisposable
         var lastWriteUtc = info.LastWriteTimeUtc;
         var length = info.Length;
 
-        _globalLock.EnterUpgradeableReadLock();
+        _globalLock.EnterReadLock();
         try
         {
             if (_segmentMetadataCache.TryGetValue(key, out var cached)
                 && cached.Length == length
                 && cached.LastWriteUtc == lastWriteUtc)
                 return (cached.Metas.ToList(), cached.UsedFooter);
-
-            var read = SegmentReader.ReadMetadataWithInfo(path);
-            _globalLock.EnterWriteLock();
-            try { _segmentMetadataCache[key] = (length, lastWriteUtc, read.Metadata, read.UsedFooter); }
-            finally { _globalLock.ExitWriteLock(); }
-            return (read.Metadata.ToList(), read.UsedFooter);
         }
-        finally { _globalLock.ExitUpgradeableReadLock(); }
+        finally { _globalLock.ExitReadLock(); }
+
+        var read = SegmentReader.ReadMetadataWithInfo(path);
+        _globalLock.EnterWriteLock();
+        try { _segmentMetadataCache[key] = (length, lastWriteUtc, read.Metadata, read.UsedFooter); }
+        finally { _globalLock.ExitWriteLock(); }
+        return (read.Metadata.ToList(), read.UsedFooter);
     }
 
     private static bool Match(Point p, string? m, long? min, long? max) => (m == null || p.Measurement == m) && (!min.HasValue || p.TimestampNs >= min) && (!max.HasValue || p.TimestampNs <= max);
