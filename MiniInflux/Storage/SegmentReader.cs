@@ -63,13 +63,13 @@ public static class SegmentReader
     {
         var allBytes = ReadAllBytesShared(path);
         if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
-        var dataBytes = allBytes.AsSpan(0, allBytes.Length - 4);
-        var storedCrc = BitConverter.ToUInt32(allBytes, allBytes.Length - 4);
-        if (storedCrc != Crc32.Compute(dataBytes.ToArray()))
+        var dataLength = allBytes.Length - 4;
+        var storedCrc = BitConverter.ToUInt32(allBytes, dataLength);
+        if (storedCrc != Crc32.Compute(allBytes.AsSpan(0, dataLength)))
             throw new InvalidDataException("segment CRC mismatch");
 
         var result = new List<SegmentColumn>();
-        using var ms = new MemoryStream(dataBytes.ToArray());
+        using var ms = new MemoryStream(allBytes, 0, dataLength, writable: false);
         using var br = new BinaryReader(ms, Encoding.UTF8);
         if (br.ReadUInt32() != Magic) throw new InvalidDataException("invalid segment magic");
 
@@ -117,13 +117,13 @@ public static class SegmentReader
     {
         var allBytes = ReadAllBytesShared(path);
         if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
-        var dataBytes = allBytes.AsSpan(0, allBytes.Length - 4);
-        var storedCrc = BitConverter.ToUInt32(allBytes, allBytes.Length - 4);
-        if (storedCrc != Crc32.Compute(dataBytes.ToArray()))
+        var dataLength = allBytes.Length - 4;
+        var storedCrc = BitConverter.ToUInt32(allBytes, dataLength);
+        if (storedCrc != Crc32.Compute(allBytes.AsSpan(0, dataLength)))
             throw new InvalidDataException("segment CRC mismatch");
 
         var result = new List<SegmentTimestampColumn>();
-        using var ms = new MemoryStream(dataBytes.ToArray());
+        using var ms = new MemoryStream(allBytes, 0, dataLength, writable: false);
         using var br = new BinaryReader(ms, Encoding.UTF8);
         if (br.ReadUInt32() != Magic) throw new InvalidDataException("invalid segment magic");
 
@@ -168,12 +168,12 @@ public static class SegmentReader
 
         var allBytes = ReadAllBytesShared(path);
         if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
-        var dataBytes = allBytes.AsSpan(0, allBytes.Length - 4);
-        if (BitConverter.ToUInt32(allBytes, allBytes.Length - 4) != Crc32.Compute(dataBytes.ToArray()))
+        var dataLength = allBytes.Length - 4;
+        if (BitConverter.ToUInt32(allBytes, dataLength) != Crc32.Compute(allBytes.AsSpan(0, dataLength)))
             throw new InvalidDataException("segment CRC mismatch");
 
         var result = new List<SegmentColumnMeta>();
-        using var ms = new MemoryStream(dataBytes.ToArray());
+        using var ms = new MemoryStream(allBytes, 0, dataLength, writable: false);
         using var br = new BinaryReader(ms, Encoding.UTF8);
         if (br.ReadUInt32() != Magic) throw new InvalidDataException("invalid segment magic");
 

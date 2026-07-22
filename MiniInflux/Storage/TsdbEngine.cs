@@ -151,7 +151,6 @@ public sealed class TsdbEngine : IDisposable
         var pending = DeduplicateWritePoints(pts);
         var writePoints = pending.Count == pts.Count ? pts : MaterializePendingPoints(pending);
         CheckCardinality(db, pending);
-        CheckBufferLimit(writePoints);
         ValidateSchema(db, writePoints);
         _globalLock.EnterWriteLock();
         try
@@ -161,6 +160,8 @@ public sealed class TsdbEngine : IDisposable
             lk.EnterWriteLock();
             try
             {
+                // CheckBufferLimit inside the lock to prevent concurrent writes from exceeding limits.
+                CheckBufferLimit(writePoints);
                 var walPositions = _wal.Append(db, rp, writePoints);
                 if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
                 AddWrittenPoints(db, key, list, pending, walPositions);
@@ -349,7 +350,7 @@ public sealed class TsdbEngine : IDisposable
             catch (FileNotFoundException) { }
         }
         res.AddRange(buffered); // Buffer contains the newest writes and must win over flushed segments.
-        return DeduplicatePoints(res.OrderBy(x => x.TimestampNs).ToList());
+        return [.. DeduplicatePoints(res).OrderBy(x => x.TimestampNs)];
     }
 
     public bool HasSegments(string db, string rp, long? min, long? max) =>
@@ -1324,18 +1325,34 @@ public sealed class TsdbEngine : IDisposable
     {
         if (_maxBufferPoints > 0)
         {
-            var bufferedPoints = GetBufferedPointCount();
+            var bufferedPoints = GetBufferedPointCountInternal();
             if (bufferedPoints + incomingPoints.Count > _maxBufferPoints)
                 throw new MemoryLimitExceededException($"memory buffer point limit exceeded: {bufferedPoints + incomingPoints.Count} > {_maxBufferPoints}");
         }
 
         if (_maxBufferBytes > 0)
         {
-            var bufferedBytes = GetBufferedByteCount();
+            var bufferedBytes = GetBufferedByteCountInternal();
             var incomingBytes = incomingPoints.Sum(EstimateBufferedPointBytes);
             if (bufferedBytes + incomingBytes > _maxBufferBytes)
                 throw new MemoryLimitExceededException($"memory buffer byte limit exceeded: {bufferedBytes + incomingBytes} > {_maxBufferBytes}");
         }
+    }
+
+    private long GetBufferedPointCountInternal()
+    {
+        long count = 0;
+        // Caller is expected to hold _globalLock (read or write) — no lock acquisition here.
+        foreach (var kv in _buf) count += kv.Value.Count;
+        return count;
+    }
+
+    private long GetBufferedByteCountInternal()
+    {
+        long bytes = 0;
+        foreach (var kv in _buf)
+            bytes += kv.Value.Sum(p => EstimateBufferedPointBytes(p.Point));
+        return bytes;
     }
 
     private static long EstimateBufferedPointBytes(Point point)

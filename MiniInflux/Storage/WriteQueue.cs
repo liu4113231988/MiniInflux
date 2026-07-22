@@ -44,16 +44,25 @@ public sealed class WriteQueue : IDisposable
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
 
+        Interlocked.Increment(ref _pendingRequests);
         try
         {
-            Interlocked.Increment(ref _pendingRequests);
             await _channel.Writer.WriteAsync(request, timeoutCts.Token);
             return await tcs.Task;
         }
         catch (OperationCanceledException)
         {
-            Interlocked.Decrement(ref _pendingRequests);
+            // Request never entered the channel — the worker won't process it, so decrement here.
+            // If the request was already enqueued before cancellation, the worker will process it
+            // and decrement _pendingRequests in ProcessBatch's finally block.
+            if (!_channel.Reader.TryPeek(out var peeked) || !ReferenceEquals(peeked, request))
+                Interlocked.Decrement(ref _pendingRequests);
             throw new WriteQueueFullException("Write queue is full or shutting down");
+        }
+        catch (ChannelClosedException)
+        {
+            Interlocked.Decrement(ref _pendingRequests);
+            throw new WriteQueueFullException("Write queue is shutting down");
         }
     }
 
