@@ -523,11 +523,26 @@ public static class InfluxQlParser
             parts.Add(Unq(tail));
         return parts.ToArray();
     }
-    static long ParseTime(string s) { s = s.Trim().Trim('\''); if (long.TryParse(s, out var n)) return n;
-        return DateTimeOffset.Parse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal).ToUnixTimeMilliseconds() * 1_000_000; }
+    static long ParseTime(string s)
+    {
+        s = s.Trim().Trim('\'');
+        if (long.TryParse(s, out var n)) return n;
+        if (s.StartsWith("now()", StringComparison.OrdinalIgnoreCase)) return ParseNowTime(s);
+        return DateTimeOffset.Parse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal).ToUnixTimeMilliseconds() * 1_000_000;
+    }
+    static long ParseNowTime(string s)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+        var rest = s["now()".Length..].Trim();
+        if (rest.Length == 0) return now;
+        var op = rest[0];
+        if (op != '+' && op != '-') throw new FormatException($"bad time expression: {s}");
+        var duration = DurationToNs(rest[1..]);
+        return op == '-' ? now - duration : now + duration;
+    }
     public static long DurationToNs(string s)
     {
-        s = s.Trim().ToLowerInvariant();
+        s = new string(s.Trim().ToLowerInvariant().Where(ch => !char.IsWhiteSpace(ch)).ToArray());
         long num = long.Parse(new string(s.TakeWhile(char.IsDigit).ToArray()));
         string unit = new string(s.SkipWhile(char.IsDigit).ToArray());
         return unit switch { "ns" => num, "u" or "us" => num * 1000, "ms" => num * 1_000_000, "s" => num * 1_000_000_000,

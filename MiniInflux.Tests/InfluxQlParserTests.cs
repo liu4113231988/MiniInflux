@@ -50,6 +50,32 @@ public class InfluxQlParserTests
     }
 
     [Fact]
+    public void Parse_SelectWithNowTimeFilter_ParsesRelativeTimeRange()
+    {
+        var before = NowNs();
+
+        var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE time >= now() - 1h AND time < now() + 5m");
+
+        var after = NowNs();
+        var hour = InfluxQlParser.DurationToNs("1h");
+        var fiveMinutes = InfluxQlParser.DurationToNs("5m");
+        Assert.InRange(query.MinTimeNs!.Value, before - hour, after - hour);
+        Assert.InRange(query.MaxTimeNs!.Value, before + fiveMinutes - 1, after + fiveMinutes - 1);
+    }
+
+    [Fact]
+    public void Parse_SelectWithSpacedNowDuration_ParsesRelativeTime()
+    {
+        var before = NowNs();
+
+        var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE time >= NOW() - 1 h");
+
+        var after = NowNs();
+        var hour = InfluxQlParser.DurationToNs("1 h");
+        Assert.InRange(query.MinTimeNs!.Value, before - hour, after - hour);
+    }
+
+    [Fact]
     public void Parse_SelectWithTagFilter_ParsesTagFilter()
     {
         var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE host = 'server01'");
@@ -292,4 +318,6 @@ public class InfluxQlParserTests
         Assert.Equal("metrics", query.Database);
         Assert.Equal("cq_cpu", query.ContinuousQueryName);
     }
+
+    static long NowNs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
 }
