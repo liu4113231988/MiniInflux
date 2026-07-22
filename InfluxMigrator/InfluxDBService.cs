@@ -11,12 +11,12 @@ namespace InfluxdbDataSync
 {
     public class InfluxDBService : IDisposable
     {
-        private const int WriteBatchSize = 1000;
         private readonly HttpClient _httpClient;
         readonly string _url, _db, _username, _password;
+        private readonly int _writeBatchSize;
 
 
-        public InfluxDBService(string host, int port, string db, string user, string password)
+        public InfluxDBService(string host, int port, string db, string user, string password, int writeBatchSize = 10000)
         {
             // 复用 HttpClient 以提高性能
             _httpClient = new HttpClient();
@@ -25,6 +25,7 @@ namespace InfluxdbDataSync
             _url = $"http://{host}:{port}";
             _username = user;
             _password = password;
+            _writeBatchSize = Math.Max(1, writeBatchSize);
         }
 
         /// <summary>
@@ -86,14 +87,13 @@ namespace InfluxdbDataSync
 
             string? line;
             long count = 0;
-            long batchSize = 5000; // 每5000条刷写一次，或者依赖 Client 内部的自动 Batch
             var pointData = new StringBuilder();
             while ((line = await reader.ReadLineAsync()) != null)
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
                 pointData.Append(line + "\n");
                 count++;
-                if (count % batchSize == 0)
+                if (count % _writeBatchSize == 0)
                 {
                     logDelegate($"已读取并排队 {count} 条数据...");
                     await WritePointsAsync(pointData.ToString());
@@ -130,7 +130,7 @@ namespace InfluxdbDataSync
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
                 batch.AppendLine(line);
-                if (++count < WriteBatchSize) continue;
+                if (++count < _writeBatchSize) continue;
                 await PostLineProtocolAsync(batch.ToString(), cancellationToken);
                 batch.Clear();
                 count = 0;

@@ -181,6 +181,8 @@ namespace InfluxdbDataSync
                     AddLog("采样时间间隔必须是大于或等于 0 的秒数（0 表示原始数据）");
                     return;
                 }
+                var migrationConcurrency = (int)numMigrationConcurrency.Value;
+                var writeBatchSize = (int)numWriteBatchSize.Value;
                 using var remoteInfluxService = new InfluxDBService(remoteHost, remotePort, remoteDB, remoteUser, remotePassword);
 
                 // 测试连接
@@ -192,7 +194,7 @@ namespace InfluxdbDataSync
                 }
 
                 AddLog("测试本地InfluxDB连接...");
-                using var localInfluxService = new InfluxDBService(localHost, localPort, localDB, localUser, localPassword);
+                using var localInfluxService = new InfluxDBService(localHost, localPort, localDB, localUser, localPassword, writeBatchSize);
                 if (!await localInfluxService.TestInfluxConnection(AddLog, cancellationToken))
                 {
                     AddLog("本地InfluxDB连接失败，无法继续");
@@ -229,16 +231,19 @@ namespace InfluxdbDataSync
                     AddLog($"从上次位置继续：测点 {_resumeTag}，时间 {_resumeTime:yyyy-MM-dd HH:mm:ss}");
                 else
                     startTagIndex = 0;
+                AddLog($"Start sync {tagFilters.Count} tags (window {configuredWindow.TotalHours:g}h, sample {sampleIntervalSeconds}s, concurrency {migrationConcurrency}, write batch {writeBatchSize})...");
 
-                AddLog($"开始同步 {tagFilters.Count} 个测点（最大查询周期：{configuredWindow.TotalHours:g} 小时，采样间隔：{sampleIntervalSeconds} 秒）...");
-                for (var tagIndex = startTagIndex; tagIndex < tagFilters.Count; tagIndex++)
+                async Task SyncTagAsync(int tagIndex, bool updateResume)
                 {
                     var tag = tagFilters[tagIndex];
                     var dtTime = _resumeKey == syncKey && _resumeTag == tag && _resumeTime > startTime ? _resumeTime : startTime;
                     var queryWindow = configuredWindow;
-                    _resumeKey = syncKey;
-                    _resumeTag = tag;
-                    _resumeTime = dtTime;
+                    if (updateResume)
+                    {
+                        _resumeKey = syncKey;
+                        _resumeTag = tag;
+                        _resumeTime = dtTime;
+                    }
                     AddLog($"----- [{tagIndex + 1}/{tagFilters.Count}] 开始同步测点: {tag} -----");
 
                     while (dtTime < endTime)
@@ -268,15 +273,32 @@ namespace InfluxdbDataSync
                         }
 
                         dtTime = et;
-                        _resumeTime = dtTime;
+                        if (updateResume) _resumeTime = dtTime;
                     }
 
-                    if (tagIndex + 1 < tagFilters.Count)
+                    if (updateResume && tagIndex + 1 < tagFilters.Count)
                     {
                         _resumeTag = tagFilters[tagIndex + 1];
                         _resumeTime = startTime;
                     }
                     await Task.Delay(10, cancellationToken);
+                }
+
+                if (migrationConcurrency <= 1)
+                {
+                    for (var tagIndex = startTagIndex; tagIndex < tagFilters.Count; tagIndex++)
+                        await SyncTagAsync(tagIndex, updateResume: true);
+                }
+                else
+                {
+                    using var throttle = new SemaphoreSlim(migrationConcurrency);
+                    var tasks = Enumerable.Range(startTagIndex, tagFilters.Count - startTagIndex).Select(async tagIndex =>
+                    {
+                        await throttle.WaitAsync(cancellationToken);
+                        try { await SyncTagAsync(tagIndex, updateResume: false); }
+                        finally { throttle.Release(); }
+                    });
+                    await Task.WhenAll(tasks);
                 }
 
                 _resumeKey = null;
@@ -431,7 +453,7 @@ namespace InfluxdbDataSync
 
                 // 测试目标InfluxDB连接
                 AddLog("测试本地InfluxDB连接...");
-                using var influxDBService = new InfluxDBService(localHost, localPort, localDB, localUser, localPassword);
+                using var influxDBService = new InfluxDBService(localHost, localPort, localDB, localUser, localPassword, (int)numWriteBatchSize.Value);
                 if (!await influxDBService.TestInfluxConnection(AddLog))
                 {
                     AddLog("本地InfluxDB连接失败，无法继续");
@@ -502,7 +524,7 @@ namespace InfluxdbDataSync
 
                 // 测试目标InfluxDB连接
                 AddLog("测试本地InfluxDB连接...");
-                using var influxDBService = new InfluxDBService(localHost, localPort, localDB, localUser, localPassword);
+                using var influxDBService = new InfluxDBService(localHost, localPort, localDB, localUser, localPassword, (int)numWriteBatchSize.Value);
                 if (!await influxDBService.TestInfluxConnection(AddLog))
                 {
                     AddLog("本地InfluxDB连接失败，无法继续");

@@ -78,6 +78,10 @@ namespace InfluxdbDataSync
             btnRestoreFromFile = new Button();
             btnFillData = new Button();
             groupBox5 = new GroupBox();
+            numWriteBatchSize = new NumericUpDown();
+            labelWriteBatchSize = new Label();
+            numMigrationConcurrency = new NumericUpDown();
+            labelMigrationConcurrency = new Label();
             numSyncWindowHours = new NumericUpDown();
             labelSyncWindowHours = new Label();
             txtTimeInterval = new TextBox();
@@ -91,6 +95,8 @@ namespace InfluxdbDataSync
             groupBox3.SuspendLayout();
             groupBox4.SuspendLayout();
             groupBox5.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)numWriteBatchSize).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)numMigrationConcurrency).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numSyncWindowHours).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numMax).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numMin).BeginInit();
@@ -439,7 +445,7 @@ namespace InfluxdbDataSync
             groupBox3.Controls.Add(label12);
             groupBox3.Controls.Add(rtbMeasurements);
             groupBox3.Controls.Add(label14);
-            groupBox3.Location = new Point(16, 239);
+            groupBox3.Location = new Point(16, 269);
             groupBox3.Margin = new Padding(5, 6, 5, 6);
             groupBox3.Name = "groupBox3";
             groupBox3.Padding = new Padding(5, 6, 5, 6);
@@ -506,7 +512,7 @@ namespace InfluxdbDataSync
             // 
             // btnSync
             // 
-            btnSync.Location = new Point(324, 414);
+            btnSync.Location = new Point(324, 444);
             btnSync.Margin = new Padding(5, 6, 5, 6);
             btnSync.Name = "btnSync";
             btnSync.Size = new Size(163, 28);
@@ -518,7 +524,7 @@ namespace InfluxdbDataSync
             // btnCancelSync
             //
             btnCancelSync.Enabled = false;
-            btnCancelSync.Location = new Point(837, 414);
+            btnCancelSync.Location = new Point(837, 444);
             btnCancelSync.Margin = new Padding(5, 6, 5, 6);
             btnCancelSync.Name = "btnCancelSync";
             btnCancelSync.Size = new Size(145, 28);
@@ -530,7 +536,7 @@ namespace InfluxdbDataSync
             // groupBox4
             // 
             groupBox4.Controls.Add(rtbLog);
-            groupBox4.Location = new Point(16, 439);
+            groupBox4.Location = new Point(16, 469);
             groupBox4.Margin = new Padding(5, 6, 5, 6);
             groupBox4.Name = "groupBox4";
             groupBox4.Padding = new Padding(5, 6, 5, 6);
@@ -550,7 +556,7 @@ namespace InfluxdbDataSync
             // 
             // btnBackupToFile
             // 
-            btnBackupToFile.Location = new Point(151, 414);
+            btnBackupToFile.Location = new Point(151, 444);
             btnBackupToFile.Margin = new Padding(5, 6, 5, 6);
             btnBackupToFile.Name = "btnBackupToFile";
             btnBackupToFile.Size = new Size(163, 28);
@@ -561,7 +567,7 @@ namespace InfluxdbDataSync
             // 
             // btnRestoreFromFile
             // 
-            btnRestoreFromFile.Location = new Point(497, 414);
+            btnRestoreFromFile.Location = new Point(497, 444);
             btnRestoreFromFile.Margin = new Padding(5, 6, 5, 6);
             btnRestoreFromFile.Name = "btnRestoreFromFile";
             btnRestoreFromFile.Size = new Size(163, 28);
@@ -572,7 +578,7 @@ namespace InfluxdbDataSync
             // 
             // btnFillData
             // 
-            btnFillData.Location = new Point(670, 414);
+            btnFillData.Location = new Point(670, 444);
             btnFillData.Margin = new Padding(5, 6, 5, 6);
             btnFillData.Name = "btnFillData";
             btnFillData.Size = new Size(163, 28);
@@ -583,6 +589,10 @@ namespace InfluxdbDataSync
             // 
             // groupBox5
             // 
+            groupBox5.Controls.Add(numWriteBatchSize);
+            groupBox5.Controls.Add(labelWriteBatchSize);
+            groupBox5.Controls.Add(numMigrationConcurrency);
+            groupBox5.Controls.Add(labelMigrationConcurrency);
             groupBox5.Controls.Add(numSyncWindowHours);
             groupBox5.Controls.Add(labelSyncWindowHours);
             groupBox5.Controls.Add(txtTimeInterval);
@@ -593,10 +603,49 @@ namespace InfluxdbDataSync
             groupBox5.Controls.Add(label20);
             groupBox5.Location = new Point(16, 192);
             groupBox5.Name = "groupBox5";
-            groupBox5.Size = new Size(978, 48);
+            groupBox5.Size = new Size(978, 78);
             groupBox5.TabIndex = 8;
             groupBox5.TabStop = false;
             groupBox5.Text = "同步配置";
+            //
+            // numWriteBatchSize
+            //
+            numWriteBatchSize.Increment = new decimal(new int[] { 1000, 0, 0, 0 });
+            numWriteBatchSize.Location = new Point(289, 48);
+            numWriteBatchSize.Maximum = new decimal(new int[] { 50000, 0, 0, 0 });
+            numWriteBatchSize.Minimum = new decimal(new int[] { 1000, 0, 0, 0 });
+            numWriteBatchSize.Name = "numWriteBatchSize";
+            numWriteBatchSize.Size = new Size(86, 23);
+            numWriteBatchSize.TabIndex = 18;
+            numWriteBatchSize.Value = new decimal(new int[] { 10000, 0, 0, 0 });
+            //
+            // labelWriteBatchSize
+            //
+            labelWriteBatchSize.Location = new Point(216, 51);
+            labelWriteBatchSize.Margin = new Padding(5, 0, 5, 0);
+            labelWriteBatchSize.Name = "labelWriteBatchSize";
+            labelWriteBatchSize.Size = new Size(74, 17);
+            labelWriteBatchSize.TabIndex = 17;
+            labelWriteBatchSize.Text = "写入批次：";
+            //
+            // numMigrationConcurrency
+            //
+            numMigrationConcurrency.Location = new Point(84, 48);
+            numMigrationConcurrency.Maximum = new decimal(new int[] { 16, 0, 0, 0 });
+            numMigrationConcurrency.Minimum = new decimal(new int[] { 1, 0, 0, 0 });
+            numMigrationConcurrency.Name = "numMigrationConcurrency";
+            numMigrationConcurrency.Size = new Size(120, 23);
+            numMigrationConcurrency.TabIndex = 16;
+            numMigrationConcurrency.Value = new decimal(new int[] { 4, 0, 0, 0 });
+            //
+            // labelMigrationConcurrency
+            //
+            labelMigrationConcurrency.Location = new Point(18, 51);
+            labelMigrationConcurrency.Margin = new Padding(5, 0, 5, 0);
+            labelMigrationConcurrency.Name = "labelMigrationConcurrency";
+            labelMigrationConcurrency.Size = new Size(58, 17);
+            labelMigrationConcurrency.TabIndex = 15;
+            labelMigrationConcurrency.Text = "并发数：";
             //
             // numSyncWindowHours
             //
@@ -674,7 +723,7 @@ namespace InfluxdbDataSync
             // 
             AutoScaleDimensions = new SizeF(7F, 17F);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(1004, 710);
+            ClientSize = new Size(1004, 740);
             Controls.Add(groupBox5);
             Controls.Add(btnCancelSync);
             Controls.Add(btnFillData);
@@ -699,6 +748,8 @@ namespace InfluxdbDataSync
             groupBox4.ResumeLayout(false);
             groupBox5.ResumeLayout(false);
             groupBox5.PerformLayout();
+            ((System.ComponentModel.ISupportInitialize)numWriteBatchSize).EndInit();
+            ((System.ComponentModel.ISupportInitialize)numMigrationConcurrency).EndInit();
             ((System.ComponentModel.ISupportInitialize)numSyncWindowHours).EndInit();
             ((System.ComponentModel.ISupportInitialize)numMax).EndInit();
             ((System.ComponentModel.ISupportInitialize)numMin).EndInit();
@@ -771,6 +822,10 @@ namespace InfluxdbDataSync
         private NumericUpDown numMax;
         private TextBox txtTimeInterval;
         private Label label23;
+        private NumericUpDown numWriteBatchSize;
+        private Label labelWriteBatchSize;
+        private NumericUpDown numMigrationConcurrency;
+        private Label labelMigrationConcurrency;
         private NumericUpDown numSyncWindowHours;
         private Label labelSyncWindowHours;
     }

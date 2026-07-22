@@ -936,7 +936,7 @@ public sealed class TsdbEngine : IDisposable
         FlushDatabase(db);
         var dbDir = Path.Combine(_root, "db", db);
         if (Directory.Exists(dbDir)) try { Directory.Delete(dbDir, true); } catch { }
-        _manifest.DropDatabase(db); _tombstones.DropDatabase(db);
+        _manifest.DropDatabase(db); _manifest.SaveIfDirty(); _tombstones.DropDatabase(db);
         _globalLock.EnterWriteLock();
         try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { _buf.Remove(k); _bufBySeries.Remove(k); _locks.Remove(k); _bufferReplayFloors.Remove(k); } _seriesKeys.Remove(db); }
         finally { _globalLock.ExitWriteLock(); }
@@ -1301,6 +1301,8 @@ public sealed class TsdbEngine : IDisposable
             UpdateWalCheckpoint();
         }
         finally { _globalLock.ExitWriteLock(); }
+        _schema.SaveIfDirty();
+        _manifest.SaveIfDirty();
     }
 
     private void CheckCardinality(string db, List<PendingPoint> pts)
@@ -1545,7 +1547,7 @@ public sealed class TsdbEngine : IDisposable
 
     public void Dispose()
     {
-        _rpExpiryTimer?.Dispose(); _compactionTimer?.Dispose(); _flushTimer?.Dispose(); FlushAll(); _manifest.SaveIfDirty(); _wal.Dispose(); _globalLock.Dispose();
+        _rpExpiryTimer?.Dispose(); _compactionTimer?.Dispose(); _flushTimer?.Dispose(); FlushAll(); _schema.SaveIfDirty(); _manifest.SaveIfDirty(); _wal.Dispose(); _globalLock.Dispose();
         foreach (var lk in _locks.Values) lk.Dispose();
     }
 
@@ -1568,6 +1570,8 @@ public sealed class TsdbEngine : IDisposable
                 UpdateWalCheckpoint();
             }
             finally { _globalLock.ExitWriteLock(); }
+            _schema.SaveIfDirty();
+            _manifest.SaveIfDirty();
         }
         catch (Exception ex) { _health.RecordFailure("periodic_flush", ex, blocksWrites: true); }
     }

@@ -114,6 +114,7 @@ public class SchemaRegistryTests : IDisposable
         };
 
         _registry.ValidateAndRegister("testdb", "cpu", points);
+        _registry.SaveIfDirty();
 
         // Create a new registry pointing to the same directory
         var registry2 = new SchemaRegistry(_testDir);

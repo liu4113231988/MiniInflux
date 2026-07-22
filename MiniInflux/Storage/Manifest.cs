@@ -91,7 +91,7 @@ public sealed class Manifest
         lock (_lock)
         {
             if (_data.Databases.Remove(db))
-                Save();
+                _dirty = true;
         }
     }
 
@@ -136,7 +136,10 @@ public sealed class Manifest
                 var isFirst = dbInfo.RetentionPolicies.Count == 0;
                 dbInfo.RetentionPolicies[rpName] = new RetentionPolicyInfo
                 {
-                    Name = rpName, DurationNs = 0, Replication = 1, IsDefault = isFirst
+                    Name = rpName,
+                    DurationNs = 0,
+                    Replication = 1,
+                    IsDefault = isFirst
                 };
                 Save();
             }
@@ -154,7 +157,10 @@ public sealed class Manifest
 
             dbInfo.RetentionPolicies[rpName] = new RetentionPolicyInfo
             {
-                Name = rpName, DurationNs = durationNs, Replication = 1, IsDefault = isDefault
+                Name = rpName,
+                DurationNs = durationNs,
+                Replication = 1,
+                IsDefault = isDefault
             };
             Save();
         }
@@ -348,7 +354,7 @@ public sealed class Manifest
             if (!shard.SegmentFiles.Contains(fileName))
             {
                 shard.SegmentFiles.Add(fileName);
-                Save();
+                _dirty = true;
             }
         }
     }
@@ -364,7 +370,7 @@ public sealed class Manifest
 
             var names = new HashSet<string>(segmentFiles.Select(Path.GetFileName).Where(name => !string.IsNullOrWhiteSpace(name))!, StringComparer.OrdinalIgnoreCase);
             shard.SegmentFiles.RemoveAll(file => names.Contains(file));
-            Save();
+            _dirty = true;
         }
     }
 

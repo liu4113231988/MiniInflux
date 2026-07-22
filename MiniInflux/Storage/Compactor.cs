@@ -91,14 +91,15 @@ public sealed class Compactor
     public CompactionStatsSnapshot GetStats()
     {
         var running = Interlocked.CompareExchange(ref _running, 0, 0) == 1;
+        var queued = Interlocked.CompareExchange(ref _queuedTasks, 0, 0);
         return new CompactionStatsSnapshot
         {
             TotalRuns = Interlocked.Read(ref _totalRuns),
             TotalTasks = Interlocked.Read(ref _totalTasks),
             TotalSegmentsMerged = Interlocked.Read(ref _totalSegmentsMerged),
             Running = running,
-            QueuedTasks = Interlocked.CompareExchange(ref _queuedTasks, 0, 0),
-            BacklogTasks = running ? Interlocked.CompareExchange(ref _queuedTasks, 0, 0) : BuildTasks().Count,
+            QueuedTasks = queued,
+            BacklogTasks = running ? queued : BuildTasks().Count,
             LastRunUtc = _lastRunUtc
         };
     }
@@ -236,8 +237,6 @@ public sealed class Compactor
     private bool CompactShard(string db, string rp, ShardGroupInfo shard, int outputLevel, List<FileCandidate> segFiles)
     {
         if (segFiles.Count == 0) return false;
-        Interlocked.Increment(ref _totalTasks);
-        Interlocked.Add(ref _totalSegmentsMerged, segFiles.Count);
 
         var orderedInputs = segFiles
             .OrderByDescending(f => f.Level)
@@ -308,6 +307,8 @@ public sealed class Compactor
         foreach (var source in sourceFiles)
             TryDelete(source.Path);
 
+        Interlocked.Increment(ref _totalTasks);
+        Interlocked.Add(ref _totalSegmentsMerged, sourceFiles.Count);
         return true;
     }
 

@@ -14,6 +14,8 @@ public sealed class SchemaRegistry
     private readonly object _lock = new();
     private readonly int _maxFieldsPerMeasurement;
     private readonly Dictionary<string, Dictionary<string, Dictionary<string, FieldKind>>> _schema = new(StringComparer.Ordinal);
+    private bool _dirty;
+    private volatile bool _dirtyVol;
 
     public SchemaRegistry(string dataPath, int maxFieldsPerMeasurement = 1024)
     {
@@ -22,6 +24,20 @@ public sealed class SchemaRegistry
         _schemaPath = Path.Combine(metaDir, "schema.json");
         _maxFieldsPerMeasurement = maxFieldsPerMeasurement;
         Load();
+    }
+
+    /// <summary>
+    /// Persist schema if changes have been made since the last save.
+    /// Called by the engine on a periodic timer to batch schema writes.
+    /// </summary>
+    public void SaveIfDirty()
+    {
+        if (!_dirtyVol) return;
+        lock (_lock)
+        {
+            if (!_dirty) return;
+            Save();
+        }
     }
 
     /// <summary>
@@ -53,7 +69,10 @@ public sealed class SchemaRegistry
             var changed = RegisterFieldsLocked(db, measurement, batchFields);
 
             if (changed)
-                Save();
+            {
+                _dirty = true;
+                _dirtyVol = true;
+            }
         }
     }
 
@@ -81,7 +100,10 @@ public sealed class SchemaRegistry
                 changed |= RegisterFieldsLocked(db, measurement, fields);
 
             if (changed)
-                Save();
+            {
+                _dirty = true;
+                _dirtyVol = true;
+            }
         }
     }
 
@@ -149,7 +171,11 @@ public sealed class SchemaRegistry
                     new SchemaEntry(db.Key, measurement.Key, field.Key, (byte)field.Value)))).ToList();
 
         var json = JsonSerializer.Serialize(entries, SchemaJsonContext.Default.ListSchemaEntry);
-        File.WriteAllText(_schemaPath, json);
+        var tmp = _schemaPath + ".tmp";
+        File.WriteAllText(tmp, json);
+        File.Move(tmp, _schemaPath, overwrite: true);
+        _dirty = false;
+        _dirtyVol = false;
     }
 
     private bool RegisterFieldsLocked(string db, string measurement, Dictionary<string, FieldKind> batchFields)
