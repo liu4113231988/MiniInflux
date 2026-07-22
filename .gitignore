@@ -138,4 +138,5 @@ web-admin/node_modules/
 .test-*/
 .dotnet_home/
 data/
+.benchmarks/
 .history/
