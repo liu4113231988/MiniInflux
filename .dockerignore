@@ -1,0 +1,16 @@
+.git
+.vs
+.vscode
+.idea
+.agents
+.benchmarks
+.history
+.dotnet_home
+artifacts
+data
+**/bin
+**/obj
+**/node_modules
+*.user
+*.suo
+*.log
