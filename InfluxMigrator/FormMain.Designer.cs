@@ -520,9 +520,9 @@ namespace InfluxdbDataSync
             btnSync.Text = "开始同步数据";
             btnSync.UseVisualStyleBackColor = true;
             btnSync.Click += btnSync_Click;
-            //
+            // 
             // btnCancelSync
-            //
+            // 
             btnCancelSync.Enabled = false;
             btnCancelSync.Location = new Point(837, 444);
             btnCancelSync.Margin = new Padding(5, 6, 5, 6);
@@ -607,9 +607,9 @@ namespace InfluxdbDataSync
             groupBox5.TabIndex = 8;
             groupBox5.TabStop = false;
             groupBox5.Text = "同步配置";
-            //
+            // 
             // numWriteBatchSize
-            //
+            // 
             numWriteBatchSize.Increment = new decimal(new int[] { 1000, 0, 0, 0 });
             numWriteBatchSize.Location = new Point(289, 48);
             numWriteBatchSize.Maximum = new decimal(new int[] { 50000, 0, 0, 0 });
@@ -618,18 +618,18 @@ namespace InfluxdbDataSync
             numWriteBatchSize.Size = new Size(86, 23);
             numWriteBatchSize.TabIndex = 18;
             numWriteBatchSize.Value = new decimal(new int[] { 10000, 0, 0, 0 });
-            //
+            // 
             // labelWriteBatchSize
-            //
+            // 
             labelWriteBatchSize.Location = new Point(216, 51);
             labelWriteBatchSize.Margin = new Padding(5, 0, 5, 0);
             labelWriteBatchSize.Name = "labelWriteBatchSize";
             labelWriteBatchSize.Size = new Size(74, 17);
             labelWriteBatchSize.TabIndex = 17;
             labelWriteBatchSize.Text = "写入批次：";
-            //
+            // 
             // numMigrationConcurrency
-            //
+            // 
             numMigrationConcurrency.Location = new Point(84, 48);
             numMigrationConcurrency.Maximum = new decimal(new int[] { 16, 0, 0, 0 });
             numMigrationConcurrency.Minimum = new decimal(new int[] { 1, 0, 0, 0 });
@@ -637,18 +637,18 @@ namespace InfluxdbDataSync
             numMigrationConcurrency.Size = new Size(120, 23);
             numMigrationConcurrency.TabIndex = 16;
             numMigrationConcurrency.Value = new decimal(new int[] { 4, 0, 0, 0 });
-            //
+            // 
             // labelMigrationConcurrency
-            //
+            // 
             labelMigrationConcurrency.Location = new Point(18, 51);
             labelMigrationConcurrency.Margin = new Padding(5, 0, 5, 0);
             labelMigrationConcurrency.Name = "labelMigrationConcurrency";
             labelMigrationConcurrency.Size = new Size(58, 17);
             labelMigrationConcurrency.TabIndex = 15;
             labelMigrationConcurrency.Text = "并发数：";
-            //
+            // 
             // numSyncWindowHours
-            //
+            // 
             numSyncWindowHours.Location = new Point(910, 18);
             numSyncWindowHours.Maximum = new decimal(new int[] { 720, 0, 0, 0 });
             numSyncWindowHours.Minimum = new decimal(new int[] { 1, 0, 0, 0 });
@@ -656,13 +656,13 @@ namespace InfluxdbDataSync
             numSyncWindowHours.Size = new Size(55, 23);
             numSyncWindowHours.TabIndex = 14;
             numSyncWindowHours.Value = new decimal(new int[] { 6, 0, 0, 0 });
-            //
+            // 
             // labelSyncWindowHours
-            //
+            // 
             labelSyncWindowHours.AutoSize = true;
             labelSyncWindowHours.Location = new Point(785, 20);
             labelSyncWindowHours.Name = "labelSyncWindowHours";
-            labelSyncWindowHours.Size = new Size(116, 17);
+            labelSyncWindowHours.Size = new Size(140, 17);
             labelSyncWindowHours.TabIndex = 13;
             labelSyncWindowHours.Text = "单次查询周期（小时）：";
             // 
@@ -716,6 +716,7 @@ namespace InfluxdbDataSync
             label20.Name = "label20";
             label20.Size = new Size(76, 24);
             label20.TabIndex = 5;
+            label20.Tag = "随机数据设置范围";
             label20.Text = "数据范围：";
             label20.TextAlign = ContentAlignment.MiddleLeft;
             // 
