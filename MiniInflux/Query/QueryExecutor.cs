@@ -1148,6 +1148,13 @@ public sealed class QueryExecutor
         if (items.Count == 0) items = [new("count", "*", "count")];
         var hasRowExpandingFunctions = items.Any(IsRowExpandingGroupFunction);
 
+        // Fast path: GROUP BY time only (no tag grouping) - avoids tuple key + BuildGroupByTagKey per point.
+        if (step.HasValue && tagNames.Count == 0 && !groupByAllTags)
+        {
+            return AggGroupByTimeOnly(pts, q, cancellationToken, resultMeasurement, step, items, hasRowExpandingFunctions);
+        }
+
+        // General path: GROUP BY tag, optionally with time.
         var groups = new Dictionary<(string TagKey, long? BucketTime), List<Point>>();
         foreach (var p in pts)
         {
@@ -1194,6 +1201,50 @@ public sealed class QueryExecutor
         var seriesList = ApplySeriesWindow(seriesMap.Values, q.SeriesOffset, q.SeriesLimit);
         EnsureWithinLimit(seriesList.Sum(s => s.Values.Count));
         return seriesList;
+    }
+
+    /// <summary>
+    /// Optimized GROUP BY time only - avoids tuple key overhead and BuildGroupByTagKey call per point.
+    /// Uses long key directly and produces a single series.
+    /// </summary>
+    List<QuerySeries> AggGroupByTimeOnly(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken,
+        string resultMeasurement, long? step, List<SelectItem> items, bool hasRowExpandingFunctions)
+    {
+        var groups = new Dictionary<long, List<Point>>();
+        foreach (var p in pts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var bucketTime = p.TimestampNs / step!.Value * step.Value;
+            if (!groups.TryGetValue(bucketTime, out var list))
+            {
+                list = [];
+                groups[bucketTime] = list;
+            }
+            list.Add(p);
+        }
+
+        var cols = new List<string> { "time" };
+        cols.AddRange(items.Select(x => x.Alias));
+        var series = new QuerySeries { Name = resultMeasurement, Columns = cols, Values = [] };
+
+        foreach (var (bucketTime, groupPts) in groups.OrderBy(g => g.Key))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            foreach (var row in BuildGroupedRows(groupPts, items, bucketTime, cancellationToken))
+                series.Values.Add(row);
+        }
+
+        if (!hasRowExpandingFunctions && step.HasValue && q.Fill != FillMode.None && q.MinTimeNs.HasValue && q.MaxTimeNs.HasValue)
+        {
+            var singleSeriesMap = new Dictionary<string, QuerySeries> { [""] = series };
+            ApplyFill(singleSeriesMap, q, step.Value, items);
+        }
+
+        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        series.Values = OrderRowsByTime(series.Values, q.Desc);
+        series.Values = series.Values.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
+
+        return [series];
     }
 
     private sealed class StreamingAggregateGroup(int itemCount)
@@ -1600,7 +1651,33 @@ public sealed class QueryExecutor
             throw new InvalidOperationException($"query memory limit exceeded: {bytes} > {_maxQueryMemoryBytes}");
     }
 
-    static long EstimatePointsBytes(List<Point> points) => points.Sum(EstimatePointBytes);
+    /// <summary>
+    /// Sample size threshold: at or below this, compute exactly; above, sample and extrapolate.
+    /// </summary>
+    private const int EstimateSampleThreshold = 2048;
+    private const int EstimateSampleSize = 1024;
+
+    /// <summary>
+    /// Estimate total bytes for a list of points using sampling for large collections.
+    /// </summary>
+    static long EstimatePointsBytes(List<Point> points)
+    {
+        var count = points.Count;
+        if (count == 0) return 0;
+        if (count <= EstimateSampleThreshold)
+            return points.Sum(EstimatePointBytes);
+
+        // Sample evenly and extrapolate
+        long sampled = 0;
+        var step = Math.Max(1, count / EstimateSampleSize);
+        var taken = 0;
+        for (var i = 0; i < count; i += step)
+        {
+            sampled += EstimatePointBytes(points[i]);
+            taken++;
+        }
+        return sampled * count / taken;
+    }
 
     static long EstimateFieldRowsBytes(List<long> timestamps, List<FieldValue?[]> rows)
     {
@@ -1638,10 +1715,14 @@ public sealed class QueryExecutor
         long timelineBytes = 0;
         long maxInputWindowBytes = 0;
         var allTimesUpperBound = new HashSet<long>();
+        var count = points.Count;
+        var useSample = count > EstimateSampleThreshold;
 
         foreach (var item in items)
         {
-            var matchingCount = CountMatchingNumericPoints(points, item.Field);
+            var matchingCount = useSample
+                ? CountMatchingNumericPointsSampled(points, item.Field)
+                : CountMatchingNumericPoints(points, item.Field);
             if (matchingCount == 0)
                 continue;
 
@@ -1649,20 +1730,58 @@ public sealed class QueryExecutor
             timelineBytes += EstimateTimelineBytes(outputCount);
             maxInputWindowBytes = Math.Max(maxInputWindowBytes, EstimateFunctionInputBytes(matchingCount));
 
-            foreach (var point in points)
-            {
-                if (item.Field == "*")
-                {
-                    allTimesUpperBound.Add(point.TimestampNs);
-                    continue;
-                }
-
-                if (point.Fields.TryGetValue(item.Field, out var value) && value.AsDouble().HasValue)
-                    allTimesUpperBound.Add(point.TimestampNs);
-            }
+            if (useSample)
+                CollectAllTimesSampled(points, item.Field, allTimesUpperBound);
+            else
+                CollectAllTimes(points, item.Field, allTimesUpperBound);
         }
 
         return timelineBytes + maxInputWindowBytes + allTimesUpperBound.Count * 8L;
+    }
+
+    static void CollectAllTimes(List<Point> points, string field, HashSet<long> allTimes)
+    {
+        foreach (var point in points)
+        {
+            if (field == "*") { allTimes.Add(point.TimestampNs); continue; }
+            if (point.Fields.TryGetValue(field, out var value) && value.AsDouble().HasValue)
+                allTimes.Add(point.TimestampNs);
+        }
+    }
+
+    static void CollectAllTimesSampled(List<Point> points, string field, HashSet<long> allTimes)
+    {
+        var count = points.Count;
+        var step = Math.Max(1, count / EstimateSampleSize);
+        for (var i = 0; i < count; i += step)
+        {
+            var point = points[i];
+            if (field == "*") { allTimes.Add(point.TimestampNs); continue; }
+            if (point.Fields.TryGetValue(field, out var value) && value.AsDouble().HasValue)
+                allTimes.Add(point.TimestampNs);
+        }
+    }
+
+    static int CountMatchingNumericPointsSampled(List<Point> points, string field)
+    {
+        var count = points.Count;
+        var step = Math.Max(1, count / EstimateSampleSize);
+        var matches = 0;
+        var taken = 0;
+        for (var i = 0; i < count; i += step)
+        {
+            var point = points[i];
+            if (field == "*")
+            {
+                if (point.Fields.Values.Any(v => v.AsDouble().HasValue)) matches++;
+            }
+            else if (point.Fields.TryGetValue(field, out var value) && value.AsDouble().HasValue)
+            {
+                matches++;
+            }
+            taken++;
+        }
+        return matches * count / Math.Max(1, taken);
     }
 
     static long EstimatePointBytes(Point point)
@@ -1686,10 +1805,37 @@ public sealed class QueryExecutor
                     size += 32 + EstimateStringBytes(tag.Key) + EstimateStringBytes(tag.Value);
             foreach (var col in series.Columns)
                 size += 16 + EstimateStringBytes(col);
-            foreach (var row in series.Values)
-                size += 32 + row.Sum(EstimateObjectBytes);
+            size += EstimateRowListBytes(series.Values);
         }
         return size;
+    }
+
+    /// <summary>
+    /// Estimate bytes for all rows in a series using sampling for large collections.
+    /// </summary>
+    static long EstimateRowListBytes(List<List<object?>> values)
+    {
+        var count = values.Count;
+        if (count == 0) return 0;
+        if (count <= EstimateSampleThreshold)
+        {
+            long size = 0;
+            foreach (var row in values)
+                size += 32 + row.Sum(EstimateObjectBytes);
+            return size;
+        }
+
+        // Sample evenly and extrapolate
+        long sampled = 0;
+        var step = Math.Max(1, count / EstimateSampleSize);
+        var taken = 0;
+        for (var i = 0; i < count; i += step)
+        {
+            var row = values[i];
+            sampled += 32 + row.Sum(EstimateObjectBytes);
+            taken++;
+        }
+        return sampled * count / taken;
     }
 
     static long EstimateRowBytes(List<object?> row)
@@ -2948,11 +3094,25 @@ public sealed class QueryExecutor
             throw new InvalidOperationException("missing required parameter db");
     }
 
+    [ThreadStatic]
+    private static Dictionary<long, string>? _timeCache;
+
     static string Time(long ns)
     {
+        // Cache formatted timestamps — effective for GROUP BY time where many rows share bucket boundaries.
+        var cache = _timeCache ??= new Dictionary<long, string>(128);
+        if (cache.TryGetValue(ns, out var cached))
+            return cached;
+
         var seconds = Math.DivRem(ns, 1_000_000_000L, out var nanos);
         var dt = DateTimeOffset.FromUnixTimeSeconds(seconds).UtcDateTime;
-        return $"{dt:yyyy-MM-ddTHH:mm:ss}.{nanos:D9}Z";
+        var result = $"{dt:yyyy-MM-ddTHH:mm:ss}.{nanos:D9}Z";
+
+        // Bound cache size to prevent unbounded growth for unique-timestamp queries.
+        if (cache.Count < 4096)
+            cache[ns] = result;
+
+        return result;
     }
 
     static long ParseTimeNs(object? value)

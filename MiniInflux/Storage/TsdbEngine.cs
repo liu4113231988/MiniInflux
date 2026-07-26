@@ -311,7 +311,6 @@ public sealed class TsdbEngine : IDisposable
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, List<FieldFilter>? fieldFilters = null,
         CancellationToken cancellationToken = default)
     {
-        var res = new List<Point>();
         var buffered = new List<Point>();
         var lk = GetLock(K(db, rp));
         lk.EnterReadLock();
@@ -335,34 +334,78 @@ public sealed class TsdbEngine : IDisposable
         }
         finally { lk.ExitReadLock(); }
 
-        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
-            {
-                // Time range pushdown: use metadata to skip segments that don't overlap the query range
-                if (meas != null || (min.HasValue && max.HasValue) || (fieldFilters != null && fieldFilters.Count > 0) || allowedTagsCanonical != null)
-                {
-                    try
-                    {
-                        var metas = ReadSegmentMetadataCached(segPath).Metas;
-                        if (meas != null && !metas.Any(m => m.Measurement == meas)) continue;
-                        if (min.HasValue && !metas.Any(m => m.MaxTime >= min.Value)) continue;
-                        if (max.HasValue && !metas.Any(m => m.MinTime <= max.Value)) continue;
-                        if (allowedTagsCanonical != null && !metas.Any(m => allowedTagsCanonical.Contains(m.TagsCanonical))) continue;
-                        if (fieldFilters != null && fieldFilters.Count > 0 && !CouldSegmentMatchFieldFilters(metas, meas, allowedTagsCanonical, fieldFilters))
-                            continue;
-                    }
-                    catch { /* fall through to full read */ }
-                }
+        var segments = _shards.ListSegments(db, rp, min, max);
 
-                res.AddRange(Rebuild(ReadSegmentColumns(db, segPath, requestedFields, meas, min, max, allowedTagsCanonical), min, max));
+        // Fast path: single segment or small result — read sequentially.
+        if (segments.Count <= 1)
+        {
+            var result = new List<Point>(buffered);
+            foreach (var (segPath, _) in segments)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                ReadSegmentInto(result, db, segPath, requestedFields, meas, min, max, allowedTagsCanonical, fieldFilters);
             }
-            catch (InvalidDataException) { }
-            catch (FileNotFoundException) { }
+            result.AddRange(buffered);
+            return [.. DeduplicatePoints(result).OrderBy(x => x.TimestampNs)];
         }
+
+        // Parallel path: multiple segments — read concurrently.
+        var segmentResults = new List<Point>[segments.Count];
+        var options = new ParallelOptions
+        {
+            CancellationToken = cancellationToken,
+            MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8)
+        };
+        Parallel.For(0, segments.Count, options, i =>
+        {
+            var segPath = segments[i].SegPath;
+            cancellationToken.ThrowIfCancellationRequested();
+            var list = new List<Point>();
+            ReadSegmentInto(list, db, segPath, requestedFields, meas, min, max, allowedTagsCanonical, fieldFilters);
+            segmentResults[i] = list;
+        });
+
+        // Merge results in order
+        long totalCount = 0;
+        for (var i = 0; i < segmentResults.Length; i++)
+            totalCount += segmentResults[i].Count;
+        totalCount += buffered.Count;
+
+        var res = new List<Point>((int)Math.Min(totalCount, int.MaxValue));
+        for (var i = 0; i < segmentResults.Length; i++)
+            res.AddRange(segmentResults[i]);
         res.AddRange(buffered); // Buffer contains the newest writes and must win over flushed segments.
         return [.. DeduplicatePoints(res).OrderBy(x => x.TimestampNs)];
+    }
+
+    /// <summary>
+    /// Read a single segment into the target list, applying metadata pushdown to skip irrelevant segments.
+    /// </summary>
+    private void ReadSegmentInto(List<Point> target, string db, string segPath,
+        HashSet<string>? requestedFields, string? meas, long? min, long? max,
+        HashSet<string>? allowedTagsCanonical, List<FieldFilter>? fieldFilters)
+    {
+        try
+        {
+            if (meas != null || (min.HasValue && max.HasValue) || (fieldFilters != null && fieldFilters.Count > 0) || allowedTagsCanonical != null)
+            {
+                try
+                {
+                    var metas = ReadSegmentMetadataCached(segPath).Metas;
+                    if (meas != null && !metas.Any(m => m.Measurement == meas)) return;
+                    if (min.HasValue && !metas.Any(m => m.MaxTime >= min.Value)) return;
+                    if (max.HasValue && !metas.Any(m => m.MinTime <= max.Value)) return;
+                    if (allowedTagsCanonical != null && !metas.Any(m => allowedTagsCanonical.Contains(m.TagsCanonical))) return;
+                    if (fieldFilters != null && fieldFilters.Count > 0 && !CouldSegmentMatchFieldFilters(metas, meas, allowedTagsCanonical, fieldFilters))
+                        return;
+                }
+                catch { /* fall through to full read */ }
+            }
+
+            target.AddRange(Rebuild(ReadSegmentColumns(db, segPath, requestedFields, meas, min, max, allowedTagsCanonical), min, max));
+        }
+        catch (InvalidDataException) { }
+        catch (FileNotFoundException) { }
     }
 
     public bool HasSegments(string db, string rp, long? min, long? max) =>
