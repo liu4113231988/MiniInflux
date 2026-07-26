@@ -7,7 +7,7 @@
     <PublishTrimmed>true</PublishTrimmed>
     <InvariantGlobalization>true</InvariantGlobalization>
     <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
-  </PropertyGroup>
+    </PropertyGroup>
   <ItemGroup>
     <Content Remove="wwwroot\**\*" />
     <EmbeddedResource Include="wwwroot\**\*" LogicalName="wwwroot/%(RecursiveDir)%(Filename)%(Extension)" />

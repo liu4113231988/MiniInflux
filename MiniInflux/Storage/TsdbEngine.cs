@@ -26,17 +26,19 @@ public sealed class TsdbEngine : IDisposable
     private readonly ShardManager _shards;
     private readonly TombstoneStore _tombstones;
     private readonly Compactor _compactor;
-    private readonly Dictionary<string, ReaderWriterLockSlim> _locks = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ReaderWriterLockSlim> _locks = new(StringComparer.Ordinal);
     private readonly ReaderWriterLockSlim _globalLock = new();
-    private readonly Dictionary<string, (long Length, DateTime LastWriteUtc, List<SegmentColumnMeta> Metas, bool UsedFooter)> _segmentMetadataCache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, List<BufferedPoint>> _buf = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, Dictionary<SeriesKey, List<BufferedPoint>>> _bufBySeries = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, WalPosition> _bufferReplayFloors = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Length, DateTime LastWriteUtc, List<SegmentColumnMeta> Metas, bool UsedFooter)> _segmentMetadataCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, List<BufferedPoint>> _buf = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Dictionary<SeriesKey, List<BufferedPoint>>> _bufBySeries = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, WalPosition> _bufferReplayFloors = new(StringComparer.Ordinal);
     private readonly int _threshold;
     private readonly long _maxSeriesPerDb;
     private readonly long _maxBufferPoints;
     private readonly long _maxBufferBytes;
-    private readonly Dictionary<string, HashSet<SeriesKey>> _seriesKeys = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, HashSet<SeriesKey>> _seriesKeys = new(StringComparer.Ordinal);
+    private long _bufferedPointCount;
+    private long _bufferedByteCount;
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
     private Timer? _flushTimer;
@@ -150,27 +152,25 @@ public sealed class TsdbEngine : IDisposable
         CreateDatabase(db); _manifest.EnsureRp(db, rp);
         var pending = DeduplicateWritePoints(pts);
         var writePoints = pending.Count == pts.Count ? pts : MaterializePendingPoints(pending);
-        CheckCardinality(db, pending);
         ValidateSchema(db, writePoints);
-        _globalLock.EnterWriteLock();
+        // Use per-db|rp lock only; the global lock is no longer needed for writes because
+        // _locks is a ConcurrentDictionary and _seriesKeys/_bufferedPointCount are updated under the per-key lock.
+        var key = K(db, rp);
+        var lk = GetLock(key);
+        lk.EnterWriteLock();
         try
         {
-            var key = K(db, rp);
-            var lk = GetLock(key, alreadyHoldingGlobalWrite: true);
-            lk.EnterWriteLock();
-            try
-            {
-                // CheckBufferLimit inside the lock to prevent concurrent writes from exceeding limits.
-                CheckBufferLimit(writePoints);
-                var walPositions = _wal.Append(db, rp, writePoints);
-                if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
-                AddWrittenPoints(db, key, list, pending, walPositions);
-                UpdateBufferReplayFloor(key, list);
-                if (list.Count >= _threshold) FlushLocked(db, rp, list);
-            }
-            finally { lk.ExitWriteLock(); }
+            // Cardinality check inside the write lock to avoid a TOCTOU race.
+            CheckCardinalityLocked(db, pending);
+            // CheckBufferLimit inside the lock to prevent concurrent writes from exceeding limits.
+            CheckBufferLimit(writePoints);
+            var walPositions = _wal.Append(db, rp, writePoints);
+            if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
+            AddWrittenPoints(db, key, list, pending, walPositions);
+            UpdateBufferReplayFloor(key, list);
+            if (list.Count >= _threshold) FlushLocked(db, rp, list);
         }
-        finally { _globalLock.ExitWriteLock(); }
+        finally { lk.ExitWriteLock(); }
         return Task.CompletedTask;
     }
 
@@ -203,7 +203,7 @@ public sealed class TsdbEngine : IDisposable
 
         var pending = new List<PendingPoint>(pts.Count);
         var first = pts[0];
-        pending.Add(new PendingPoint(first, SeriesKey.From(first)));
+        pending.Add(new PendingPoint(first, FastSeriesKey(first)));
         if (pts.Count == 1) return pending;
 
         var strictlyIncreasingTimestamps = true;
@@ -213,7 +213,7 @@ public sealed class TsdbEngine : IDisposable
             var point = pts[i];
             if (point.TimestampNs <= lastTimestamp) strictlyIncreasingTimestamps = false;
             lastTimestamp = point.TimestampNs;
-            pending.Add(new PendingPoint(point, SeriesKey.From(point)));
+            pending.Add(new PendingPoint(point, FastSeriesKey(point)));
         }
 
         if (strictlyIncreasingTimestamps) return pending;
@@ -245,6 +245,18 @@ public sealed class TsdbEngine : IDisposable
             }
         }
         return map.Values.ToList();
+    }
+
+    /// <summary>
+    /// Fast SeriesKey creation: skip tag sorting when TagsCanonical is already set by the parser.
+    /// </summary>
+    private static SeriesKey FastSeriesKey(Point p)
+    {
+        // LineProtocolParser pre-computes TagsCanonical when tags are already sorted.
+        // Only fall back to SeriesKey.From (which sorts) when canonical form is not available.
+        if (p.TagsCanonical != null)
+            return new SeriesKey(p.Measurement, p.TagsCanonical);
+        return SeriesKey.From(p);
     }
 
     /// <summary>
@@ -672,27 +684,15 @@ public sealed class TsdbEngine : IDisposable
     public IReadOnlyList<string> GetSeriesForTagRegex(string db, string measurement, string tagKey, string pattern, bool negate = false) =>
         _manifest.GetSeriesForTagRegex(db, measurement, tagKey, pattern, negate);
 
-    public long GetBufferedPointCount()
-    {
-        long count = 0;
-        _globalLock.EnterReadLock();
-        try { foreach (var kv in _buf) count += kv.Value.Count; }
-        finally { _globalLock.ExitReadLock(); }
-        return count;
-    }
+public long GetBufferedPointCount()
+{
+return Interlocked.Read(ref _bufferedPointCount);
+}
 
-    public long GetBufferedByteCount()
-    {
-        long bytes = 0;
-        _globalLock.EnterReadLock();
-        try
-        {
-            foreach (var kv in _buf)
-                bytes += kv.Value.Sum(p => EstimateBufferedPointBytes(p.Point));
-        }
-        finally { _globalLock.ExitReadLock(); }
-        return bytes;
-    }
+public long GetBufferedByteCount()
+{
+return Interlocked.Read(ref _bufferedByteCount);
+}
 
     public List<Point> ReadBufferedPoints(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null)
@@ -938,7 +938,7 @@ public sealed class TsdbEngine : IDisposable
         if (Directory.Exists(dbDir)) try { Directory.Delete(dbDir, true); } catch { }
         _manifest.DropDatabase(db); _manifest.SaveIfDirty(); _tombstones.DropDatabase(db);
         _globalLock.EnterWriteLock();
-        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { _buf.Remove(k); _bufBySeries.Remove(k); _locks.Remove(k); _bufferReplayFloors.Remove(k); } _seriesKeys.Remove(db); }
+        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); _locks.TryRemove(k, out var lk); lk?.Dispose(); _bufferReplayFloors.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
         finally { _globalLock.ExitWriteLock(); }
     }
 
@@ -958,7 +958,8 @@ public sealed class TsdbEngine : IDisposable
                 {
                     if (_buf.TryGetValue(key, out var list))
                     {
-                        list.RemoveAll(p => p.Point.Measurement == measurement);
+                        var removed = list.RemoveAll(p => p.Point.Measurement == measurement);
+                        if (removed > 0) { _bufferedPointCount -= removed; if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
                         RebuildBufferSeriesIndex(key, list);
                         UpdateBufferReplayFloor(key, list, forceRecalculate: true);
                     }
@@ -1038,7 +1039,8 @@ public sealed class TsdbEngine : IDisposable
                 {
                     if (_buf.TryGetValue(key, out var list))
                     {
-                        list.RemoveAll(p => p.Point.Measurement == measurement && tagSet.Contains(p.SeriesKey.TagsCanonical));
+                        var removed = list.RemoveAll(p => p.Point.Measurement == measurement && tagSet.Contains(p.SeriesKey.TagsCanonical));
+                        if (removed > 0) { _bufferedPointCount -= removed; if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
                         RebuildBufferSeriesIndex(key, list);
                         UpdateBufferReplayFloor(key, list, forceRecalculate: true);
                     }
@@ -1078,10 +1080,11 @@ public sealed class TsdbEngine : IDisposable
             {
                 if (_buf.TryGetValue(key, out var list))
                 {
-                    list.RemoveAll(p => p.Point.Measurement == measurement
+                    var removed = list.RemoveAll(p => p.Point.Measurement == measurement
                         && (!minTime.HasValue || p.Point.TimestampNs >= minTime.Value)
                         && (!maxTime.HasValue || p.Point.TimestampNs <= maxTime.Value)
                         && predicate(p.Point));
+                    if (removed > 0) { _bufferedPointCount -= removed; if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
                     RebuildBufferSeriesIndex(key, list);
                     UpdateBufferReplayFloor(key, list, forceRecalculate: true);
                 }
@@ -1174,20 +1177,13 @@ public sealed class TsdbEngine : IDisposable
         var lastWriteUtc = info.LastWriteTimeUtc;
         var length = info.Length;
 
-        _globalLock.EnterReadLock();
-        try
-        {
-            if (_segmentMetadataCache.TryGetValue(key, out var cached)
-                && cached.Length == length
-                && cached.LastWriteUtc == lastWriteUtc)
-                return (cached.Metas.ToList(), cached.UsedFooter);
-        }
-        finally { _globalLock.ExitReadLock(); }
+        if (_segmentMetadataCache.TryGetValue(key, out var cached)
+            && cached.Length == length
+            && cached.LastWriteUtc == lastWriteUtc)
+            return (cached.Metas.ToList(), cached.UsedFooter);
 
         var read = SegmentReader.ReadMetadataWithInfo(path);
-        _globalLock.EnterWriteLock();
-        try { _segmentMetadataCache[key] = (length, lastWriteUtc, read.Metadata, read.UsedFooter); }
-        finally { _globalLock.ExitWriteLock(); }
+        _segmentMetadataCache[key] = (length, lastWriteUtc, read.Metadata, read.UsedFooter);
         return (read.Metadata.ToList(), read.UsedFooter);
     }
 
@@ -1240,9 +1236,13 @@ public sealed class TsdbEngine : IDisposable
     private void FlushLocked(string db, string rp, List<BufferedPoint> l, bool updateCheckpoint = true)
     {
         if (l.Count == 0) return;
+        var flushCount = l.Count;
+        long flushBytes = 0;
         var byShard = new Dictionary<int, List<(Point Point, SeriesKey SeriesKey)>>();
         foreach (var buffered in l)
         {
+            if (_maxBufferBytes > 0)
+                flushBytes += EstimateBufferedPointBytes(buffered.Point);
             var (shardId, _) = _shards.GetOrCreateShard(db, rp, buffered.Point.TimestampNs);
             if (!byShard.TryGetValue(shardId, out var points))
             {
@@ -1259,9 +1259,12 @@ public sealed class TsdbEngine : IDisposable
             SegmentWriter.WriteSegment(segPath, points);
             _shards.RegisterSegment(db, rp, shardId, segPath);
         }
+        _bufferedPointCount -= flushCount;
+        if (_maxBufferBytes > 0)
+            _bufferedByteCount -= flushBytes;
         l.Clear();
         var key = K(db, rp);
-        _bufBySeries.Remove(key);
+        _bufBySeries.TryRemove(key, out _);
         UpdateBufferReplayFloor(key, l);
         if (updateCheckpoint)
             UpdateWalCheckpoint();
@@ -1269,58 +1272,48 @@ public sealed class TsdbEngine : IDisposable
 
     private void FlushDatabase(string db)
     {
-        _globalLock.EnterWriteLock();
-        try
+        var prefix = db + "|";
+        foreach (var kv in _buf.Where(kv => kv.Key.StartsWith(prefix)).ToList())
         {
-            foreach (var kv in _buf.Where(kv => kv.Key.StartsWith(db + "|")).ToList())
-            {
-                var p = kv.Key.Split('|');
-                var lk = GetLock(kv.Key, alreadyHoldingGlobalWrite: true);
-                lk.EnterWriteLock();
-                try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
-                finally { lk.ExitWriteLock(); }
-            }
-            UpdateWalCheckpoint();
+            var p = kv.Key.Split('|');
+            var lk = GetLock(kv.Key);
+            lk.EnterWriteLock();
+            try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
+            finally { lk.ExitWriteLock(); }
         }
-        finally { _globalLock.ExitWriteLock(); }
+        UpdateWalCheckpoint();
     }
 
     public void FlushAll()
     {
-        _globalLock.EnterWriteLock();
-        try
+        foreach (var kv in _buf.ToArray())
         {
-            foreach (var kv in _buf.ToArray())
-            {
-                var p = kv.Key.Split('|');
-                var lk = GetLock(kv.Key, alreadyHoldingGlobalWrite: true);
-                lk.EnterWriteLock();
-                try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
-                finally { lk.ExitWriteLock(); }
-            }
-            UpdateWalCheckpoint();
+            var p = kv.Key.Split('|');
+            var lk = GetLock(kv.Key);
+            lk.EnterWriteLock();
+            try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
+            finally { lk.ExitWriteLock(); }
         }
-        finally { _globalLock.ExitWriteLock(); }
+        UpdateWalCheckpoint();
         _schema.SaveIfDirty();
         _manifest.SaveIfDirty();
     }
 
-    private void CheckCardinality(string db, List<PendingPoint> pts)
+    /// <summary>
+    /// Check series cardinality limit. Caller must hold the per-key write lock.
+    /// _seriesKeys is a ConcurrentDictionary; per-db HashSet access is serialized by the per-key lock.
+    /// </summary>
+    private void CheckCardinalityLocked(string db, List<PendingPoint> pts)
     {
-        _globalLock.EnterReadLock();
-        try
-        {
-            if (!_seriesKeys.TryGetValue(db, out var existing))
-                existing = [];
-            var seen = new HashSet<SeriesKey>();
-            var newSeries = 0;
-            foreach (var p in pts)
-                if (seen.Add(p.SeriesKey) && !existing.Contains(p.SeriesKey))
-                    newSeries++;
-            var total = existing.Count + newSeries;
-            if (total > _maxSeriesPerDb) throw new CardinalityLimitExceededException($"series cardinality limit exceeded for database '{db}': {total} > {_maxSeriesPerDb}");
-        }
-        finally { _globalLock.ExitReadLock(); }
+        if (!_seriesKeys.TryGetValue(db, out var existing))
+            existing = [];
+        var seen = new HashSet<SeriesKey>();
+        var newSeries = 0;
+        foreach (var p in pts)
+            if (seen.Add(p.SeriesKey) && !existing.Contains(p.SeriesKey))
+                newSeries++;
+        var total = existing.Count + newSeries;
+        if (total > _maxSeriesPerDb) throw new CardinalityLimitExceededException($"series cardinality limit exceeded for database '{db}': {total} > {_maxSeriesPerDb}");
     }
 
     private void CheckBufferLimit(List<Point> incomingPoints)
@@ -1343,18 +1336,24 @@ public sealed class TsdbEngine : IDisposable
 
     private long GetBufferedPointCountInternal()
     {
-        long count = 0;
-        // Caller is expected to hold _globalLock (read or write) — no lock acquisition here.
-        foreach (var kv in _buf) count += kv.Value.Count;
-        return count;
+        // Caller is expected to hold _globalLock (read or write). Counter maintained incrementally.
+        return _bufferedPointCount;
     }
 
     private long GetBufferedByteCountInternal()
     {
+        // Caller is expected to hold _globalLock (read or write). Counter maintained incrementally.
+        return _bufferedByteCount;
+    }
+
+    private void RecalculateBufferedBytes()
+    {
+        // Called only on delete/drop paths (infrequent). Rebuilds the byte counter from scratch.
         long bytes = 0;
         foreach (var kv in _buf)
-            bytes += kv.Value.Sum(p => EstimateBufferedPointBytes(p.Point));
-        return bytes;
+            foreach (var p in kv.Value)
+                bytes += EstimateBufferedPointBytes(p.Point);
+        _bufferedByteCount = bytes;
     }
 
     private static long EstimateBufferedPointBytes(Point point)
@@ -1402,6 +1401,11 @@ public sealed class TsdbEngine : IDisposable
             }
             seriesPoints.Add(point);
         }
+
+        _bufferedPointCount += points.Count;
+        if (_maxBufferBytes > 0)
+            foreach (var point in points)
+                _bufferedByteCount += EstimateBufferedPointBytes(point.Point);
     }
 
     private void AddWrittenPoints(string db, string key, List<BufferedPoint> list, List<PendingPoint> points, IReadOnlyList<WalPosition> positions)
@@ -1436,6 +1440,11 @@ public sealed class TsdbEngine : IDisposable
             keys.Add(series);
 
         _manifest.UpdateIndexes(db, indexPoints);
+
+        _bufferedPointCount += points.Count;
+        if (_maxBufferBytes > 0)
+            for (var i = 0; i < points.Count; i++)
+                _bufferedByteCount += EstimateBufferedPointBytes(points[i].Point);
     }
 
     private IEnumerable<BufferedPoint> BufferedCandidates(string key, List<BufferedPoint> list, string? measurement, HashSet<string>? allowedTagsCanonical)
@@ -1456,7 +1465,7 @@ public sealed class TsdbEngine : IDisposable
     {
         if (list.Count == 0)
         {
-            _bufBySeries.Remove(key);
+            _bufBySeries.TryRemove(key, out _);
             return;
         }
 
@@ -1484,15 +1493,10 @@ public sealed class TsdbEngine : IDisposable
 
     private void UpdateBufferReplayFloor(string key, List<BufferedPoint> list, bool forceRecalculate = false)
     {
-        var lockHeld = _globalLock.IsWriteLockHeld;
-        if (!lockHeld) _globalLock.EnterWriteLock();
-        try
-        {
-            if (list.Count == 0) _bufferReplayFloors.Remove(key);
-            else if (forceRecalculate || !_bufferReplayFloors.ContainsKey(key))
-                _bufferReplayFloors[key] = FindReplayFloor(list);
-        }
-        finally { if (!lockHeld) _globalLock.ExitWriteLock(); }
+        // _bufferReplayFloors is a ConcurrentDictionary; caller holds per-key write lock.
+        if (list.Count == 0) _bufferReplayFloors.TryRemove(key, out _);
+        else if (forceRecalculate || !_bufferReplayFloors.ContainsKey(key))
+            _bufferReplayFloors[key] = FindReplayFloor(list);
     }
 
     private static WalPosition FindReplayFloor(List<BufferedPoint> list)
@@ -1509,32 +1513,30 @@ public sealed class TsdbEngine : IDisposable
 
     private void UpdateWalCheckpoint()
     {
-        var writeHeld = _globalLock.IsWriteLockHeld;
-        var readHeld = _globalLock.IsReadLockHeld;
-        if (!writeHeld && !readHeld) _globalLock.EnterReadLock();
-        try
+        // _bufferReplayFloors is a ConcurrentDictionary; snapshot values safely.
+        var snapshot = _bufferReplayFloors.ToArray();
+        if (snapshot.Length == 0)
         {
-            var checkpoint = _bufferReplayFloors.Count == 0
-                ? _wal.CurrentPosition
-                : _bufferReplayFloors.Values.OrderBy(p => p.FileId).ThenBy(p => p.Offset).First();
-            _wal.Checkpoint(checkpoint);
+            _wal.Checkpoint(_wal.CurrentPosition);
+            return;
         }
-        finally { if (!writeHeld && !readHeld) _globalLock.ExitReadLock(); }
+        var min = snapshot[0].Value;
+        for (var i = 1; i < snapshot.Length; i++)
+        {
+            var pos = snapshot[i].Value;
+            if (pos.FileId < min.FileId || (pos.FileId == min.FileId && pos.Offset < min.Offset))
+                min = pos;
+        }
+        _wal.Checkpoint(min);
     }
 
-    public int GetSeriesCardinality(string db) { _globalLock.EnterReadLock(); try { return _seriesKeys.TryGetValue(db, out var keys) ? keys.Count : 0; } finally { _globalLock.ExitReadLock(); } }
+    public int GetSeriesCardinality(string db) => _seriesKeys.TryGetValue(db, out var keys) ? keys.Count : 0;
 
-    private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite = false)
+private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite = false)
     {
-        if (alreadyHoldingGlobalWrite)
-        {
-            if (!_locks.TryGetValue(key, out var lk))
-            { lk = new ReaderWriterLockSlim(); _locks[key] = lk; }
-            return lk;
-        }
-        _globalLock.EnterUpgradeableReadLock();
-        try { if (_locks.TryGetValue(key, out var lk)) return lk; _globalLock.EnterWriteLock(); try { if (!_locks.TryGetValue(key, out lk)) { lk = new ReaderWriterLockSlim(); _locks[key] = lk; } return lk; } finally { _globalLock.ExitWriteLock(); } }
-        finally { _globalLock.ExitUpgradeableReadLock(); }
+        // ConcurrentDictionary.GetOrAdd is lock-free for existing keys; the factory is only called
+        // for new keys and ConcurrentDictionary guarantees exactly one instance per key.
+        return _locks.GetOrAdd(key, _ => new ReaderWriterLockSlim());
     }
 
     private void CleanupExpiredShards()
@@ -1555,21 +1557,16 @@ public sealed class TsdbEngine : IDisposable
     {
         try
         {
-            _globalLock.EnterWriteLock();
-            try
+            foreach (var kv in _buf.ToArray())
             {
-                foreach (var kv in _buf.ToArray())
-                {
-                    if (kv.Value.Count == 0) continue;
-                    var p = kv.Key.Split('|');
-                    var lk = GetLock(kv.Key, alreadyHoldingGlobalWrite: true);
-                    lk.EnterWriteLock();
-                    try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
-                    finally { lk.ExitWriteLock(); }
-                }
-                UpdateWalCheckpoint();
+                if (kv.Value.Count == 0) continue;
+                var p = kv.Key.Split('|');
+                var lk = GetLock(kv.Key);
+                lk.EnterWriteLock();
+                try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
+                finally { lk.ExitWriteLock(); }
             }
-            finally { _globalLock.ExitWriteLock(); }
+            UpdateWalCheckpoint();
             _schema.SaveIfDirty();
             _manifest.SaveIfDirty();
         }

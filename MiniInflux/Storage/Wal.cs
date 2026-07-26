@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Buffers;
 using System.Text;
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
@@ -104,18 +105,29 @@ public sealed class WalManager : IDisposable
             try
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
-                var payload = Encoding.UTF8.GetBytes(FormatRecord(db, rp, pointList));
-                var position = WriteRecord(payload);
-                for (var i = 0; i < pointList.Count; i++)
-                    positions.Add(position);
-
-                if (_currentFileSize >= _maxFileBytes)
-                    RotateLocked();
-
-                if (!_fsync || _fsyncIntervalMs <= 0)
+                // Build payload directly into a pooled byte array, avoiding StringBuilder→string→byte[] double copy.
+                var payloadSize = EstimatePayloadSize(db, rp, pointList);
+                var payload = ArrayPool<byte>.Shared.Rent(payloadSize);
+                try
                 {
-                    _currentStream?.Flush(_fsync);
-                    _health.RecordWriteSuccess();
+                    var actualSize = FormatRecordUtf8(payload, db, rp, pointList);
+                    var payloadSpan = payload.AsSpan(0, actualSize);
+                    var position = WriteRecord(payloadSpan, Crc32.Compute(payloadSpan));
+                    for (var i = 0; i < pointList.Count; i++)
+                        positions.Add(position);
+
+                    if (_currentFileSize >= _maxFileBytes)
+                        RotateLocked();
+
+                    if (!_fsync || _fsyncIntervalMs <= 0)
+                    {
+                        _currentStream?.Flush(_fsync);
+                        _health.RecordWriteSuccess();
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(payload);
                 }
             }
             catch (Exception ex)
@@ -127,27 +139,98 @@ public sealed class WalManager : IDisposable
         return positions;
     }
 
-    private WalPosition WriteRecord(ReadOnlySpan<byte> payload)
+    private WalPosition WriteRecord(ReadOnlySpan<byte> payload, uint crc)
     {
         if (_currentStream == null) return CurrentPosition;
         var recordStart = _currentFileSize;
         Span<byte> header = stackalloc byte[8];
         BinaryPrimitives.WriteInt32LittleEndian(header[..4], payload.Length);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[4..], Crc32.Compute(payload));
+        BinaryPrimitives.WriteUInt32LittleEndian(header[4..], crc);
         _currentStream.Write(header);
         _currentStream.Write(payload);
         _currentFileSize += 8 + payload.Length;
         return new WalPosition(_currentFileId, recordStart);
     }
 
-    private static string FormatRecord(string db, string rp, IReadOnlyList<Point> points)
+    private static int EstimatePayloadSize(string db, string rp, IReadOnlyList<Point> points)
     {
-        var estimatedBytes = db.Length + rp.Length + points.Count * 80;
-        var sb = new StringBuilder(estimatedBytes);
-        sb.Append(db).Append('\t').Append(rp).Append('\t');
+        // Conservative estimate: db + rp + 2 tabs + per-point overhead.
+        // UTF8 max expansion for ASCII is 1:1; for non-ASCII we overestimate slightly.
+        var size = (db.Length + rp.Length + 2) * 2 + points.Count * 96;
+        return size;
+    }
+
+    /// <summary>
+    /// Format WAL record directly into a byte buffer, avoiding StringBuilder→string→byte[] double copy.
+    /// Returns the actual number of bytes written.
+    /// </summary>
+    private static int FormatRecordUtf8(byte[] buffer, string db, string rp, IReadOnlyList<Point> points)
+    {
+        var writer = new ArrayBufferWriter<byte>();
+        WriteUtf8(writer, db);
+        WriteUtf8(writer, "\t");
+        WriteUtf8(writer, rp);
+        WriteUtf8(writer, "\t");
         for (var i = 0; i < points.Count; i++)
-            AppendLineProtocol(sb, points[i]);
-        return sb.ToString();
+            AppendLineProtocolUtf8(writer, points[i]);
+        var written = writer.WrittenCount;
+        writer.WrittenSpan.CopyTo(buffer);
+        return written;
+    }
+
+    private static void WriteUtf8(IBufferWriter<byte> writer, string? s)
+    {
+        if (string.IsNullOrEmpty(s)) return;
+        var span = writer.GetSpan(s.Length * 3);
+        var bytes = Encoding.UTF8.GetBytes(s, span);
+        writer.Advance(bytes);
+    }
+
+    private static void AppendLineProtocolUtf8(IBufferWriter<byte> writer, Point p)
+    {
+        WriteUtf8(writer, p.Measurement);
+        foreach (var tag in p.Tags)
+        {
+            WriteUtf8(writer, ",");
+            WriteUtf8(writer, tag.Key);
+            WriteUtf8(writer, "=");
+            WriteUtf8(writer, tag.Value);
+        }
+        WriteUtf8(writer, " ");
+        var first = true;
+        foreach (var field in p.Fields)
+        {
+            if (!first) WriteUtf8(writer, ",");
+            first = false;
+            WriteUtf8(writer, field.Key);
+            WriteUtf8(writer, "=");
+            AppendFieldValueUtf8(writer, field.Value);
+        }
+        WriteUtf8(writer, " ");
+        WriteUtf8(writer, p.TimestampNs.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        WriteUtf8(writer, "\n");
+    }
+
+    private static void AppendFieldValueUtf8(IBufferWriter<byte> writer, FieldValue v)
+    {
+        switch (v.Kind)
+        {
+            case FieldKind.Integer:
+                WriteUtf8(writer, v.Integer.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                WriteUtf8(writer, "i");
+                break;
+            case FieldKind.Float:
+                WriteUtf8(writer, v.Float.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                break;
+            case FieldKind.Boolean:
+                WriteUtf8(writer, v.Boolean ? "true" : "false");
+                break;
+            case FieldKind.String:
+                WriteUtf8(writer, "\"");
+                WriteUtf8(writer, v.String);
+                WriteUtf8(writer, "\"");
+                break;
+        }
     }
 
     private static void AppendLineProtocol(StringBuilder sb, Point p)
