@@ -279,6 +279,37 @@ public class InfluxQlParserTests
     }
 
     [Fact]
+    public void Parse_SelectWithOrTagFilter_ParsesOrFilterGroups()
+    {
+        var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE host = 'server01' OR host = 'server02'");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.True(query.HasOrFilters);
+        Assert.Equal(2, query.OrTagFilterGroups.Count);
+        Assert.Equal("host", query.OrTagFilterGroups[0][0].Key);
+        Assert.Equal("server01", query.OrTagFilterGroups[0][0].Value);
+        Assert.Equal("host", query.OrTagFilterGroups[1][0].Key);
+        Assert.Equal("server02", query.OrTagFilterGroups[1][0].Value);
+        Assert.Empty(query.TagFilters);
+    }
+
+    [Fact]
+    public void Parse_SelectWithOrAndAndTagFilters_ParsesCorrectly()
+    {
+        var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE host = 'server01' OR host = 'server2' AND region = 'us'");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.True(query.HasOrFilters);
+        Assert.Equal(2, query.OrTagFilterGroups.Count);
+        // First group: host = 'server01'
+        Assert.Single(query.OrTagFilterGroups[0]);
+        Assert.Equal("host", query.OrTagFilterGroups[0][0].Key);
+        Assert.Equal("server01", query.OrTagFilterGroups[0][0].Value);
+        // Second group: host = 'server2' AND region = 'us'
+        Assert.Equal(2, query.OrTagFilterGroups[1].Count);
+    }
+
+    [Fact]
     public void Parse_CreateContinuousQuery_ParsesDefinition()
     {
         var query = InfluxQlParser.Parse("CREATE CONTINUOUS QUERY cq_cpu ON metrics RESAMPLE EVERY 10s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");

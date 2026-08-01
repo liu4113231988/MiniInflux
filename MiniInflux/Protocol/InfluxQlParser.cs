@@ -42,6 +42,17 @@ public sealed class ParsedQuery
     public string? TagKey { get; init; }
     public List<TagFilter> TagFilters { get; init; } = [];
     public List<FieldFilter> FieldFilters { get; init; } = [];
+
+    /// <summary>
+    /// Groups of tag filters connected by OR logic.
+    /// Each group is a list of AND-connected filters.
+    /// If a point matches ANY group, it passes the OR filter.
+    /// Example: tag='a' OR tag='b' AND tag2='c' becomes:
+    ///   Group 1: [tag='a']
+    ///   Group 2: [tag='b', tag2='c']
+    /// </summary>
+    public List<List<TagFilter>> OrTagFilterGroups { get; init; } = [];
+    public bool HasOrFilters { get; init; }
     public string? RpName { get; init; }
     public long? RpDurationNs { get; init; }
     public bool? RpDefault { get; init; }
@@ -226,12 +237,13 @@ public static class InfluxQlParser
         var rest = q["DELETE FROM ".Length..].Trim();
         var target = ParseQualifiedMeasurement(ReadToken(ref rest));
         long? min = null, max = null;
-        var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
-        var upper = rest.ToUpperInvariant(); var wi = upper.IndexOf(" WHERE ");
-        if (wi >= 0) ParseWhere(rest[(wi + 7)..], out min, out max, tagFilters, fieldFilters);
-        return new() { Kind = QueryKind.Delete, Measurement = target.Measurement,
-            SourceDatabase = target.Database, SourceRpName = target.RetentionPolicy,
-            MinTimeNs = min, MaxTimeNs = max, TagFilters = tagFilters, FieldFilters = fieldFilters };
+var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
+var orGroups = new List<List<TagFilter>>(); var hasOr = false;
+var upper = rest.ToUpperInvariant(); var wi = upper.IndexOf(" WHERE ");
+if (wi >= 0) ParseWhere(rest[(wi + 7)..], out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr);
+return new() { Kind = QueryKind.Delete, Measurement = target.Measurement,
+SourceDatabase = target.Database, SourceRpName = target.RetentionPolicy,
+MinTimeNs = min, MaxTimeNs = max, TagFilters = tagFilters, FieldFilters = fieldFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
     }
 
     static ParsedQuery ParseDropSeries(string q)
@@ -240,6 +252,7 @@ public static class InfluxQlParser
         var measurements = new List<string>();
         long? min = null, max = null;
         var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
+        var orGroups = new List<List<TagFilter>>(); var hasOr = false;
 
         if (rest.StartsWith("FROM ", StringComparison.OrdinalIgnoreCase))
         {
@@ -251,17 +264,19 @@ public static class InfluxQlParser
             measurements = SplitMeasurementList(measurementText);
         }
 
-        var upper = rest.ToUpperInvariant(); var wi = upper.IndexOf(" WHERE ");
-        if (wi >= 0) ParseWhere(rest[(wi + 7)..], out min, out max, tagFilters, fieldFilters);
-        return new()
-        {
-            Kind = QueryKind.DropSeries,
+var upper = rest.ToUpperInvariant(); var wi = upper.IndexOf(" WHERE ");
+if (wi >= 0) ParseWhere(rest[(wi + 7)..], out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr);
+return new()
+{
+Kind = QueryKind.DropSeries,
             Measurement = measurements.FirstOrDefault(),
             Measurements = measurements,
             MinTimeNs = min,
             MaxTimeNs = max,
             TagFilters = tagFilters,
-            FieldFilters = fieldFilters
+            FieldFilters = fieldFilters,
+            OrTagFilterGroups = orGroups,
+            HasOrFilters = hasOr
         };
     }
 
@@ -311,9 +326,10 @@ public static class InfluxQlParser
         var tu = tail.ToUpperInvariant();
         bool desc = tu.Contains(" ORDER BY TIME DESC");
         var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
+        var orGroups = new List<List<TagFilter>>(); var hasOr = false;
         var groupByTags = new List<string>(); var groupByAllTags = false; var fill = FillMode.None;
         int wi = tu.IndexOf(" WHERE ");
-        if (wi >= 0) { var end = EndClause(tu, wi + 7); ParseWhere(tail[(wi + 7)..end], out min, out max, tagFilters, fieldFilters); }
+        if (wi >= 0) { var end = EndClause(tu, wi + 7); ParseWhere(tail[(wi + 7)..end], out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr); }
         var gu = tu.IndexOf(" GROUP BY ");
         if (gu >= 0) { var gs = gu + 10; var ge = EndClause(tu, gs); ParseGroupBy(tail[gs..ge].Trim(), out gb, groupByTags, out groupByAllTags); }
         var fu = tu.IndexOf(" FILL(");
@@ -330,7 +346,7 @@ public static class InfluxQlParser
         return new() { Kind = QueryKind.Select, Measurement = measurement, Subquery = subquery, SourceDatabase = sourceDb, SourceRpName = sourceRp, Select = ParseItems(fieldText),
             MinTimeNs = min, MaxTimeNs = max, Limit = limit, Desc = desc, GroupByNs = gb,
             Offset = offset, SeriesLimit = slimit, SeriesOffset = soffset,
-            GroupByTags = groupByTags, GroupByAllTags = groupByAllTags, Fill = fill, TagFilters = tagFilters, FieldFilters = fieldFilters, IntoTarget = intoTarget };
+            GroupByTags = groupByTags, GroupByAllTags = groupByAllTags, Fill = fill, TagFilters = tagFilters, FieldFilters = fieldFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr, IntoTarget = intoTarget };
     }
 
     static void ParseGroupBy(string text, out long? gbNs, List<string> tags, out bool groupByAllTags)
@@ -346,38 +362,85 @@ public static class InfluxQlParser
         }
     }
 
-    static void ParseWhere(string where, out long? min, out long? max, List<TagFilter> tagFilters, List<FieldFilter> fieldFilters)
+    static void ParseWhere(string where, out long? min, out long? max, List<TagFilter> tagFilters, List<FieldFilter> fieldFilters, out List<List<TagFilter>> orGroups, out bool hasOr)
     {
         min = null; max = null;
+        orGroups = [];
+        hasOr = false;
+
+        // Split by OR at top level first
+        var orBranches = SplitTopLevelOrClauses(where);
+
+        if (orBranches.Count > 1)
+        {
+            hasOr = true;
+            // Each branch becomes a separate AND-group
+            foreach (var branch in orBranches)
+            {
+                var group = new List<TagFilter>();
+                foreach (var raw in SplitTopLevelAndClauses(branch))
+                {
+                    var p = raw.Trim();
+                    if (TryParseTimeFilter(p, out var newMin, out var newMax))
+                    {
+                        if (newMin.HasValue) min = newMin;
+                        if (newMax.HasValue) max = newMax;
+                        continue;
+                    }
+                    TryParseFilter(p, group, fieldFilters);
+                }
+                if (group.Count > 0)
+                    orGroups.Add(group);
+            }
+            return;
+        }
+
+        // No OR - use original AND-only parsing
         foreach (var raw in SplitTopLevelAndClauses(where))
         {
             var p = raw.Trim();
-            if (p.StartsWith("time", StringComparison.OrdinalIgnoreCase))
+            if (TryParseTimeFilter(p, out var newMin, out var newMax))
             {
-                if (p.Contains(">=")) min = ParseTime(p.Split(">=")[1]);
-                else if (p.Contains("<=")) max = ParseTime(p.Split("<=")[1]);
-                else if (p.Contains('>')) min = ParseTime(p.Split('>')[1]) + 1;
-                else if (p.Contains('<')) max = ParseTime(p.Split('<')[1]) - 1;
+                if (newMin.HasValue) min = newMin;
+                if (newMax.HasValue) max = newMax;
                 continue;
             }
-            if (p.Contains("=~")) { var parts = p.Split("=~", 2); tagFilters.Add(new TagFilter(Unq(parts[0].Trim()), ExtractRegex(parts[1].Trim()), TagOp.Regex)); continue; }
-            if (p.Contains("!~")) { var parts = p.Split("!~", 2); tagFilters.Add(new TagFilter(Unq(parts[0].Trim()), ExtractRegex(parts[1].Trim()), TagOp.NotRegex)); continue; }
-            if (p.Contains("!="))
-            {
-                var parts = p.Split("!=", 2); var key = Unq(parts[0].Trim()); var val = Unq(parts[1].Trim().Trim('\''));
-                if (double.TryParse(val, NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(key, nv, FieldOp.Neq));
-                else tagFilters.Add(new TagFilter(key, val, TagOp.Neq)); continue;
-            }
-            if (p.Contains(">=")) { var parts = p.Split(">=", 2); if (double.TryParse(Unq(parts[1].Trim().Trim('\'')), NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(Unq(parts[0].Trim()), nv, FieldOp.Gte)); continue; }
-            if (p.Contains("<=")) { var parts = p.Split("<=", 2); if (double.TryParse(Unq(parts[1].Trim().Trim('\'')), NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(Unq(parts[0].Trim()), nv, FieldOp.Lte)); continue; }
-            if (p.Contains('>')) { var parts = p.Split('>', 2); if (double.TryParse(Unq(parts[1].Trim().Trim('\'')), NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(Unq(parts[0].Trim()), nv, FieldOp.Gt)); continue; }
-            if (p.Contains('<')) { var parts = p.Split('<', 2); if (double.TryParse(Unq(parts[1].Trim().Trim('\'')), NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(Unq(parts[0].Trim()), nv, FieldOp.Lt)); continue; }
-            if (p.Contains('='))
-            {
-                var parts = p.Split('=', 2); var key = Unq(parts[0].Trim()); var val = Unq(parts[1].Trim().Trim('\''));
-                if (double.TryParse(val, NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(key, nv, FieldOp.Eq));
-                else tagFilters.Add(new TagFilter(key, val, TagOp.Eq));
-            }
+            TryParseFilter(p, tagFilters, fieldFilters);
+        }
+    }
+
+    static bool TryParseTimeFilter(string p, out long? min, out long? max)
+    {
+        min = null; max = null;
+        if (!p.StartsWith("time", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (p.Contains(">=")) min = ParseTime(p.Split(">=")[1]);
+        else if (p.Contains("<=")) max = ParseTime(p.Split("<=")[1]);
+        else if (p.Contains('>')) min = ParseTime(p.Split('>')[1]) + 1;
+        else if (p.Contains('<')) max = ParseTime(p.Split('<')[1]) - 1;
+        return true;
+    }
+
+    static void TryParseFilter(string p, List<TagFilter> tagFilters, List<FieldFilter> fieldFilters)
+    {
+        if (p.Contains("=~")) { var parts = p.Split("=~", 2); tagFilters.Add(new TagFilter(Unq(parts[0].Trim()), ExtractRegex(parts[1].Trim()), TagOp.Regex)); return; }
+        if (p.Contains("!~")) { var parts = p.Split("!~", 2); tagFilters.Add(new TagFilter(Unq(parts[0].Trim()), ExtractRegex(parts[1].Trim()), TagOp.NotRegex)); return; }
+        if (p.Contains("!="))
+        {
+            var parts = p.Split("!=", 2); var key = Unq(parts[0].Trim()); var val = Unq(parts[1].Trim().Trim('\''));
+            if (double.TryParse(val, NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(key, nv, FieldOp.Neq));
+            else tagFilters.Add(new TagFilter(key, val, TagOp.Neq)); return;
+        }
+        if (p.Contains(">=")) { var parts = p.Split(">=", 2); if (double.TryParse(Unq(parts[1].Trim().Trim('\'')), NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(Unq(parts[0].Trim()), nv, FieldOp.Gte)); return; }
+        if (p.Contains("<=")) { var parts = p.Split("<=", 2); if (double.TryParse(Unq(parts[1].Trim().Trim('\'')), NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(Unq(parts[0].Trim()), nv, FieldOp.Lte)); return; }
+        if (p.Contains('>')) { var parts = p.Split('>', 2); if (double.TryParse(Unq(parts[1].Trim().Trim('\'')), NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(Unq(parts[0].Trim()), nv, FieldOp.Gt)); return; }
+        if (p.Contains('<')) { var parts = p.Split('<', 2); if (double.TryParse(Unq(parts[1].Trim().Trim('\'')), NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(Unq(parts[0].Trim()), nv, FieldOp.Lt)); return; }
+        if (p.Contains('='))
+        {
+            var parts = p.Split('=', 2); var key = Unq(parts[0].Trim()); var val = Unq(parts[1].Trim().Trim('\''));
+            if (double.TryParse(val, NumberStyles.Any, CultureInfo.InvariantCulture, out var nv)) fieldFilters.Add(new FieldFilter(key, nv, FieldOp.Eq));
+            else tagFilters.Add(new TagFilter(key, val, TagOp.Eq));
         }
     }
 
@@ -666,6 +729,82 @@ public static class InfluxQlParser
                         clauses.Add(clause);
                     start = i + 3;
                     i += 2;
+                }
+            }
+        }
+
+        var tail = text[start..].Trim();
+        if (tail.Length > 0)
+            clauses.Add(tail);
+        return clauses;
+    }
+
+    /// <summary>
+    /// Split WHERE clause by OR at top level (not inside quotes, parens, or regex).
+    /// </summary>
+    static List<string> SplitTopLevelOrClauses(string text)
+    {
+        var clauses = new List<string>();
+        int depth = 0;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+        bool inRegex = false;
+        int start = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (inRegex)
+            {
+                if (ch == '/' && (i == 0 || text[i - 1] != '\\'))
+                    inRegex = false;
+                continue;
+            }
+
+            if (ch == '\'' && !inDoubleQuote)
+            {
+                inSingleQuote = !inSingleQuote;
+                continue;
+            }
+
+            if (ch == '"' && !inSingleQuote)
+            {
+                inDoubleQuote = !inDoubleQuote;
+                continue;
+            }
+
+            if (inSingleQuote || inDoubleQuote)
+                continue;
+
+            if (ch == '(')
+            {
+                depth++;
+                continue;
+            }
+
+            if (ch == ')')
+            {
+                depth--;
+                continue;
+            }
+
+            if (ch == '/' && i > 0 && (text[i - 1] == '~' || text[i - 1] == '!'))
+            {
+                inRegex = true;
+                continue;
+            }
+
+            // Check for OR at top level
+            if (depth == 0 && i + 2 <= text.Length && text.AsSpan(i, 2).Equals("OR".AsSpan(), StringComparison.OrdinalIgnoreCase))
+            {
+                var leftBoundary = i == 0 || char.IsWhiteSpace(text[i - 1]);
+                var rightBoundary = i + 2 == text.Length || char.IsWhiteSpace(text[i + 2]);
+                if (leftBoundary && rightBoundary)
+                {
+                    var clause = text[start..i].Trim();
+                    if (clause.Length > 0)
+                        clauses.Add(clause);
+                    start = i + 2;
+                    i += 1;
                 }
             }
         }

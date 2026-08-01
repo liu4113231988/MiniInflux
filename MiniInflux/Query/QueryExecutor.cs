@@ -451,7 +451,7 @@ public sealed class QueryExecutor
             report.ScannedPoints = scanned;
             report.EstimatedInputBytes += EstimatePointBytes(point);
 
-            if (!MatchesTagFilters(point, q.TagFilters) || !MatchesFieldFilters(point, q.FieldFilters))
+            if (!PassesTagFilters(point, q) || !MatchesFieldFilters(point, q.FieldFilters))
                 continue;
 
             if (skipped < offset)
@@ -834,6 +834,7 @@ public sealed class QueryExecutor
 
         cancellationToken.ThrowIfCancellationRequested();
         if (!tagFiltersApplied) pts = ApplyTagFilters(pts, q.TagFilters);
+        if (!tagFiltersApplied && q.HasOrFilters) pts = ApplyOrTagFilters(pts, q.OrTagFilterGroups);
         cancellationToken.ThrowIfCancellationRequested();
         pts = ApplyFieldFilters(pts, q.FieldFilters);
         if (q.Desc && !pointsAreDescending) pts.Reverse();
@@ -1095,7 +1096,7 @@ public sealed class QueryExecutor
                 EnsureQueryPointLimit(scanned);
             report.ScannedPoints = scanned;
             report.EstimatedInputBytes += EstimatePointBytes(point);
-            if (!MatchesTagFilters(point, q.TagFilters) || !MatchesFieldFilters(point, q.FieldFilters))
+            if (!PassesTagFilters(point, q) || !MatchesFieldFilters(point, q.FieldFilters))
                 continue;
 
             var tagKey = BuildGroupByTagKey(point.Tags, q.GroupByTags, q.GroupByAllTags);
@@ -1375,40 +1376,50 @@ public sealed class QueryExecutor
 
     HashSet<string>? BuildSeriesFilter(TsdbEngine e, string db, ParsedQuery q, QueryExecutionReport report)
     {
-        if (string.IsNullOrWhiteSpace(q.Measurement) || q.TagFilters.Count == 0)
+        if (string.IsNullOrWhiteSpace(q.Measurement))
             return null;
 
         var fieldKeys = e.ListFieldKeys(db, q.Measurement)
             .ToDictionary(f => f.Field, f => f.Kind, StringComparer.Ordinal);
+
+        // For OR filters, build a union of all matching series from each OR group
+        if (q.HasOrFilters)
+        {
+            var allSeries = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var group in q.OrTagFilterGroups)
+            {
+                HashSet<string>? groupMatches = null;
+                foreach (var filter in group)
+                {
+                    var matches = GetMatchingSeries(e, db, q.Measurement, filter, fieldKeys);
+                    if (matches == null)
+                    {
+                        groupMatches = null;
+                        break; // This group has an unmatched filter, skip it
+                    }
+                    if (groupMatches == null)
+                        groupMatches = new HashSet<string>(matches, StringComparer.Ordinal);
+                    else
+                        groupMatches.IntersectWith(matches);
+                }
+                if (groupMatches != null)
+                    allSeries.UnionWith(groupMatches);
+            }
+            if (allSeries.Count > 0)
+            {
+                report.UsedSeriesIndexPushdown = true;
+                return allSeries;
+            }
+            return null;
+        }
+
+        if (q.TagFilters.Count == 0)
+            return null;
+
         HashSet<string>? candidates = null;
         foreach (var filter in q.TagFilters)
         {
-            // A quoted string predicate can target a string field. Do not apply tag-index pushdown when ambiguous.
-            if (fieldKeys.TryGetValue(filter.Key, out var fieldKind))
-            {
-                // String field always ambiguous with tag values.
-                if (fieldKind == FieldKind.String)
-                    continue;
-
-                // For numeric fields (Float/Integer/Boolean): only skip pushdown if the filter value
-                // could actually be parsed as that numeric type (ambiguous case).
-                // Non-numeric strings like "00HAA10AA311XQ05.OUT" can never equal a numeric field value,
-                // so tag-index pushdown remains correct and safe.
-                if (CanStringMatchNumericField(filter.Value, fieldKind))
-                    continue;
-            }
-
-            IReadOnlyList<string>? matches = filter.Op switch
-            {
-                TagOp.Eq => e.GetSeriesForTagValue(db, q.Measurement, filter.Key, filter.Value),
-                TagOp.Neq => e.GetSeriesForTagKey(db, q.Measurement, filter.Key)
-                    .Except(e.GetSeriesForTagValue(db, q.Measurement, filter.Key, filter.Value), StringComparer.Ordinal)
-                    .ToArray(),
-                TagOp.Regex => e.GetSeriesForTagRegex(db, q.Measurement, filter.Key, filter.Value),
-                TagOp.NotRegex => e.GetSeriesForTagRegex(db, q.Measurement, filter.Key, filter.Value, negate: true),
-                _ => null
-            };
-
+            var matches = GetMatchingSeries(e, db, q.Measurement, filter, fieldKeys);
             if (matches == null) continue;
             report.UsedSeriesIndexPushdown = true;
             if (filter.Op is TagOp.Regex or TagOp.NotRegex) report.UsedRegexPushdown = true;
@@ -1420,6 +1431,39 @@ public sealed class QueryExecutor
         }
 
         return candidates;
+    }
+
+    /// <summary>
+    /// Get matching series for a single tag filter, handling field ambiguity checks.
+    /// Returns null if the filter cannot be resolved (ambiguous with field).
+    /// </summary>
+    static IReadOnlyList<string>? GetMatchingSeries(TsdbEngine e, string db, string measurement, TagFilter filter, Dictionary<string, FieldKind> fieldKeys)
+    {
+        // A quoted string predicate can target a string field. Do not apply tag-index pushdown when ambiguous.
+        if (fieldKeys.TryGetValue(filter.Key, out var fieldKind))
+        {
+            // String field always ambiguous with tag values.
+            if (fieldKind == FieldKind.String)
+                return null;
+
+            // For numeric fields (Float/Integer/Boolean): only skip pushdown if the filter value
+            // could actually be parsed as that numeric type (ambiguous case).
+            // Non-numeric strings like "00HAA10AA311XQ05.OUT" can never equal a numeric field value,
+            // so tag-index pushdown remains correct and safe.
+            if (CanStringMatchNumericField(filter.Value, fieldKind))
+                return null;
+        }
+
+        return filter.Op switch
+        {
+            TagOp.Eq => e.GetSeriesForTagValue(db, measurement, filter.Key, filter.Value),
+            TagOp.Neq => e.GetSeriesForTagKey(db, measurement, filter.Key)
+                .Except(e.GetSeriesForTagValue(db, measurement, filter.Key, filter.Value), StringComparer.Ordinal)
+                .ToArray(),
+            TagOp.Regex => e.GetSeriesForTagRegex(db, measurement, filter.Key, filter.Value),
+            TagOp.NotRegex => e.GetSeriesForTagRegex(db, measurement, filter.Key, filter.Value, negate: true),
+            _ => null
+        };
     }
 
     static bool CanStringMatchNumericField(string value, FieldKind fieldKind)
@@ -1993,6 +2037,12 @@ public sealed class QueryExecutor
     {
         if (filters.Count == 0) return pts;
         return pts.Where(point => MatchesTagFilters(point, filters)).ToList();
+    }
+
+    static List<Point> ApplyOrTagFilters(List<Point> pts, List<List<TagFilter>> orGroups)
+    {
+        if (orGroups.Count == 0) return pts;
+        return pts.Where(point => MatchesOrTagFilters(point, orGroups)).ToList();
     }
 
     static List<Point> ApplyFieldFilters(List<Point> pts, List<FieldFilter> filters)
@@ -3006,6 +3056,41 @@ public sealed class QueryExecutor
         }
         return true;
     }
+
+    /// <summary>
+    /// Match point against OR filter groups.
+    /// Returns true if the point matches ANY of the OR groups.
+    /// </summary>
+    static bool MatchesOrTagFilters(Point point, List<List<TagFilter>> orGroups)
+    {
+        if (orGroups.Count == 0) return true;
+        foreach (var group in orGroups)
+        {
+            if (MatchesTagFilters(point, group))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Check if a point passes the tag filters, handling both regular AND filters and OR filter groups.
+    /// </summary>
+    static bool PassesTagFilters(Point point, ParsedQuery q)
+    {
+        if (q.HasOrFilters)
+        {
+            // For OR filters: pass if no regular AND filters match OR any OR group matches
+            if (q.TagFilters.Count > 0 && !MatchesTagFilters(point, q.TagFilters))
+                return false;
+            return MatchesOrTagFilters(point, q.OrTagFilterGroups);
+        }
+        return MatchesTagFilters(point, q.TagFilters);
+    }
+
+    /// <summary>
+    /// Check if any tag filtering is needed (either regular or OR filters).
+    /// </summary>
+    static bool HasTagFilters(ParsedQuery q) => q.TagFilters.Count > 0 || q.OrTagFilterGroups.Count > 0;
 
     static bool MatchesFieldFilters(Point point, List<FieldFilter> filters)
     {
