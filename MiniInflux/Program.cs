@@ -28,7 +28,15 @@ if (cliExitCode.HasValue)
 }
 
 builder.Logging.ClearProviders();
-builder.Logging.SetMinimumLevel(ParseLogLevel(options.Logging.Level));
+var appLevel = ParseLogLevel(options.Logging.Level);
+var systemLevel = ParseLogLevel(options.Logging.SystemLevel);
+// Set default minimum level to the higher of the two
+builder.Logging.SetMinimumLevel(appLevel < systemLevel ? appLevel : systemLevel);
+// Apply separate levels for system vs application loggers
+builder.Logging.AddFilter("Microsoft", systemLevel);
+builder.Logging.AddFilter("Microsoft.AspNetCore", systemLevel);
+builder.Logging.AddFilter("Microsoft.Hosting", systemLevel);
+builder.Logging.AddFilter("System", systemLevel);
 if (options.Logging.ConsoleEnabled)
 {
     builder.Logging.AddSimpleConsole(console =>
@@ -45,7 +53,7 @@ if (!options.Http.Enabled)
 {
     var bootstrapLogger = LoggerFactory.Create(logging =>
     {
-        logging.SetMinimumLevel(ParseLogLevel(options.Logging.Level));
+        logging.SetMinimumLevel(appLevel);
         if (options.Logging.ConsoleEnabled)
             logging.AddSimpleConsole();
         if (options.Logging.FileEnabled)
@@ -125,8 +133,8 @@ if (!options.Tls.Enabled)
     runtimeLogger.LogWarning("TLS is disabled; HTTP traffic is unencrypted");
 if (tlsConfigurationMissing)
     runtimeLogger.LogWarning("TLS was requested but Tls.CertPath is missing or unreadable; TLS has been disabled");
-runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {BindAddress}, auth {AuthEnabled}, log level {LogLevel}",
-    Path.GetFullPath(options.DataPath), options.Http.BindAddress, options.Auth.Enabled, options.Logging.Level);
+runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {BindAddress}, auth {AuthEnabled}, app log level {AppLogLevel}, system log level {SystemLogLevel}",
+    Path.GetFullPath(options.DataPath), options.Http.BindAddress, options.Auth.Enabled, options.Logging.Level, options.Logging.SystemLevel);
 runtimeLogger.LogInformation("Performance tuning: adjust Write.QueueCapacity={QueueCapacity}, Write.BatchSize={BatchSize}, Storage.MaxBufferPoints={MaxBufferPoints}, Storage.MaxQueryDurationMs={MaxQueryDurationMs}, Storage.MaxQueryMemoryBytes={MaxQueryMemoryBytes}, and Wal.Fsync={WalFsync} as needed",
     options.Write.QueueCapacity, options.Write.BatchSize, options.Storage.MaxBufferPoints, options.Storage.MaxQueryDurationMs, options.Storage.MaxQueryMemoryBytes, options.Wal.Fsync);
 

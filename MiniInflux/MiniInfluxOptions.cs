@@ -54,6 +54,7 @@ public sealed class MiniInfluxOptions
             Logging = new LoggingOptions
             {
                 Level = ReadString(config, "Logging:Level", "Information")!,
+                SystemLevel = ReadString(config, "Logging:SystemLevel", "Warning")!,
                 ConsoleEnabled = ReadBool(config, true, "Logging:ConsoleEnabled"),
                 FileEnabled = ReadBool(config, false, "Logging:FileEnabled"),
                 FilePath = ReadString(config, "Logging:FilePath", "./logs/miniinflux.log")!,
@@ -220,7 +221,17 @@ public sealed class HttpOptions
 
 public sealed class LoggingOptions
 {
+    /// <summary>
+    /// Application log level (for MiniInflux.* loggers).
+    /// </summary>
     public string Level { get; init; } = "Information";
+
+    /// <summary>
+    /// System log level (for Microsoft.*, System.*, etc. loggers).
+    /// Defaults to Warning to reduce noise from framework components.
+    /// </summary>
+    public string SystemLevel { get; init; } = "Warning";
+
     public bool ConsoleEnabled { get; init; } = true;
     public bool FileEnabled { get; init; }
     public string FilePath { get; init; } = "./logs/miniinflux.log";
