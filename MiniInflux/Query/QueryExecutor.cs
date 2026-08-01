@@ -949,12 +949,10 @@ public sealed class QueryExecutor
         if (!q.Desc
             || q.Subquery != null
             || q.GroupByNs.HasValue
-            || q.GroupByTags.Count > 0
-            || q.GroupByAllTags
             || q.Select.Any(s => !string.IsNullOrEmpty(s.Func))
             || !string.IsNullOrWhiteSpace(q.IntoTarget)
             || string.IsNullOrWhiteSpace(q.Measurement)
-            || (seriesFilter == null && q.TagFilters.Count != 0)
+            || (seriesFilter == null && (q.TagFilters.Count != 0 || q.HasOrFilters))
             || q.FieldFilters.Count != 0)
             return null;
 
@@ -973,7 +971,7 @@ public sealed class QueryExecutor
         var columns = new List<string> { "time" };
         columns.AddRange(tagKeys);
         columns.AddRange(fields);
-        var rows = new List<(long Timestamp, List<object?> Row)>();
+        var rows = new List<(long Timestamp, List<object?> Row, string TagsCanonical)>();
         long resultBytes = EstimateRawSeriesShellBytes(resultMeasurement, columns);
         long inputBytes = 0;
         var scanned = 0;
@@ -1002,7 +1000,7 @@ public sealed class QueryExecutor
                         row.Add(tags.TryGetValue(tag, out var value) ? value : null);
                     foreach (var field in fields)
                         row.Add(point.Fields.TryGetValue(field, out var fv) ? fv.ToObject() : null);
-                    rows.Add((point.TimestampNs, row));
+                    rows.Add((point.TimestampNs, row, tagsCanonical));
                 }
                 continue;
             }
@@ -1018,17 +1016,17 @@ public sealed class QueryExecutor
                     row.Add(tags.TryGetValue(tag, out var value) ? value : null);
                 foreach (var value in read.Rows[i])
                     row.Add(value.HasValue ? value.Value.ToObject() : null);
-                rows.Add((read.Timestamps[i], row));
+                rows.Add((read.Timestamps[i], row, tagsCanonical));
             }
         }
 
-        var values = rows.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit).Select(row => row.Row).ToList();
-        foreach (var row in values)
-            resultBytes += 16 + row.Sum(EstimateObjectBytes);
+        var orderedRows = rows.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit).ToList();
+        foreach (var row in orderedRows)
+            resultBytes += 16 + row.Row.Sum(EstimateObjectBytes);
 
         report.UsedStreamingRawSelect = true;
         report.ScannedPoints += scanned;
-        report.RowsReturned = values.Count;
+        report.RowsReturned = orderedRows.Count;
         report.SegmentColumnsRead += segmentColumnsRead;
         report.PointsMaterialized = pointsMaterialized;
         report.LimitPushdownStopReason = usedFallbackForSeries ? "mixed-fallback" : (series.Count == 1 ? "segment-limit" : "series-limit");
@@ -1037,13 +1035,34 @@ public sealed class QueryExecutor
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, inputBytes + resultBytes);
         EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
 
+        // When GROUP BY tags is specified, return one series per tag value combination
+        if (q.GroupByTags.Count > 0 || q.GroupByAllTags)
+        {
+            var grouped = orderedRows.GroupBy(r => r.TagsCanonical, StringComparer.Ordinal);
+            var result = new List<QuerySeries>();
+            foreach (var group in grouped)
+            {
+                var groupTags = ParseTagsCanonical(group.Key);
+                var groupTagDict = new Dictionary<string, string>(groupTags, StringComparer.Ordinal);
+                result.Add(new QuerySeries
+                {
+                    Name = resultMeasurement,
+                    Tags = groupTagDict,
+                    Columns = columns,
+                    Values = group.Select(r => r.Row).ToList(),
+                    TagColumns = new HashSet<string>(tagKeys, StringComparer.Ordinal)
+                });
+            }
+            return result;
+        }
+
         return
         [
             new()
             {
                 Name = resultMeasurement,
                 Columns = columns,
-                Values = values,
+                Values = orderedRows.Select(r => r.Row).ToList(),
                 TagColumns = new HashSet<string>(tagKeys, StringComparer.Ordinal)
             }
         ];
@@ -1062,7 +1081,8 @@ public sealed class QueryExecutor
             || string.IsNullOrWhiteSpace(q.Measurement)
             || seriesFilter == null
             || seriesFilter.Count != 1
-            || q.FieldFilters.Count != 0)
+            || q.FieldFilters.Count != 0
+            || q.HasOrFilters)
             return null;
 
         var rowLimit = Math.Min(q.Limit ?? maxResponseRows, maxResponseRows);
