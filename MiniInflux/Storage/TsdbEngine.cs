@@ -772,7 +772,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null)
     {
         var fields = new Dictionary<string, BufferedFieldStats>(StringComparer.Ordinal);
-        var matchedPoints = 0;
+        long matchedPoints = 0;
         long maxTime = 0;
         var lk = GetLock(K(db, rp));
         lk.EnterReadLock();
@@ -847,7 +847,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         return new SegmentMetadataQueryResult(result, footerHits, fullReads);
     }
 
-    public sealed record PointCountResult(Dictionary<string, long> FieldCounts, long MaxTimestampNs, int ScannedPoints);
+    public sealed record PointCountResult(Dictionary<string, long> FieldCounts, long MaxTimestampNs, long ScannedPoints);
 
     /// <summary>
     /// Count non-null field values per field using timestamp-only reads (skips value block decoding).
@@ -898,7 +898,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         // Merge timestamps per (measurement, tags, field) using HashSet for last-write-wins deduplication.
         var fieldTsMap = new Dictionary<(string Measurement, string Tags, string Field), HashSet<long>>();
         var maxTime = 0L;
-        var scannedPoints = 0;
+        long scannedPoints = 0;
 
         foreach (var columns in bag)
         {
@@ -957,7 +957,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         // Aggregate unique timestamp counts per field.
         var result = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (var group in fieldTsMap.GroupBy(kv => kv.Key.Field, StringComparer.Ordinal))
-            result[group.Key] = group.Sum(kv => kv.Value.Count);
+            result[group.Key] = group.Sum(kv => (long)kv.Value.Count);
 
         if (result.Count == 0) return null;
 
@@ -1213,21 +1213,48 @@ return Interlocked.Read(ref _bufferedByteCount);
         return filtered;
     }
 
+    private long _metadataCacheHits;
+    private long _metadataCacheMisses;
+
     private (List<SegmentColumnMeta> Metas, bool UsedFooter) ReadSegmentMetadataCached(string path)
     {
-        var info = new FileInfo(path);
-        var key = info.FullName;
-        var lastWriteUtc = info.LastWriteTimeUtc;
-        var length = info.Length;
-
-        if (_segmentMetadataCache.TryGetValue(key, out var cached)
-            && cached.Length == length
-            && cached.LastWriteUtc == lastWriteUtc)
+        // Segment files are immutable once written - cache by path only, no FileInfo needed.
+        if (_segmentMetadataCache.TryGetValue(path, out var cached))
+        {
+            Interlocked.Increment(ref _metadataCacheHits);
             return (cached.Metas.ToList(), cached.UsedFooter);
+        }
 
+        Interlocked.Increment(ref _metadataCacheMisses);
         var read = SegmentReader.ReadMetadataWithInfo(path);
-        _segmentMetadataCache[key] = (length, lastWriteUtc, read.Metadata, read.UsedFooter);
+        var info = new FileInfo(path);
+        _segmentMetadataCache[path] = (info.Length, info.LastWriteTimeUtc, read.Metadata, read.UsedFooter);
         return (read.Metadata.ToList(), read.UsedFooter);
+    }
+
+    /// <summary>
+    /// Get cache statistics for diagnostics.
+    /// </summary>
+    public (long Hits, long Misses, int CachedCount) GetMetadataCacheStats() =>
+        (Interlocked.Read(ref _metadataCacheHits), Interlocked.Read(ref _metadataCacheMisses), _segmentMetadataCache.Count);
+
+    /// <pre>
+    /// Register segment metadata in the cache after a new segment is written.
+    /// This avoids the first query having to read the metadata from disk.
+    /// </pre>
+    internal void RegisterSegmentMetadata(string path)
+    {
+        var read = SegmentReader.ReadMetadataWithInfo(path);
+        var info = new FileInfo(path);
+        _segmentMetadataCache[path] = (info.Length, info.LastWriteTimeUtc, read.Metadata, read.UsedFooter);
+    }
+
+    /// <pre>
+    /// Remove segment metadata from the cache when a segment is deleted (compaction).
+    /// </pre>
+    internal void UnregisterSegmentMetadata(string path)
+    {
+        _segmentMetadataCache.TryRemove(path, out _);
     }
 
     private static bool Match(Point p, string? m, long? min, long? max) => (m == null || p.Measurement == m) && (!min.HasValue || p.TimestampNs >= min) && (!max.HasValue || p.TimestampNs <= max);
@@ -1301,6 +1328,8 @@ return Interlocked.Read(ref _bufferedByteCount);
             var segPath = Path.Combine(shardDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
             SegmentWriter.WriteSegment(segPath, points);
             _shards.RegisterSegment(db, rp, shardId, segPath);
+            // Pre-populate metadata cache so first query doesn't need to read from disk
+            RegisterSegmentMetadata(segPath);
         }
         _bufferedPointCount -= flushCount;
         if (_maxBufferBytes > 0)
@@ -1638,9 +1667,9 @@ public sealed class MemoryLimitExceededException : Exception
     public MemoryLimitExceededException(string message) : base(message) { }
 }
 
-public readonly record struct BufferedStatsSnapshot(int MatchedPointCount, long MaxTime, IReadOnlyDictionary<string, BufferedFieldStats> Fields);
+public readonly record struct BufferedStatsSnapshot(long MatchedPointCount, long MaxTime, IReadOnlyDictionary<string, BufferedFieldStats> Fields);
 
-public readonly record struct BufferedFieldStats(int Count, double Sum, double Min, double Max)
+public readonly record struct BufferedFieldStats(long Count, double Sum, double Min, double Max)
 {
     public static BufferedFieldStats Single(double value) => new(1, value, value, value);
     public BufferedFieldStats Add(double value) => new(Count + 1, Sum + value, Math.Min(Min, value), Math.Max(Max, value));

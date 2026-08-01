@@ -99,6 +99,16 @@ public sealed class MaintenanceResult
     public CompactionStatsSnapshot? Compaction { get; set; }
 }
 
+public sealed class CacheStatsResponse
+{
+    [JsonPropertyName("hits")]
+    public long Hits { get; set; }
+    [JsonPropertyName("misses")]
+    public long Misses { get; set; }
+    [JsonPropertyName("cachedCount")]
+    public int CachedCount { get; set; }
+}
+
 public sealed class BackupPathRequest
 {
     [JsonPropertyName("path")]

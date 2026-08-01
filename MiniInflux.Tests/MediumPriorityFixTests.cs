@@ -470,6 +470,87 @@ public class MediumPriorityFixTests : IDisposable
             engine.WriteAsync("testdb", "autogen", [Point("cpu", "value", 2, "server01", 2)]));
     }
 
+    [Fact]
+    public async Task TagFilterWithSameNameAsNumericField_UsesSeriesIndexPushdown_WhenValueNonNumeric()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 2);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "INDEX",
+                Tags = new Dictionary<string, string> { ["tag"] = "00HAA10AA311XQ05.OUT" },
+                Fields = new Dictionary<string, FieldValue>
+                {
+                    ["tag"] = FieldValue.FromDouble(99.0),
+                    ["value"] = FieldValue.FromDouble(1)
+                },
+                TimestampNs = 1_000_000_000
+            },
+            new Point
+            {
+                Measurement = "INDEX",
+                Tags = new Dictionary<string, string> { ["tag"] = "00HAA10AA311XQ05.OUT" },
+                Fields = new Dictionary<string, FieldValue>
+                {
+                    ["tag"] = FieldValue.FromDouble(99.0),
+                    ["value"] = FieldValue.FromDouble(2)
+                },
+                TimestampNs = 2_000_000_000
+            },
+            new Point
+            {
+                Measurement = "INDEX",
+                Tags = new Dictionary<string, string> { ["tag"] = "OTHER_SERIES.OUT" },
+                Fields = new Dictionary<string, FieldValue>
+                {
+                    ["tag"] = FieldValue.FromDouble(88.0),
+                    ["value"] = FieldValue.FromDouble(100)
+                },
+                TimestampNs = 3_000_000_000
+            }
+        ]);
+        engine.FlushAll();
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb",
+            "SELECT * FROM \"INDEX\" WHERE \"tag\"='00HAA10AA311XQ05.OUT' ORDER BY time DESC LIMIT 10");
+
+        Assert.True(outcome.Report.UsedSeriesIndexPushdown,
+            "Series index pushdown should apply when filter value cannot match numeric field type.");
+        Assert.Null(outcome.Response.Results[0].Error);
+        var rows = Assert.Single(outcome.Response.Results[0].Series!).Values;
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(2.0, rows[0][^1]);
+        Assert.Equal(1.0, rows[1][^1]);
+    }
+
+    [Fact]
+    public async Task MixedSeriesBufferAndFlushed_UsesHybridPath()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1, "server01", 1),
+            Point("cpu", "value", 2, "server01", 2)
+        ]);
+        engine.FlushAll();
+
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 3, "server02", 3)
+        ]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb",
+            "SELECT * FROM cpu ORDER BY time DESC LIMIT 3");
+
+        Assert.Null(outcome.Response.Results[0].Error);
+        var rows = Assert.Single(outcome.Response.Results[0].Series!).Values;
+        Assert.Equal(3, rows.Count);
+        Assert.Equal(3.0, rows[0][^1]);
+        Assert.Equal(2.0, rows[1][^1]);
+        Assert.Equal(1.0, rows[2][^1]);
+    }
+
     private static Point Point(string measurement, string field, double value, string host, long seconds) => new()
     {
         Measurement = measurement,

@@ -157,7 +157,7 @@ public class P0TodoTests : IDisposable
         var server01 = Assert.Single(series, s => s.Tags?["host"] == "server01");
         Assert.Equal(2, server01.Values.Count);
         Assert.Equal(2.0, server01.Values[0][1]);
-        Assert.Equal(2, server01.Values[0][2]);
+        Assert.Equal(2, Convert.ToInt32(server01.Values[0][2]));
         Assert.Equal(3.0, server01.Values[0][3]);
     }
 

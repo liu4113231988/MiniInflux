@@ -544,6 +544,14 @@ adminApi.MapPost("/maintenance/flush", (HttpRequest request) =>
     return Results.Json(new MaintenanceResult { Message = "flush completed" }, AppJsonContext.Default.MaintenanceResult);
 });
 
+adminApi.MapGet("/maintenance/cache-stats", (HttpRequest request) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+    var stats = engine.GetMetadataCacheStats();
+    return Results.Ok(new CacheStatsResponse { Hits = stats.Hits, Misses = stats.Misses, CachedCount = stats.CachedCount });
+});
+
 adminApi.MapPost("/maintenance/compact", (HttpRequest request) =>
 {
     if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))

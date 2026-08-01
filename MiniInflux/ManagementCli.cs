@@ -79,7 +79,7 @@ public static class ManagementCli
         var measurements = metadata.Select(m => m.Measurement).Distinct(StringComparer.Ordinal).Order().ToArray();
         var minTime = metadata.Count == 0 ? 0 : metadata.Min(m => m.MinTime);
         var maxTime = metadata.Count == 0 ? 0 : metadata.Max(m => m.MaxTime);
-        var totalPoints = metadata.Sum(m => m.PointCount);
+        var totalPoints = metadata.Sum(m => (long)m.PointCount);
         var format = ParseTextOrJsonFormat(args);
 
         if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))

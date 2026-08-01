@@ -62,7 +62,7 @@ public class P2TodoTests : IDisposable
         var cpuRow = Assert.Single(Assert.Single(cpuWest.Response.Results[0].Series!).Values);
         Assert.True(cpuWest.Report.UsedSeriesIndexPushdown);
         Assert.Equal(expectedCpuWest, Convert.ToDouble(cpuRow[1]));
-        Assert.Equal(4, cpuRow[2]);
+        Assert.Equal(4, Convert.ToInt32(cpuRow[2]));
 
         var memPoints = engine.ReadAllPoints("testdb", "autogen", "mem", null, null);
         Assert.DoesNotContain(memPoints, p => p.TimestampNs is >= 5 and <= 15);

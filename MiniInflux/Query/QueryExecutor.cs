@@ -36,7 +36,7 @@ public sealed class QuerySeries
 
 public sealed class QueryExecutionReport
 {
-    public int ScannedPoints { get; set; }
+    public long ScannedPoints { get; set; }
     public int RowsReturned { get; set; }
     public long DurationMs { get; set; }
     public bool TimedOut { get; set; }
@@ -977,13 +977,35 @@ public sealed class QueryExecutor
         long inputBytes = 0;
         var scanned = 0;
         var segmentColumnsRead = 0;
+        var pointsMaterialized = 0;
+        var usedFallbackForSeries = false;
+        var fieldSet = new HashSet<string>(fields, StringComparer.Ordinal);
         foreach (var tagsCanonical in series)
         {
             var read = e.TryReadFlushedFieldsDescending(sourceDb, sourceRp, q.Measurement, tagsCanonical, fields, q.MinTimeNs, q.MaxTimeNs, readLimit, cancellationToken);
-            if (read == null)
-                return null;
-
             var tags = ParseTagsCanonical(tagsCanonical);
+            if (read == null)
+            {
+                // Fast path unavailable for this series (buffer points exist or field alignment mismatch).
+                // Fall back to full point read for this series only instead of aborting the entire fast path.
+                usedFallbackForSeries = true;
+                var singleSeriesFilter = new HashSet<string>(StringComparer.Ordinal) { tagsCanonical };
+                foreach (var point in e.EnumeratePoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, fieldSet, singleSeriesFilter, null, cancellationToken))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    scanned++;
+                    pointsMaterialized++;
+                    inputBytes += EstimatePointBytes(point);
+                    var row = new List<object?>(columns.Count) { Time(point.TimestampNs) };
+                    foreach (var tag in tagKeys)
+                        row.Add(tags.TryGetValue(tag, out var value) ? value : null);
+                    foreach (var field in fields)
+                        row.Add(point.Fields.TryGetValue(field, out var fv) ? fv.ToObject() : null);
+                    rows.Add((point.TimestampNs, row));
+                }
+                continue;
+            }
+
             scanned += read.Timestamps.Count;
             inputBytes += EstimateFieldRowsBytes(read.Timestamps, read.Rows);
             segmentColumnsRead += read.SegmentColumnsRead;
@@ -1007,8 +1029,8 @@ public sealed class QueryExecutor
         report.ScannedPoints += scanned;
         report.RowsReturned = values.Count;
         report.SegmentColumnsRead += segmentColumnsRead;
-        report.PointsMaterialized = 0;
-        report.LimitPushdownStopReason = series.Count == 1 ? "segment-limit" : "series-limit";
+        report.PointsMaterialized = pointsMaterialized;
+        report.LimitPushdownStopReason = usedFallbackForSeries ? "mixed-fallback" : (series.Count == 1 ? "segment-limit" : "series-limit");
         report.EstimatedInputBytes = inputBytes;
         report.EstimatedResultBytes = resultBytes;
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, inputBytes + resultBytes);
@@ -1258,7 +1280,7 @@ public sealed class QueryExecutor
         private double _sum;
         private double _min;
         private double _max;
-        private int _count;
+        private long _count;
 
         public void Add(double value)
         {
@@ -1357,13 +1379,25 @@ public sealed class QueryExecutor
             return null;
 
         var fieldKeys = e.ListFieldKeys(db, q.Measurement)
-            .Select(field => field.Field)
-            .ToHashSet(StringComparer.Ordinal);
+            .ToDictionary(f => f.Field, f => f.Kind, StringComparer.Ordinal);
         HashSet<string>? candidates = null;
         foreach (var filter in q.TagFilters)
         {
             // A quoted string predicate can target a string field. Do not apply tag-index pushdown when ambiguous.
-            if (fieldKeys.Contains(filter.Key)) continue;
+            if (fieldKeys.TryGetValue(filter.Key, out var fieldKind))
+            {
+                // String field always ambiguous with tag values.
+                if (fieldKind == FieldKind.String)
+                    continue;
+
+                // For numeric fields (Float/Integer/Boolean): only skip pushdown if the filter value
+                // could actually be parsed as that numeric type (ambiguous case).
+                // Non-numeric strings like "00HAA10AA311XQ05.OUT" can never equal a numeric field value,
+                // so tag-index pushdown remains correct and safe.
+                if (CanStringMatchNumericField(filter.Value, fieldKind))
+                    continue;
+            }
+
             IReadOnlyList<string>? matches = filter.Op switch
             {
                 TagOp.Eq => e.GetSeriesForTagValue(db, q.Measurement, filter.Key, filter.Value),
@@ -1386,6 +1420,24 @@ public sealed class QueryExecutor
         }
 
         return candidates;
+    }
+
+    static bool CanStringMatchNumericField(string value, FieldKind fieldKind)
+    {
+        if (string.IsNullOrEmpty(value))
+            return true;
+
+        switch (fieldKind)
+        {
+            case FieldKind.Float:
+                return double.TryParse(value, out _);
+            case FieldKind.Integer:
+                return long.TryParse(value, out _);
+            case FieldKind.Boolean:
+                return bool.TryParse(value, out _) || value == "1" || value == "0";
+            default:
+                return true;
+        }
     }
 
     void ExecuteSelectInto(TsdbEngine e, string defaultDb, ParsedQuery q, List<QuerySeries> seriesList)
@@ -2053,7 +2105,7 @@ public sealed class QueryExecutor
         if (item.Func == "count" && item.Field == "*")
         {
             var countResult = new SortedDictionary<long, object?>();
-            if (pts.Count > 0) countResult[pts.Max(p => p.TimestampNs)] = pts.Count;
+            if (pts.Count > 0) countResult[pts.Max(p => p.TimestampNs)] = (long)pts.Count;
             return countResult;
         }
 
@@ -2124,7 +2176,7 @@ public sealed class QueryExecutor
 
     static object? Calc(List<FieldValue> vs, string fn, double param = 0, List<long>? timestamps = null, long? unitNs = null)
     {
-        if (fn == "count") return vs.Count;
+        if (fn == "count") return (long)vs.Count;
         if (vs.Count == 0) return null;
         var nums = vs.Select(v => v.AsDouble()).Where(x => x.HasValue).Select(x => x!.Value).ToList();
         var effectiveUnitNs = unitNs ?? 1_000_000_000L;
@@ -2271,7 +2323,7 @@ public sealed class QueryExecutor
         {
             if (metas.Any(m => !IsFullCoverage(m, q.MinTimeNs, q.MaxTimeNs) || m.Stats == null)) return null;
             if (HasPotentialAggregateDuplicates(metas, dedupedBufferPoints, aggregateItems)) return null;
-            report.ScannedPoints += metas.Sum(m => m.PointCount);
+            report.ScannedPoints += metas.Sum(m => (long)m.PointCount);
         }
 
         var row = new List<object?> { Time(MaxTime(metas, dedupedBufferPoints)) };
@@ -2332,7 +2384,7 @@ public sealed class QueryExecutor
 
         var row = new List<object?> { Time(countResult.MaxTimestampNs) };
         foreach (var item in aggregateItems)
-            row.Add(countResult.FieldCounts.TryGetValue(item.Field, out var count) ? (object?)count : 0);
+            row.Add(countResult.FieldCounts.TryGetValue(item.Field, out var count) ? (object?)count : 0L);
 
         return [new QuerySeries
         {
@@ -2391,7 +2443,7 @@ public sealed class QueryExecutor
                 return null;
             if (HasPotentialAggregateDuplicates(metas, dedupedBufferPoints, aggregateItems))
                 return null;
-            report.ScannedPoints += metas.Sum(m => m.PointCount);
+            report.ScannedPoints += metas.Sum(m => (long)m.PointCount);
         }
 
         var parsedTags = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
@@ -2525,7 +2577,7 @@ public sealed class QueryExecutor
         var metaStats = metas.Select(m => m.Stats!).ToList();
         return func switch
         {
-            "count" => metas.Sum(m => m.PointCount) + bufferFieldStats.Count,
+            "count" => metas.Sum(m => (long)m.PointCount) + bufferFieldStats.Count,
             "sum" => metaStats.Sum(s => s.Sum) + bufferFieldStats.Sum,
             "min" => CombineMin(metaStats, bufferFieldStats),
             "max" => CombineMax(metaStats, bufferFieldStats),
@@ -2543,7 +2595,7 @@ public sealed class QueryExecutor
         var metaStats = metas.Select(m => m.Stats!).ToList();
         return func switch
         {
-            "count" => metas.Sum(m => m.PointCount) + bufferValues.Count,
+            "count" => metas.Sum(m => (long)m.PointCount) + bufferValues.Count,
             "sum" => metaStats.Sum(s => s.Sum) + bufferValues.Sum(),
             "min" => CombineMin(metaStats, bufferValues),
             "max" => CombineMax(metaStats, bufferValues),
@@ -2619,7 +2671,7 @@ public sealed class QueryExecutor
     static object? CombineMean(List<BlockStats> stats, List<double> bufferValues)
     {
         var sum = stats.Sum(s => s.Sum) + bufferValues.Sum();
-        var count = stats.Sum(s => s.Count) + bufferValues.Count;
+        var count = stats.Sum(s => (long)s.Count) + bufferValues.Count;
         return count == 0 ? null : sum / count;
     }
 
@@ -2640,7 +2692,7 @@ public sealed class QueryExecutor
     static object? CombineMean(List<BlockStats> stats, BufferedFieldStats bufferStats)
     {
         var sum = stats.Sum(s => s.Sum) + bufferStats.Sum;
-        var count = stats.Sum(s => s.Count) + bufferStats.Count;
+        var count = stats.Sum(s => (long)s.Count) + bufferStats.Count;
         return count == 0 ? null : sum / count;
     }
 

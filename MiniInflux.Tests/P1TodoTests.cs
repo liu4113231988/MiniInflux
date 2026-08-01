@@ -57,7 +57,7 @@ public class P1TodoTests : IDisposable
         Assert.True(outcome.Report.UsedAggregatePushdown);
         var row = Assert.Single(outcome.Response.Results[0].Series![0].Values);
         Assert.Equal(6.0, row[1]);
-        Assert.Equal(3, row[2]);
+        Assert.Equal(3, Convert.ToInt32(row[2]));
         Assert.Equal(3.0, row[3]);
         Assert.Equal(2.0, row[4]);
     }
@@ -80,7 +80,7 @@ public class P1TodoTests : IDisposable
         Assert.Equal(0, outcome.Report.SegmentMetadataFullReads);
         var row = Assert.Single(outcome.Response.Results[0].Series![0].Values);
         Assert.Equal(6.0, row[1]);
-        Assert.Equal(3, row[2]);
+        Assert.Equal(3, Convert.ToInt32(row[2]));
         Assert.Equal(3.0, row[3]);
         Assert.Equal(2.0, row[4]);
     }
@@ -99,10 +99,10 @@ public class P1TodoTests : IDisposable
         var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb", "SELECT mean(value),count(value) FROM cpu WHERE host='server01'");
 
         Assert.True(outcome.Report.UsedAggregatePushdown);
-        Assert.Equal(2, outcome.Report.ScannedPoints);
+        Assert.Equal(2L, outcome.Report.ScannedPoints);
         var row = Assert.Single(outcome.Response.Results[0].Series![0].Values);
         Assert.Equal(1.5, row[1]);
-        Assert.Equal(2, row[2]);
+        Assert.Equal(2, Convert.ToInt32(row[2]));
     }
 
     [Fact]
@@ -133,13 +133,13 @@ public class P1TodoTests : IDisposable
 
         var row01 = Assert.Single(server01.Values);
         Assert.Equal(3.0, row01[1]);
-        Assert.Equal(2, row01[2]);
+        Assert.Equal(2, Convert.ToInt32(row01[2]));
         Assert.Equal(2.0, row01[3]);
         Assert.Equal(1.5, row01[4]);
 
         var row02 = Assert.Single(server02.Values);
         Assert.Equal(30.0, row02[1]);
-        Assert.Equal(2, row02[2]);
+        Assert.Equal(2, Convert.ToInt32(row02[2]));
         Assert.Equal(20.0, row02[3]);
         Assert.Equal(15.0, row02[4]);
     }
@@ -213,7 +213,7 @@ public class P1TodoTests : IDisposable
         Assert.Equal(2, stats.QueryTotal);
         Assert.Equal(1, stats.QueryTimeoutTotal);
         Assert.Equal(2, stats.QueryRowsReturnedTotal);
-        Assert.Equal(13, stats.QueryScannedPointsTotal);
+        Assert.Equal(13L, stats.QueryScannedPointsTotal);
     }
 
     [Fact]
@@ -415,7 +415,7 @@ public class P1TodoTests : IDisposable
         var rows = outcome.Response.Results[0].Series![0].Values;
         Assert.Single(rows);
         Assert.Equal(80.0, rows[0][2]);
-        Assert.Equal(1, outcome.Report.ScannedPoints);
+        Assert.Equal(1L, outcome.Report.ScannedPoints);
     }
 
     [Fact]

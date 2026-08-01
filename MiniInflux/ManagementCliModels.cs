@@ -8,7 +8,7 @@ public sealed class CliInspectSegmentResult
     public List<string> Measurements { get; set; } = [];
     public long MinTimeNs { get; set; }
     public long MaxTimeNs { get; set; }
-    public int TotalPoints { get; set; }
+    public long TotalPoints { get; set; }
     public List<CliSegmentColumnSummary> ColumnEntries { get; set; } = [];
 }
 

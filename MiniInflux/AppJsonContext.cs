@@ -42,6 +42,7 @@ using MiniInflux.Net10.Storage;
 [JsonSerializable(typeof(AdminContinuousQuerySummary))]
 [JsonSerializable(typeof(List<AdminContinuousQuerySummary>))]
 [JsonSerializable(typeof(MaintenanceResult))]
+[JsonSerializable(typeof(CacheStatsResponse))]
 [JsonSerializable(typeof(BackupPathRequest))]
 [JsonSerializable(typeof(Dictionary<string, int>))]
 [JsonSerializable(typeof(Dictionary<string, long>))]
