@@ -126,9 +126,9 @@ public static class InfluxQlParser
         if (q.StartsWith("SHOW TAG VALUES", StringComparison.OrdinalIgnoreCase))
             return ParseShowTagValues(q);
         if (q.StartsWith("SHOW FIELD KEY CARDINALITY", StringComparison.OrdinalIgnoreCase))
-            return new() { Kind = QueryKind.ShowFieldKeyCardinality, Measurement = AfterFrom(q) };
+            return new() { Kind = QueryKind.ShowFieldKeyCardinality, Database = AfterOn(q), Measurement = AfterFrom(q) };
         if (q.StartsWith("SHOW TAG KEY CARDINALITY", StringComparison.OrdinalIgnoreCase))
-            return new() { Kind = QueryKind.ShowTagKeyCardinality, Measurement = AfterFrom(q) };
+            return new() { Kind = QueryKind.ShowTagKeyCardinality, Database = AfterOn(q), Measurement = AfterFrom(q) };
         if (q.StartsWith("SHOW SHARD GROUPS", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowShardGroups, Database = AfterOn(q) };
         if (q.StartsWith("SHOW SHARDS", StringComparison.OrdinalIgnoreCase))
@@ -177,54 +177,61 @@ public static class InfluxQlParser
     {
         var rest = q["CREATE DATABASE ".Length..].Trim();
         if (rest.StartsWith("IF NOT EXISTS ", StringComparison.OrdinalIgnoreCase)) rest = rest[14..].Trim();
-        var database = Unq(ReadToken(rest));
-        rest = rest[database.Length..].Trim();
+        var database = Unq(ReadToken(ref rest));
+        rest = rest.TrimStart();
 
         long? durationNs = null;
         int? replication = null;
         string? shardGroupName = null;
         long? shardDurationNs = null;
 
-        // Parse WITH DURATION ... REPLICATION ... SHARD ... NAME ...
-        var u = rest.ToUpperInvariant();
-        if (u.StartsWith("WITH "))
+        if (rest.StartsWith("WITH ", StringComparison.OrdinalIgnoreCase))
         {
             rest = rest[5..].Trim();
-            u = rest.ToUpperInvariant();
-
-            var durIdx = u.IndexOf("DURATION ");
-            if (durIdx >= 0)
+            while (rest.Length > 0)
             {
-                var token = ReadToken(rest[(durIdx + 9)..].Trim());
-                durationNs = DurationToNs(token);
+                if (rest.StartsWith("DURATION ", StringComparison.OrdinalIgnoreCase))
+                {
+                    rest = rest[9..];
+                    var token = ReadToken(ref rest);
+                    durationNs = token.Equals("INF", StringComparison.OrdinalIgnoreCase) ? 0 : DurationToNs(token);
+                }
+                else if (rest.StartsWith("REPLICATION ", StringComparison.OrdinalIgnoreCase))
+                {
+                    rest = rest[12..];
+                    var token = ReadToken(ref rest);
+                    if (!int.TryParse(token, NumberStyles.None, CultureInfo.InvariantCulture, out var value) || value < 1)
+                        throw new FormatException($"bad replication factor: {token}");
+                    replication = value;
+                }
+                else if (rest.StartsWith("SHARD DURATION ", StringComparison.OrdinalIgnoreCase))
+                {
+                    rest = rest[15..];
+                    shardDurationNs = DurationToNs(ReadToken(ref rest));
+                }
+                else if (rest.StartsWith("NAME ", StringComparison.OrdinalIgnoreCase))
+                {
+                    rest = rest[5..];
+                    shardGroupName = Unq(ReadToken(ref rest));
+                }
+                else
+                {
+                    throw new FormatException($"unsupported CREATE DATABASE option: {rest}");
+                }
+                rest = rest.TrimStart();
             }
-
-            var repIdx = u.IndexOf("REPLICATION ");
-            if (repIdx >= 0)
-            {
-                var token = ReadToken(rest[(repIdx + 11)..].Trim());
-                if (int.TryParse(token, out var rep)) replication = rep;
-            }
-
-            var shardIdx = u.IndexOf("SHARD ");
-            if (shardIdx >= 0)
-            {
-                var token = ReadToken(rest[(shardIdx + 6)..].Trim());
-                shardDurationNs = DurationToNs(token);
-            }
-
-            var nameIdx = u.IndexOf("NAME ");
-            if (nameIdx >= 0)
-            {
-                shardGroupName = Unq(rest[(nameIdx + 5)..].Trim());
-            }
+        }
+        else if (rest.Length > 0)
+        {
+            throw new FormatException($"unexpected CREATE DATABASE clause: {rest}");
         }
 
         return new()
         {
             Kind = QueryKind.CreateDatabase,
             Database = database,
-            ShardDurationNs = durationNs,
+            RpDurationNs = durationNs,
+            ShardDurationNs = shardDurationNs,
             ShardReplication = replication,
             ShardGroupName = shardGroupName
         };
@@ -903,8 +910,8 @@ public static class InfluxQlParser
         s = new string(s.Trim().ToLowerInvariant().Where(ch => !char.IsWhiteSpace(ch)).ToArray());
         long num = long.Parse(new string(s.TakeWhile(char.IsDigit).ToArray()));
         string unit = new string(s.SkipWhile(char.IsDigit).ToArray());
-        return unit switch { "ns" => num, "u" or "us" => num * 1000, "ms" => num * 1_000_000, "s" => num * 1_000_000_000,
-            "m" => num * 60_000_000_000, "h" => num * 3600_000_000_000, "d" => num * 86400_000_000_000, "w" => num * 7 * 86400_000_000_000,
+        return unit switch { "ns" => num, "u" or "us" => checked(num * 1000), "ms" => checked(num * 1_000_000), "s" => checked(num * 1_000_000_000),
+            "m" => checked(num * 60_000_000_000), "h" => checked(num * 3600_000_000_000), "d" => checked(num * 86400_000_000_000), "w" => checked(num * 7 * 86400_000_000_000),
             _ => throw new FormatException($"bad duration: {s}") };
     }
 

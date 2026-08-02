@@ -11,6 +11,7 @@ public sealed class RetentionPolicyInfo
 {
     public string Name { get; set; } = "";
     public long DurationNs { get; set; } // 0 = infinite
+    public long ShardDurationNs { get; set; } // 0 = derived from retention duration
     public int Replication { get; set; } = 1;
     public bool IsDefault { get; set; }
     public List<ShardGroupInfo> ShardGroups { get; set; } = [];
@@ -146,7 +147,7 @@ public sealed class Manifest
         }
     }
 
-    public void EnsureRpWithDuration(string db, string rpName, long durationNs, int replication, bool isDefault)
+    public void EnsureRpWithDuration(string db, string rpName, long durationNs, long shardDurationNs, int replication, bool isDefault)
     {
         lock (_lock)
         {
@@ -154,10 +155,13 @@ public sealed class Manifest
             var dbInfo = _data.Databases[db];
             if (!dbInfo.RetentionPolicies.ContainsKey(rpName))
             {
+                if (isDefault)
+                    foreach (var rp in dbInfo.RetentionPolicies.Values) rp.IsDefault = false;
                 dbInfo.RetentionPolicies[rpName] = new RetentionPolicyInfo
                 {
                     Name = rpName,
                     DurationNs = durationNs,
+                    ShardDurationNs = shardDurationNs,
                     Replication = replication,
                     IsDefault = isDefault
                 };

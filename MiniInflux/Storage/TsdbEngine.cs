@@ -18,6 +18,8 @@ public sealed class TsdbEngine : IDisposable
         public bool Cloned;
     }
 
+    private sealed record IndexedSegmentMetadata(List<SegmentColumnMeta> Metas, bool UsedFooter);
+
     private readonly string _root;
     private readonly WalManager _wal;
     private readonly StorageHealth _health = new();
@@ -29,10 +31,14 @@ public sealed class TsdbEngine : IDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ReaderWriterLockSlim> _locks = new(StringComparer.Ordinal);
     private readonly ReaderWriterLockSlim _globalLock = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Length, DateTime LastWriteUtc, List<SegmentColumnMeta> Metas, bool UsedFooter)> _segmentMetadataCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string DbRp, string Measurement, string Tags), System.Collections.Concurrent.ConcurrentDictionary<string, IndexedSegmentMetadata>> _segmentMetadataBySeries = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _segmentMetadataIndexReady = new(StringComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, List<BufferedPoint>> _buf = new(StringComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Dictionary<SeriesKey, List<BufferedPoint>>> _bufBySeries = new(StringComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, WalPosition> _bufferReplayFloors = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _lastBufferWriteTicks = new(StringComparer.Ordinal);
     private readonly int _threshold;
+    private readonly long _flushColdTicks;
     private readonly long _maxSeriesPerDb;
     private readonly long _maxBufferPoints;
     private readonly long _maxBufferBytes;
@@ -46,16 +52,19 @@ public sealed class TsdbEngine : IDisposable
     public TsdbEngine(string rootPath, int flushThreshold = 50000,
         long maxWalFileBytes = 16 * 1024 * 1024, bool walFsync = true, int walFsyncIntervalMs = 1000,
         int rpCheckIntervalMs = 60000, long maxSeriesPerDb = 10_000_000, int maxFieldsPerMeasurement = 1024,
-        int flushIntervalMs = 5000, long maxBufferPoints = 1_000_000, long maxBufferBytes = 0, int compactionIntervalMs = 30000)
+        int flushIntervalMs = 5000, long maxBufferPoints = 1_000_000, long maxBufferBytes = 0, int compactionIntervalMs = 30000,
+        int flushColdDurationMs = 600_000, long compactionTargetBytes = 256L * 1024 * 1024)
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
+        _flushColdTicks = TimeSpan.FromMilliseconds(Math.Max(0, flushColdDurationMs)).Ticks;
         Directory.CreateDirectory(_root);
         _wal = new WalManager(Path.Combine(_root, "wal"), maxWalFileBytes, walFsync, walFsyncIntervalMs, _health);
         _manifest = new Manifest(_root);
         _schema = new SchemaRegistry(_root, maxFieldsPerMeasurement);
         _shards = new ShardManager(_root, _manifest);
         _tombstones = new TombstoneStore(_root);
-        _compactor = new Compactor(_manifest, _shards, _tombstones, _schema, health: _health);
+        _compactor = new Compactor(_manifest, _shards, _tombstones, _schema,
+            maxL0Bytes: compactionTargetBytes, maxL1Bytes: compactionTargetBytes, health: _health);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
         if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => RunCompaction(), null, compactionIntervalMs, compactionIntervalMs);
         if (flushIntervalMs > 0) _flushTimer = new Timer(_ => PeriodicFlush(), null, flushIntervalMs, flushIntervalMs);
@@ -91,6 +100,7 @@ public sealed class TsdbEngine : IDisposable
                 {
                     if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
                     AddBufferedPoints(key, list, validPoints); TrackSeriesKeys(replayPoint.Db, validPoints);
+                    _lastBufferWriteTicks[key] = DateTime.UtcNow.Ticks;
                     UpdateBufferReplayFloor(key, list);
                 }
                 finally { lk.ExitWriteLock(); }
@@ -112,7 +122,7 @@ public sealed class TsdbEngine : IDisposable
                     result.SegmentsScanned++;
                     try
                     {
-                        var metas = ReadSegmentMetadataCached(segFile).Metas;
+                        var metas = ReadSegmentMetadataCached(segFile, db, shardRp).Metas;
                         var pointsForIndex = new List<(string Measurement, string TagsCanonical, Dictionary<string, string> Tags)>();
                         foreach (var m in metas)
                         {
@@ -138,6 +148,9 @@ public sealed class TsdbEngine : IDisposable
                     catch (InvalidDataException) { result.SegmentsCorrupted++; }
                 }
             }
+
+            foreach (var rp in _manifest.ListRetentionPolicies(db))
+                _segmentMetadataIndexReady[K(db, rp.Name)] = 0;
         }
 
         return result;
@@ -167,6 +180,7 @@ public sealed class TsdbEngine : IDisposable
             var walPositions = _wal.Append(db, rp, writePoints);
             if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
             AddWrittenPoints(db, key, list, pending, walPositions);
+            _lastBufferWriteTicks[key] = DateTime.UtcNow.Ticks;
             UpdateBufferReplayFloor(key, list);
             if (list.Count >= _threshold) FlushLocked(db, rp, list);
         }
@@ -300,15 +314,13 @@ public sealed class TsdbEngine : IDisposable
 
     public void CreateDatabase(string db) { _manifest.EnsureDatabase(db); _manifest.EnsureRp(db, "autogen"); Directory.CreateDirectory(Path.Combine(_root, "db", db, "autogen")); }
 
-public void CreateDatabaseWithRp(string db, long durationNs, int replication, string rpName)
-{
-    _manifest.EnsureDatabase(db);
-    if (durationNs > 0)
-        _manifest.EnsureRpWithDuration(db, rpName, durationNs, replication, rpName == "autogen");
-    else
-        _manifest.EnsureRp(db, rpName);
-    Directory.CreateDirectory(Path.Combine(_root, "db", db, rpName));
-}
+    public void CreateDatabaseWithRp(string db, long durationNs, long shardDurationNs, int replication, string rpName)
+    {
+        if (_manifest.HasDatabase(db)) return;
+        _manifest.EnsureDatabase(db);
+        _manifest.EnsureRpWithDuration(db, rpName, durationNs, shardDurationNs, replication, isDefault: true);
+        Directory.CreateDirectory(Path.Combine(_root, "db", db, rpName));
+    }
 
     public IReadOnlyList<string> ListDatabases() => _manifest.ListDatabases();
 
@@ -506,12 +518,12 @@ public void CreateDatabaseWithRp(string db, long durationNs, int replication, st
             return new DescendingSeriesReadResult(result.Values.ToList(), 0, result.Count, "buffer-limit");
 
         var segments = new List<(string Path, long MaxTime)>();
-        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var (segPath, indexedMetas) in EnumerateSeriesSegmentMetadata(db, rp, measurement, tagsCanonical, min, max, cancellationToken))
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                var maxTime = ReadSegmentMetadataCached(segPath).Metas
+                var maxTime = indexedMetas.Metas
                     .Where(m => m.Measurement == measurement && m.TagsCanonical == tagsCanonical
                         && (!min.HasValue || m.MaxTime >= min.Value)
                         && (!max.HasValue || m.MinTime <= max.Value)
@@ -569,12 +581,12 @@ public void CreateDatabaseWithRp(string db, long durationNs, int replication, st
         finally { lk.ExitReadLock(); }
 
         var segments = new List<(string Path, long MaxTime)>();
-        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var (segPath, indexedMetas) in EnumerateSeriesSegmentMetadata(db, rp, measurement, tagsCanonical, min, max, cancellationToken))
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                var maxTime = ReadSegmentMetadataCached(segPath).Metas
+                var maxTime = indexedMetas.Metas
                     .Where(m => m.Measurement == measurement
                         && m.TagsCanonical == tagsCanonical
                         && m.Field == field
@@ -640,12 +652,12 @@ public void CreateDatabaseWithRp(string db, long durationNs, int replication, st
 
         var fieldSet = new HashSet<string>(fields, StringComparer.Ordinal);
         var segments = new List<(string Path, long MaxTime)>();
-        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var (segPath, indexedMetas) in EnumerateSeriesSegmentMetadata(db, rp, measurement, tagsCanonical, min, max, cancellationToken))
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                var metas = ReadSegmentMetadataCached(segPath).Metas
+                var metas = indexedMetas.Metas
                     .Where(m => m.Measurement == measurement
                         && m.TagsCanonical == tagsCanonical
                         && fieldSet.Contains(m.Field)
@@ -826,6 +838,22 @@ return Interlocked.Read(ref _bufferedByteCount);
     public SegmentMetadataQueryResult ReadSegmentMetadataWithStats(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, CancellationToken cancellationToken = default)
     {
+        if (meas != null && allowedTagsCanonical != null)
+        {
+            var indexed = new Dictionary<string, IndexedSegmentMetadata>(StringComparer.OrdinalIgnoreCase);
+            foreach (var tags in allowedTagsCanonical)
+                foreach (var (path, metadata) in EnumerateSeriesSegmentMetadata(db, rp, meas, tags, min, max, cancellationToken))
+                    indexed[path] = metadata;
+
+            var indexedResult = indexed.Values
+                .SelectMany(metadata => metadata.Metas)
+                .Where(m => (!min.HasValue || m.MaxTime >= min.Value)
+                    && (!max.HasValue || m.MinTime <= max.Value)
+                    && (requestedFields == null || requestedFields.Contains(m.Field)))
+                .ToList();
+            return new SegmentMetadataQueryResult(indexedResult, indexed.Values.Count(metadata => metadata.UsedFooter), indexed.Values.Count(metadata => !metadata.UsedFooter));
+        }
+
         var reads = new System.Collections.Concurrent.ConcurrentBag<(List<SegmentColumnMeta> Metas, bool UsedFooter)>();
         Parallel.ForEach(
             _shards.ListSegments(db, rp, min, max),
@@ -834,7 +862,7 @@ return Interlocked.Read(ref _bufferedByteCount);
             {
                 try
                 {
-                    reads.Add(ReadSegmentMetadataCached(segment.SegPath));
+                    reads.Add(ReadSegmentMetadataCached(segment.SegPath, db, rp));
                 }
                 catch (InvalidDataException) { }
                 catch (FileNotFoundException) { }
@@ -979,7 +1007,7 @@ return Interlocked.Read(ref _bufferedByteCount);
     public int CompactNow()
     {
         var merged = _compactor.CompactAll();
-        if (merged > 0) _segmentMetadataCache.Clear();
+        if (merged > 0) InvalidateSegmentMetadataIndex();
         return merged;
     }
 
@@ -987,7 +1015,7 @@ return Interlocked.Read(ref _bufferedByteCount);
     {
         try
         {
-            if (_compactor.CompactAll() > 0) _segmentMetadataCache.Clear();
+            if (_compactor.CompactAll() > 0) InvalidateSegmentMetadataIndex();
         }
         catch (Exception ex) { _health.RecordFailure("compaction", ex); }
     }
@@ -997,10 +1025,10 @@ return Interlocked.Read(ref _bufferedByteCount);
         FlushDatabase(db);
         var dbDir = Path.Combine(_root, "db", db);
         if (Directory.Exists(dbDir)) try { Directory.Delete(dbDir, true); } catch { }
-        _segmentMetadataCache.Clear();
+        InvalidateSegmentMetadataIndex();
         _manifest.DropDatabase(db); _manifest.SaveIfDirty(); _tombstones.DropDatabase(db);
         _globalLock.EnterWriteLock();
-        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); _locks.TryRemove(k, out var lk); lk?.Dispose(); _bufferReplayFloors.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
+        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); _locks.TryRemove(k, out var lk); lk?.Dispose(); _bufferReplayFloors.TryRemove(k, out _); _lastBufferWriteTicks.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
         finally { _globalLock.ExitWriteLock(); }
     }
 
@@ -1123,7 +1151,7 @@ return Interlocked.Read(ref _bufferedByteCount);
                 if (shard == null) continue;
                 var dir = _shards.ShardDir(db, rp, shardId);
                 if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
-                _segmentMetadataCache.Clear();
+                InvalidateSegmentMetadataIndex();
                 _manifest.RemoveShardGroup(db, rp, shardId);
                 return true;
             }
@@ -1236,12 +1264,13 @@ return Interlocked.Read(ref _bufferedByteCount);
     private long _metadataCacheHits;
     private long _metadataCacheMisses;
 
-    private (List<SegmentColumnMeta> Metas, bool UsedFooter) ReadSegmentMetadataCached(string path)
+    private (List<SegmentColumnMeta> Metas, bool UsedFooter) ReadSegmentMetadataCached(string path, string? db = null, string? rp = null)
     {
         // Segment files are immutable once written - cache by path only, no FileInfo needed.
         if (_segmentMetadataCache.TryGetValue(path, out var cached))
         {
             Interlocked.Increment(ref _metadataCacheHits);
+            if (db != null && rp != null) IndexSegmentMetadata(db, rp, path, cached.Metas, cached.UsedFooter);
             return (cached.Metas.ToList(), cached.UsedFooter);
         }
 
@@ -1249,7 +1278,55 @@ return Interlocked.Read(ref _bufferedByteCount);
         var read = SegmentReader.ReadMetadataWithInfo(path);
         var info = new FileInfo(path);
         _segmentMetadataCache[path] = (info.Length, info.LastWriteTimeUtc, read.Metadata, read.UsedFooter);
+        if (db != null && rp != null) IndexSegmentMetadata(db, rp, path, read.Metadata, read.UsedFooter);
         return (read.Metadata.ToList(), read.UsedFooter);
+    }
+
+    private IEnumerable<(string Path, IndexedSegmentMetadata Metadata)> EnumerateSeriesSegmentMetadata(
+        string db, string rp, string measurement, string tagsCanonical, long? min, long? max, CancellationToken cancellationToken)
+    {
+        var dbRp = K(db, rp);
+        var key = (dbRp, measurement, tagsCanonical);
+        if (_segmentMetadataIndexReady.ContainsKey(dbRp))
+        {
+            if (_segmentMetadataBySeries.TryGetValue(key, out var indexed))
+                foreach (var item in indexed)
+                    yield return (item.Key, item.Value);
+            yield break;
+        }
+
+        foreach (var (path, _) in _shards.ListSegments(db, rp, min, max))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            IndexedSegmentMetadata metadata;
+            try
+            {
+                var read = ReadSegmentMetadataCached(path, db, rp);
+                metadata = new IndexedSegmentMetadata(read.Metas.Where(m => m.Measurement == measurement && m.TagsCanonical == tagsCanonical).ToList(), read.UsedFooter);
+            }
+            catch (InvalidDataException) { continue; }
+            catch (FileNotFoundException) { continue; }
+            if (metadata.Metas.Count > 0) yield return (path, metadata);
+        }
+
+        if (!min.HasValue && !max.HasValue)
+            _segmentMetadataIndexReady[dbRp] = 0;
+    }
+
+    private void IndexSegmentMetadata(string db, string rp, string path, List<SegmentColumnMeta> metas, bool usedFooter)
+    {
+        foreach (var group in metas.GroupBy(meta => (meta.Measurement, meta.TagsCanonical)))
+        {
+            var segments = _segmentMetadataBySeries.GetOrAdd((K(db, rp), group.Key.Measurement, group.Key.TagsCanonical), _ => new(StringComparer.OrdinalIgnoreCase));
+            segments[path] = new IndexedSegmentMetadata(group.ToList(), usedFooter);
+        }
+    }
+
+    private void InvalidateSegmentMetadataIndex()
+    {
+        _segmentMetadataCache.Clear();
+        _segmentMetadataBySeries.Clear();
+        _segmentMetadataIndexReady.Clear();
     }
 
     /// <summary>
@@ -1262,11 +1339,12 @@ return Interlocked.Read(ref _bufferedByteCount);
     /// Register segment metadata in the cache after a new segment is written.
     /// This avoids the first query having to read the metadata from disk.
     /// </pre>
-    internal void RegisterSegmentMetadata(string path)
+    internal void RegisterSegmentMetadata(string db, string rp, string path)
     {
         var read = SegmentReader.ReadMetadataWithInfo(path);
         var info = new FileInfo(path);
         _segmentMetadataCache[path] = (info.Length, info.LastWriteTimeUtc, read.Metadata, read.UsedFooter);
+        IndexSegmentMetadata(db, rp, path, read.Metadata, read.UsedFooter);
     }
 
     /// <pre>
@@ -1349,13 +1427,14 @@ return Interlocked.Read(ref _bufferedByteCount);
             SegmentWriter.WriteSegment(segPath, points);
             _shards.RegisterSegment(db, rp, shardId, segPath);
             // Pre-populate metadata cache so first query doesn't need to read from disk
-            RegisterSegmentMetadata(segPath);
+            RegisterSegmentMetadata(db, rp, segPath);
         }
         _bufferedPointCount -= flushCount;
         if (_maxBufferBytes > 0)
             _bufferedByteCount -= flushBytes;
         l.Clear();
         var key = K(db, rp);
+        _lastBufferWriteTicks.TryRemove(key, out _);
         _bufBySeries.TryRemove(key, out _);
         UpdateBufferReplayFloor(key, l);
         if (updateCheckpoint)
@@ -1636,7 +1715,7 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
         try
         {
             if (_shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000) > 0)
-                _segmentMetadataCache.Clear();
+                InvalidateSegmentMetadataIndex();
         }
         catch (Exception ex) { _health.RecordFailure("retention_cleanup", ex); }
     }
@@ -1653,13 +1732,20 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
     {
         try
         {
+            var coldBefore = DateTime.UtcNow.Ticks - _flushColdTicks;
             foreach (var kv in _buf.ToArray())
             {
-                if (kv.Value.Count == 0) continue;
                 var p = kv.Key.Split('|');
                 var lk = GetLock(kv.Key);
                 lk.EnterWriteLock();
-                try { FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false); }
+                try
+                {
+                    if (kv.Value.Count == 0) continue;
+                    if (kv.Value.Count < _threshold
+                        && (_flushColdTicks <= 0 || !_lastBufferWriteTicks.TryGetValue(kv.Key, out var lastWrite) || lastWrite > coldBefore))
+                        continue;
+                    FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false);
+                }
                 finally { lk.ExitWriteLock(); }
             }
             UpdateWalCheckpoint();

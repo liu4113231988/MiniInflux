@@ -536,9 +536,10 @@ public sealed class QueryExecutor
 
     List<QuerySeries>? CreateDatabase(TsdbEngine e, ParsedQuery q)
     {
-        if (q.ShardDurationNs.HasValue || q.ShardReplication.HasValue || !string.IsNullOrEmpty(q.ShardGroupName))
+        if (q.RpDurationNs.HasValue || q.ShardDurationNs.HasValue || q.ShardReplication.HasValue || !string.IsNullOrEmpty(q.ShardGroupName))
         {
-            e.CreateDatabaseWithRp(q.Database!, q.ShardDurationNs ?? 0, q.ShardReplication ?? 1, q.ShardGroupName ?? "autogen");
+            e.CreateDatabaseWithRp(q.Database!, q.RpDurationNs ?? 0, q.ShardDurationNs ?? 0,
+                q.ShardReplication ?? 1, q.ShardGroupName ?? "autogen");
         }
         else
         {
@@ -713,9 +714,34 @@ public sealed class QueryExecutor
             if (!string.IsNullOrEmpty(db))
             {
                 rows.Add(new() { "measurements", (long)e.ListMeasurements(db!).Count });
-                rows.Add(new() { "series", (long)e.ListSeries(db!, null).Count });
+                rows.Add(new() { "series", e.ListMeasurements(db!).Sum(measurement => (long)e.ListSeries(db!, measurement).Count) });
             }
             return [new() { Name = "stats", Columns = ["stat", "value"], Values = rows }];
+        }
+
+        if (target.Equals("runtime", StringComparison.OrdinalIgnoreCase))
+        {
+            var rows = new List<List<object?>>
+            {
+                new() { "heap_bytes", GC.GetTotalMemory(false) },
+                new() { "gen0_collections", (long)GC.CollectionCount(0) },
+                new() { "gen1_collections", (long)GC.CollectionCount(1) },
+                new() { "gen2_collections", (long)GC.CollectionCount(2) }
+            };
+            return [new() { Name = "runtime", Columns = ["stat", "value"], Values = rows }];
+        }
+
+        if (target.Equals("indexes", StringComparison.OrdinalIgnoreCase))
+        {
+            var databases = string.IsNullOrEmpty(db) ? e.ListDatabases() : [db!];
+            var rows = databases.SelectMany(database => new List<List<object?>>
+            {
+                new() { $"{database}:measurements", (long)e.ListMeasurements(database).Count },
+                new() { $"{database}:series", e.ListMeasurements(database).Sum(measurement => (long)e.ListSeries(database, measurement).Count) },
+                new() { $"{database}:tag_keys", (long)e.ListTagKeys(database, null).Count },
+                new() { $"{database}:field_keys", (long)e.ListFieldKeys(database, null).Select(field => field.Field).Distinct(StringComparer.Ordinal).Count() }
+            }).ToList();
+            return [new() { Name = "indexes", Columns = ["stat", "value"], Values = rows }];
         }
 
         // Per-measurement stats
@@ -748,10 +774,11 @@ public sealed class QueryExecutor
         {
             rows.Add(new() { "current_database", db! });
             rows.Add(new() { "measurements", (long)e.ListMeasurements(db!).Count });
-            rows.Add(new() { "series", (long)e.ListSeries(db!, null).Count });
+            rows.Add(new() { "series", e.ListMeasurements(db!).Sum(measurement => (long)e.ListSeries(db!, measurement).Count) });
             rows.Add(new() { "default_rp", e.GetDefaultRpName(db!) });
         }
-        rows.Add(new() { "uptime_ms", (long)Environment.TickCount64 });
+        using var process = System.Diagnostics.Process.GetCurrentProcess();
+        rows.Add(new() { "uptime_ms", (long)(DateTime.UtcNow - process.StartTime.ToUniversalTime()).TotalMilliseconds });
         rows.Add(new() { "dotnet_runtime", Environment.Version.ToString() });
         rows.Add(new() { "processor_count", (long)Environment.ProcessorCount });
         rows.Add(new() { "gc_total_memory_mb", Math.Round(GC.GetTotalMemory(false) / 1024.0 / 1024.0, 2) });
@@ -763,16 +790,21 @@ public sealed class QueryExecutor
 
     List<QuerySeries>? ShowTagKeyCardinality(TsdbEngine e, string? db, ParsedQuery q)
     {
-        Req(db);
-        var tagKeys = e.ListTagKeys(db!, q.Measurement);
+        var targetDb = q.Database ?? db;
+        Req(targetDb);
+        var tagKeys = e.ListTagKeys(targetDb!, q.Measurement);
         return [new() { Name = "tag key cardinality", Columns = ["count"], Values = [new List<object?> { (long)tagKeys.Count }] }];
     }
 
     List<QuerySeries>? ShowFieldKeyCardinality(TsdbEngine e, string? db, ParsedQuery q)
     {
-        Req(db);
-        var fieldKeys = e.ListFieldKeys(db!, q.Measurement);
-        return [new() { Name = "field key cardinality", Columns = ["count"], Values = [new List<object?> { (long)fieldKeys.Count }] }];
+        var targetDb = q.Database ?? db;
+        Req(targetDb);
+        var fieldKeyCount = e.ListFieldKeys(targetDb!, q.Measurement)
+            .Select(field => field.Field)
+            .Distinct(StringComparer.Ordinal)
+            .LongCount();
+        return [new() { Name = "field key cardinality", Columns = ["count"], Values = [new List<object?> { fieldKeyCount }] }];
     }
 
     static string FormatTime(long ns)

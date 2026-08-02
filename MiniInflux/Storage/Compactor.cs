@@ -29,7 +29,7 @@ public sealed class Compactor
 
     public Compactor(Manifest manifest, ShardManager shardManager, TombstoneStore tombstones,
         SchemaRegistry schema, int maxL0Segments = 10, int maxL1Segments = 4,
-        long maxL0Bytes = 32 * 1024 * 1024, long maxL1Bytes = 128 * 1024 * 1024,
+        long maxL0Bytes = 256 * 1024 * 1024, long maxL1Bytes = 256 * 1024 * 1024,
         int minFilesPerCompaction = 2, int maxPassesPerRun = 8, StorageHealth? health = null)
     {
         _manifest = manifest;
@@ -158,12 +158,15 @@ public sealed class Compactor
             .ToList();
 
     private FileCandidate DescribeFile(string path)
+        => new(path, SafeLength(path), SafeWriteTime(path), InferLevel(path), null, null);
+
+    private FileCandidate ReadTimeRange(FileCandidate file)
     {
         long? minTimeNs = null;
         long? maxTimeNs = null;
         try
         {
-            var metadata = SegmentReader.ReadMetadata(path);
+            var metadata = SegmentReader.ReadMetadata(file.Path);
             if (metadata.Count > 0)
             {
                 minTimeNs = metadata.Min(m => m.MinTime);
@@ -172,7 +175,7 @@ public sealed class Compactor
         }
         catch (Exception ex) { _health?.RecordFailure("compaction_metadata", ex); }
 
-        return new FileCandidate(path, SafeLength(path), SafeWriteTime(path), InferLevel(path), minTimeNs, maxTimeNs);
+        return file with { MinTimeNs = minTimeNs, MaxTimeNs = maxTimeNs };
     }
 
     private CompactionTask? BuildLevelTask(
@@ -202,19 +205,23 @@ public sealed class Compactor
             selected.Add(file);
             selectedBytes += file.Length;
 
-            if (selected.Count >= requiredFiles && (selected.Count >= segmentThreshold || (byteThreshold > 0 && selectedBytes >= byteThreshold)))
+            if (selected.Count >= requiredFiles && byteThreshold > 0 && selectedBytes >= byteThreshold)
+                break;
+            if (selected.Count >= segmentThreshold && byteThreshold <= 0)
                 break;
         }
 
         if (selected.Count < requiredFiles)
             selected = currentLevelFiles.Take(requiredFiles).ToList();
 
+        selected = selected.Select(ReadTimeRange).ToList();
+        var describedOverlaps = overlapLevelFiles.Select(ReadTimeRange).ToList();
         var includeAllOverlaps = selected.Any(file => !file.MinTimeNs.HasValue || !file.MaxTimeNs.HasValue);
-        if (overlapLevelFiles.Count > 0)
+        if (describedOverlaps.Count > 0)
         {
             var selectedMinTime = selected.Where(f => f.MinTimeNs.HasValue).Select(f => f.MinTimeNs!.Value).DefaultIfEmpty(long.MinValue).Min();
             var selectedMaxTime = selected.Where(f => f.MaxTimeNs.HasValue).Select(f => f.MaxTimeNs!.Value).DefaultIfEmpty(long.MaxValue).Max();
-            foreach (var overlap in overlapLevelFiles)
+            foreach (var overlap in describedOverlaps)
             {
                 if (includeAllOverlaps || Overlaps(overlap, selectedMinTime, selectedMaxTime))
                     selected.Add(overlap);

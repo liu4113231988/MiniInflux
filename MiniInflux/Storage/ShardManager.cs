@@ -95,13 +95,12 @@ public sealed class ShardManager
             foreach (var file in shard.SegmentFiles)
             {
                 var seg = Path.Combine(dir, file);
-                if (File.Exists(seg))
-                    result.Add((seg, shard));
+                result.Add((seg, shard));
             }
         }
         return result
             .OrderByDescending(x => InferSegmentLevel(x.Item1))
-            .ThenBy(x => SafeWriteTime(x.Item1))
+            .ThenBy(x => InferSegmentSequence(x.Item1))
             .ThenBy(x => x.Item1, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
@@ -142,6 +141,7 @@ public sealed class ShardManager
     private long GetShardDurationNs(string db, string rp)
     {
         var rpInfo = _manifest.GetRp(db, rp);
+        if (rpInfo?.ShardDurationNs > 0) return rpInfo.ShardDurationNs;
         var rpDuration = rpInfo?.DurationNs ?? 0;
 
         if (rpDuration <= 0) return 604_800_000_000_000L;          // infinite RP -> 7d shards
@@ -165,9 +165,13 @@ public sealed class ShardManager
         return 0;
     }
 
-    private static DateTime SafeWriteTime(string path)
+    private static long InferSegmentSequence(string segmentPath)
     {
-        try { return File.GetLastWriteTimeUtc(path); }
-        catch { return DateTime.MinValue; }
+        var name = Path.GetFileNameWithoutExtension(segmentPath);
+        var start = name.StartsWith('l') ? name.IndexOf('-') + 1 : 0;
+        var end = name.IndexOf('-', start);
+        return end > start && long.TryParse(name.AsSpan(start, end - start), out var sequence)
+            ? sequence
+            : long.MinValue;
     }
 }

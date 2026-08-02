@@ -93,7 +93,9 @@ public sealed class MiniInfluxOptions
                 MaxQueryDurationMs = ReadInt(config, 30_000, "Storage:MaxQueryDurationMs"),
                 MaxBufferBytes = ReadLong(config, 0, "Storage:MaxBufferBytes"),
                 MaxQueryMemoryBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:MaxQueryMemoryBytes"),
-                MinFreeDiskBytes = ReadLong(config, 1L * 1024 * 1024 * 1024, "Storage:MinFreeDiskBytes")
+                MinFreeDiskBytes = ReadLong(config, 1L * 1024 * 1024 * 1024, "Storage:MinFreeDiskBytes"),
+                FlushColdDurationMs = ReadInt(config, 600_000, "Storage:FlushColdDurationMs"),
+                CompactionTargetBytes = ReadLong(config, 256L * 1024 * 1024, "Storage:CompactionTargetBytes")
             },
             Auth = new AuthOptions
             {
@@ -275,6 +277,8 @@ public sealed class StorageOptions
     public long MaxBufferBytes { get; init; }
     public long MaxQueryMemoryBytes { get; init; } = 512L * 1024 * 1024;
     public long MinFreeDiskBytes { get; init; } = 1L * 1024 * 1024 * 1024;
+    public int FlushColdDurationMs { get; init; } = 600_000;
+    public long CompactionTargetBytes { get; init; } = 256L * 1024 * 1024;
 }
 
 public sealed class AuthOptions
