@@ -300,6 +300,16 @@ public sealed class TsdbEngine : IDisposable
 
     public void CreateDatabase(string db) { _manifest.EnsureDatabase(db); _manifest.EnsureRp(db, "autogen"); Directory.CreateDirectory(Path.Combine(_root, "db", db, "autogen")); }
 
+public void CreateDatabaseWithRp(string db, long durationNs, int replication, string rpName)
+{
+    _manifest.EnsureDatabase(db);
+    if (durationNs > 0)
+        _manifest.EnsureRpWithDuration(db, rpName, durationNs, replication, rpName == "autogen");
+    else
+        _manifest.EnsureRp(db, rpName);
+    Directory.CreateDirectory(Path.Combine(_root, "db", db, rpName));
+}
+
     public IReadOnlyList<string> ListDatabases() => _manifest.ListDatabases();
 
     public string GetDefaultRpName(string db) => _manifest.GetDefaultRp(db).Name;

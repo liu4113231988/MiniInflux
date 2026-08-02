@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.RegularExpressions;
 using System.Text.Json.Serialization;
 using MiniInflux.Net10.Model;
@@ -523,13 +524,26 @@ public sealed class QueryExecutor
             QueryKind.Explain => ExplainQuery(e, db, q, cancellationToken, report),
             QueryKind.ShowQueries => ShowQueries(),
             QueryKind.KillQuery => KillQueryResult(q),
+            QueryKind.ShowShards => ShowShards(e, q),
+            QueryKind.ShowShardGroups => ShowShardGroups(e, q),
+            QueryKind.ShowStats => ShowStats(e, db, q),
+            QueryKind.ShowDiagnostics => ShowDiagnostics(e, db),
+            QueryKind.ShowTagKeyCardinality => ShowTagKeyCardinality(e, db, q),
+            QueryKind.ShowFieldKeyCardinality => ShowFieldKeyCardinality(e, db, q),
             _ => throw new NotSupportedException()
         };
     }
 
     List<QuerySeries>? CreateDatabase(TsdbEngine e, ParsedQuery q)
     {
-        e.CreateDatabase(q.Database!);
+        if (q.ShardDurationNs.HasValue || q.ShardReplication.HasValue || !string.IsNullOrEmpty(q.ShardGroupName))
+        {
+            e.CreateDatabaseWithRp(q.Database!, q.ShardDurationNs ?? 0, q.ShardReplication ?? 1, q.ShardGroupName ?? "autogen");
+        }
+        else
+        {
+            e.CreateDatabase(q.Database!);
+        }
         return null;
     }
 
@@ -650,6 +664,122 @@ public sealed class QueryExecutor
             Columns = ["name", "duration", "replicaN", "default"],
             Values = rpList.Select(r => new List<object?> { r.Name, FormatDuration(r.DurationNs), r.Replication, r.IsDefault }).ToList()
         }];
+    }
+
+    List<QuerySeries>? ShowShards(TsdbEngine e, ParsedQuery q)
+    {
+        var databases = string.IsNullOrEmpty(q.Database)
+            ? e.ListDatabases()
+            : [q.Database!];
+        var rows = new List<List<object?>>();
+        foreach (var db in databases)
+        {
+            var allShards = e.Meta.GetAllShards(db);
+            foreach (var (rp, shard) in allShards)
+            {
+                rows.Add(new() { db, rp, (long)shard.Id, shard.SegmentFiles.Count, FormatTime(shard.StartTimeNs), FormatTime(shard.EndTimeNs) });
+            }
+        }
+        return [new() { Name = "shards", Columns = ["database", "retention_policy", "shard_id", "num_segments", "start_time", "end_time"], Values = rows }];
+    }
+
+    List<QuerySeries>? ShowShardGroups(TsdbEngine e, ParsedQuery q)
+    {
+        var databases = string.IsNullOrEmpty(q.Database)
+            ? e.ListDatabases()
+            : [q.Database!];
+        var rows = new List<List<object?>>();
+        foreach (var db in databases)
+        {
+            var allShards = e.Meta.GetAllShards(db);
+            foreach (var (rp, shard) in allShards)
+            {
+                rows.Add(new() { db, rp, (long)shard.Id, FormatTime(shard.StartTimeNs), FormatTime(shard.EndTimeNs) });
+            }
+        }
+        return [new() { Name = "shard groups", Columns = ["database", "retention_policy", "shard_id", "start_time", "end_time"], Values = rows }];
+    }
+
+    List<QuerySeries>? ShowStats(TsdbEngine e, string? db, ParsedQuery q)
+    {
+        var target = q.StatsTarget;
+        if (string.IsNullOrEmpty(target))
+        {
+            // Global stats
+            var rows = new List<List<object?>>
+            {
+                new() { "databases", (long)e.ListDatabases().Count },
+            };
+            if (!string.IsNullOrEmpty(db))
+            {
+                rows.Add(new() { "measurements", (long)e.ListMeasurements(db!).Count });
+                rows.Add(new() { "series", (long)e.ListSeries(db!, null).Count });
+            }
+            return [new() { Name = "stats", Columns = ["stat", "value"], Values = rows }];
+        }
+
+        // Per-measurement stats
+        Req(db);
+        var meas = target;
+        var fieldKeys = e.ListFieldKeys(db!, meas);
+        var tagKeys = e.ListTagKeys(db!, meas);
+        var series = e.ListSeries(db!, meas).Count;
+        var rows2 = new List<List<object?>>
+        {
+            new() { "measurement", meas },
+            new() { "field_keys", (long)fieldKeys.Count },
+            new() { "tag_keys", (long)tagKeys.Count },
+            new() { "series_count", (long)series },
+        };
+        foreach (var fk in fieldKeys)
+            rows2.Add(new() { $"field:{fk.Field}", fk.Kind.ToString().ToLowerInvariant() });
+        foreach (var tk in tagKeys)
+            rows2.Add(new() { $"tag:{tk}", "" });
+        return [new() { Name = $"stats_{meas}", Columns = ["stat", "value"], Values = rows2 }];
+    }
+
+    List<QuerySeries>? ShowDiagnostics(TsdbEngine e, string? db)
+    {
+        var rows = new List<List<object?>>();
+        rows.Add(new() { "version", "MiniInflux.NET10" });
+        rows.Add(new() { "data_dir", e.RootPath });
+        rows.Add(new() { "databases", (long)e.ListDatabases().Count });
+        if (!string.IsNullOrEmpty(db))
+        {
+            rows.Add(new() { "current_database", db! });
+            rows.Add(new() { "measurements", (long)e.ListMeasurements(db!).Count });
+            rows.Add(new() { "series", (long)e.ListSeries(db!, null).Count });
+            rows.Add(new() { "default_rp", e.GetDefaultRpName(db!) });
+        }
+        rows.Add(new() { "uptime_ms", (long)Environment.TickCount64 });
+        rows.Add(new() { "dotnet_runtime", Environment.Version.ToString() });
+        rows.Add(new() { "processor_count", (long)Environment.ProcessorCount });
+        rows.Add(new() { "gc_total_memory_mb", Math.Round(GC.GetTotalMemory(false) / 1024.0 / 1024.0, 2) });
+        rows.Add(new() { "gc_gen0", (long)GC.CollectionCount(0) });
+        rows.Add(new() { "gc_gen1", (long)GC.CollectionCount(1) });
+        rows.Add(new() { "gc_gen2", (long)GC.CollectionCount(2) });
+        return [new() { Name = "diagnostics", Columns = ["key", "value"], Values = rows }];
+    }
+
+    List<QuerySeries>? ShowTagKeyCardinality(TsdbEngine e, string? db, ParsedQuery q)
+    {
+        Req(db);
+        var tagKeys = e.ListTagKeys(db!, q.Measurement);
+        return [new() { Name = "tag key cardinality", Columns = ["count"], Values = [new List<object?> { (long)tagKeys.Count }] }];
+    }
+
+    List<QuerySeries>? ShowFieldKeyCardinality(TsdbEngine e, string? db, ParsedQuery q)
+    {
+        Req(db);
+        var fieldKeys = e.ListFieldKeys(db!, q.Measurement);
+        return [new() { Name = "field key cardinality", Columns = ["count"], Values = [new List<object?> { (long)fieldKeys.Count }] }];
+    }
+
+    static string FormatTime(long ns)
+    {
+        if (ns <= 0) return "";
+        var dt = DateTimeOffset.FromUnixTimeMilliseconds(ns / 1_000_000);
+        return dt.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
     }
 
     List<QuerySeries>? CreateContinuousQuery(TsdbEngine e, ParsedQuery q)

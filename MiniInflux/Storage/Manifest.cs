@@ -146,6 +146,26 @@ public sealed class Manifest
         }
     }
 
+    public void EnsureRpWithDuration(string db, string rpName, long durationNs, int replication, bool isDefault)
+    {
+        lock (_lock)
+        {
+            EnsureDatabase(db);
+            var dbInfo = _data.Databases[db];
+            if (!dbInfo.RetentionPolicies.ContainsKey(rpName))
+            {
+                dbInfo.RetentionPolicies[rpName] = new RetentionPolicyInfo
+                {
+                    Name = rpName,
+                    DurationNs = durationNs,
+                    Replication = replication,
+                    IsDefault = isDefault
+                };
+                Save();
+            }
+        }
+    }
+
     public void CreateRetentionPolicy(string db, string rpName, long durationNs, bool isDefault)
     {
         lock (_lock)

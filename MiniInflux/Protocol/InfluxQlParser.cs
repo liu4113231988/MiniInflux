@@ -9,7 +9,9 @@ public enum QueryKind
     CreateContinuousQuery, ShowContinuousQueries, DropContinuousQuery,
     DropDatabase, DropMeasurement, DropSeries, DropShard, Delete,
     ShowSeries, ShowSeriesCardinality, ShowMeasurementCardinality, ShowTagValuesCardinality,
-    Explain, ShowQueries, KillQuery
+    Explain, ShowQueries, KillQuery,
+    ShowShards, ShowShardGroups, ShowStats, ShowDiagnostics,
+    ShowTagKeyCardinality, ShowFieldKeyCardinality
 }
 
 public enum TagOp { Eq, Neq, Regex, NotRegex }
@@ -73,6 +75,10 @@ public sealed class ParsedQuery
     public bool ExplainAnalyze { get; init; }
     public ParsedQuery? ExplainedQuery { get; init; }
     public long? KillQueryId { get; init; }
+    public string? StatsTarget { get; init; }
+    public long? ShardDurationNs { get; init; }
+    public int? ShardReplication { get; init; }
+    public string? ShardGroupName { get; init; }
 }
 
 public static class InfluxQlParser
@@ -98,11 +104,7 @@ public static class InfluxQlParser
             return new() { Kind = QueryKind.DropShard, Limit = int.Parse(q["DROP SHARD ".Length..].Trim(), CultureInfo.InvariantCulture) };
         if (q.StartsWith("DELETE FROM ", StringComparison.OrdinalIgnoreCase)) return ParseDelete(q);
         if (q.StartsWith("CREATE DATABASE ", StringComparison.OrdinalIgnoreCase))
-        {
-            var database = q[16..].Trim();
-            if (database.StartsWith("IF NOT EXISTS ", StringComparison.OrdinalIgnoreCase)) database = database[14..].Trim();
-            return new() { Kind = QueryKind.CreateDatabase, Database = Unq(database) };
-        }
+            return ParseCreateDatabase(q);
         if (q.Equals("SHOW DATABASES", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowDatabases };
         if (q.Equals("SHOW MEASUREMENTS", StringComparison.OrdinalIgnoreCase))
@@ -123,6 +125,27 @@ public static class InfluxQlParser
             return ParseShowTagKeys(q);
         if (q.StartsWith("SHOW TAG VALUES", StringComparison.OrdinalIgnoreCase))
             return ParseShowTagValues(q);
+        if (q.StartsWith("SHOW FIELD KEY CARDINALITY", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowFieldKeyCardinality, Measurement = AfterFrom(q) };
+        if (q.StartsWith("SHOW TAG KEY CARDINALITY", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowTagKeyCardinality, Measurement = AfterFrom(q) };
+        if (q.StartsWith("SHOW SHARD GROUPS", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowShardGroups, Database = AfterOn(q) };
+        if (q.StartsWith("SHOW SHARDS", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowShards, Database = AfterOn(q) };
+        if (q.StartsWith("SHOW STATS", StringComparison.OrdinalIgnoreCase))
+        {
+            var u = q.ToUpperInvariant();
+            var forIdx = u.IndexOf(" FOR ");
+            if (forIdx >= 0)
+            {
+                var target = q[(forIdx + 5)..].Trim().Trim('\'');
+                return new() { Kind = QueryKind.ShowStats, StatsTarget = target };
+            }
+            return new() { Kind = QueryKind.ShowStats };
+        }
+        if (q.Equals("SHOW DIAGNOSTICS", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowDiagnostics };
         if (q.StartsWith("SELECT ", StringComparison.OrdinalIgnoreCase)) return ParseSelect(q);
         if (q.StartsWith("EXPLAIN ", StringComparison.OrdinalIgnoreCase))
         {
@@ -148,6 +171,63 @@ public static class InfluxQlParser
             return new() { Kind = QueryKind.KillQuery, KillQueryId = long.Parse(idStr, CultureInfo.InvariantCulture) };
         }
         throw new NotSupportedException($"unsupported query: {q}");
+    }
+
+    static ParsedQuery ParseCreateDatabase(string q)
+    {
+        var rest = q["CREATE DATABASE ".Length..].Trim();
+        if (rest.StartsWith("IF NOT EXISTS ", StringComparison.OrdinalIgnoreCase)) rest = rest[14..].Trim();
+        var database = Unq(ReadToken(rest));
+        rest = rest[database.Length..].Trim();
+
+        long? durationNs = null;
+        int? replication = null;
+        string? shardGroupName = null;
+        long? shardDurationNs = null;
+
+        // Parse WITH DURATION ... REPLICATION ... SHARD ... NAME ...
+        var u = rest.ToUpperInvariant();
+        if (u.StartsWith("WITH "))
+        {
+            rest = rest[5..].Trim();
+            u = rest.ToUpperInvariant();
+
+            var durIdx = u.IndexOf("DURATION ");
+            if (durIdx >= 0)
+            {
+                var token = ReadToken(rest[(durIdx + 9)..].Trim());
+                durationNs = DurationToNs(token);
+            }
+
+            var repIdx = u.IndexOf("REPLICATION ");
+            if (repIdx >= 0)
+            {
+                var token = ReadToken(rest[(repIdx + 11)..].Trim());
+                if (int.TryParse(token, out var rep)) replication = rep;
+            }
+
+            var shardIdx = u.IndexOf("SHARD ");
+            if (shardIdx >= 0)
+            {
+                var token = ReadToken(rest[(shardIdx + 6)..].Trim());
+                shardDurationNs = DurationToNs(token);
+            }
+
+            var nameIdx = u.IndexOf("NAME ");
+            if (nameIdx >= 0)
+            {
+                shardGroupName = Unq(rest[(nameIdx + 5)..].Trim());
+            }
+        }
+
+        return new()
+        {
+            Kind = QueryKind.CreateDatabase,
+            Database = database,
+            ShardDurationNs = durationNs,
+            ShardReplication = replication,
+            ShardGroupName = shardGroupName
+        };
     }
 
     static ParsedQuery ParseCreateRp(string q)
