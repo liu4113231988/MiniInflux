@@ -373,6 +373,75 @@ public class InfluxQlParserTests
     }
 
     [Fact]
+    public void Parse_Explain_ParsesInnerQuery()
+    {
+        var query = InfluxQlParser.Parse("EXPLAIN SELECT value FROM cpu WHERE host = 'server01'");
+
+        Assert.Equal(QueryKind.Explain, query.Kind);
+        Assert.Equal("cpu", query.Measurement);
+    }
+
+    [Fact]
+    public void Parse_ExplainAnalyze_ParsesWithAnalyzeFlag()
+    {
+        var query = InfluxQlParser.Parse("EXPLAIN ANALYZE SELECT value FROM cpu");
+
+        Assert.Equal(QueryKind.Explain, query.Kind);
+        Assert.True(query.ExplainAnalyze);
+    }
+
+    [Fact]
+    public void Parse_ShowQueries_ParsesCommand()
+    {
+        var query = InfluxQlParser.Parse("SHOW QUERIES");
+
+        Assert.Equal(QueryKind.ShowQueries, query.Kind);
+    }
+
+    [Fact]
+    public void Parse_KillQuery_ParsesQueryId()
+    {
+        var query = InfluxQlParser.Parse("KILL QUERY 42");
+
+        Assert.Equal(QueryKind.KillQuery, query.Kind);
+        Assert.Equal(42L, query.KillQueryId);
+    }
+
+    [Fact]
+    public void Parse_NonNegativeDifference_ParsesFunction()
+    {
+        var query = InfluxQlParser.Parse("SELECT NON_NEGATIVE_DIFFERENCE(value) FROM cpu");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.Single(query.Select);
+        Assert.Equal("non_negative_difference", query.Select[0].Func);
+    }
+
+    [Fact]
+    public void Parse_Mode_ParsesFunction()
+    {
+        var query = InfluxQlParser.Parse("SELECT MODE(value) FROM cpu");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.Single(query.Select);
+        Assert.Equal("mode", query.Select[0].Func);
+    }
+
+    [Fact]
+    public void Parse_MathFunctions_ParsesCorrectly()
+    {
+        var query = InfluxQlParser.Parse("SELECT ABS(value), CEIL(value), FLOOR(value), ROUND(value), SQRT(value) FROM cpu");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.Equal(5, query.Select.Count);
+        Assert.Equal("abs", query.Select[0].Func);
+        Assert.Equal("ceil", query.Select[1].Func);
+        Assert.Equal("floor", query.Select[2].Func);
+        Assert.Equal("round", query.Select[3].Func);
+        Assert.Equal("sqrt", query.Select[4].Func);
+    }
+
+    [Fact]
     public void Parse_CreateContinuousQuery_ParsesDefinition()
     {
         var query = InfluxQlParser.Parse("CREATE CONTINUOUS QUERY cq_cpu ON metrics RESAMPLE EVERY 10s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");

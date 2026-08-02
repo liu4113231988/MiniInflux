@@ -8,7 +8,8 @@ public enum QueryKind
     CreateRetentionPolicy, AlterRetentionPolicy, DropRetentionPolicy, ShowRetentionPolicies,
     CreateContinuousQuery, ShowContinuousQueries, DropContinuousQuery,
     DropDatabase, DropMeasurement, DropSeries, DropShard, Delete,
-    ShowSeries, ShowSeriesCardinality, ShowMeasurementCardinality, ShowTagValuesCardinality
+    ShowSeries, ShowSeriesCardinality, ShowMeasurementCardinality, ShowTagValuesCardinality,
+    Explain, ShowQueries, KillQuery
 }
 
 public enum TagOp { Eq, Neq, Regex, NotRegex }
@@ -24,7 +25,7 @@ public sealed record TagFilter(string Key, string Value, TagOp Op);
 public sealed record FieldFilter(string Field, double Value, FieldOp Op);
 public sealed class ParsedQuery
 {
-    public required QueryKind Kind { get; init; }
+    public required QueryKind Kind { get; set; }
     public string? Database { get; init; }
     public string? Measurement { get; init; }
     public List<string> Measurements { get; init; } = [];
@@ -68,6 +69,8 @@ public sealed class ParsedQuery
     public long? ContinuousQueryForNs { get; init; }
     public int? ContinuousQueryRecomputeRecentBuckets { get; init; }
     public string? IntoTarget { get; init; }
+    public bool ExplainAnalyze { get; set; }
+    public long? KillQueryId { get; init; }
 }
 
 public static class InfluxQlParser
@@ -119,6 +122,23 @@ public static class InfluxQlParser
         if (q.StartsWith("SHOW TAG VALUES", StringComparison.OrdinalIgnoreCase))
             return ParseShowTagValues(q);
         if (q.StartsWith("SELECT ", StringComparison.OrdinalIgnoreCase)) return ParseSelect(q);
+        if (q.StartsWith("EXPLAIN ", StringComparison.OrdinalIgnoreCase))
+        {
+            var inner = q["EXPLAIN ".Length..].Trim();
+            var analyze = inner.StartsWith("ANALYZE ", StringComparison.OrdinalIgnoreCase);
+            if (analyze) inner = inner["ANALYZE ".Length..].Trim();
+            var parsed = Parse(inner);
+            parsed.Kind = QueryKind.Explain;
+            parsed.ExplainAnalyze = analyze;
+            return parsed;
+        }
+        if (q.StartsWith("SHOW QUERIES", StringComparison.OrdinalIgnoreCase))
+            return new() { Kind = QueryKind.ShowQueries };
+        if (q.StartsWith("KILL QUERY ", StringComparison.OrdinalIgnoreCase))
+        {
+            var idStr = q["KILL QUERY ".Length..].Trim();
+            return new() { Kind = QueryKind.KillQuery, KillQueryId = long.Parse(idStr, CultureInfo.InvariantCulture) };
+        }
         throw new NotSupportedException($"unsupported query: {q}");
     }
 

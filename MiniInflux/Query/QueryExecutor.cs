@@ -260,6 +260,7 @@ public sealed class QueryExecutor
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var report = new QueryExecutionReport();
+        var queryId = RegisterActiveQuery(q, db);
         try
         {
             using var timeoutCts = _maxQueryDurationMs > 0 ? new CancellationTokenSource(_maxQueryDurationMs) : null;
@@ -329,6 +330,10 @@ public sealed class QueryExecutor
                 },
                 Report = report
             };
+        }
+        finally
+        {
+            UnregisterActiveQuery(queryId);
         }
     }
 
@@ -513,6 +518,9 @@ public sealed class QueryExecutor
             QueryKind.DropShard => DropShard(e, q),
             QueryKind.Delete => DeleteResult(e, db, q),
             QueryKind.Select => Select(e, db, q, cancellationToken, report),
+            QueryKind.Explain => ExplainQuery(e, db, q, cancellationToken, report),
+            QueryKind.ShowQueries => ShowQueries(),
+            QueryKind.KillQuery => KillQueryResult(q),
             _ => throw new NotSupportedException()
         };
     }
@@ -2043,7 +2051,7 @@ public sealed class QueryExecutor
 
         return item.Func switch
         {
-            "difference" or "derivative" or "non_negative_derivative" or "integral" or "elapsed" => Math.Max(0, matchingCount - 1),
+            "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "integral" or "elapsed" => Math.Max(0, matchingCount - 1),
             "moving_average" => Math.Max(0, matchingCount - Math.Max(1, (int)item.Param) + 1),
             "cumulative_sum" => matchingCount,
             "top" or "bottom" or "sample" => Math.Min(matchingCount, Math.Max(1, (int)item.Param)),
@@ -2239,6 +2247,13 @@ public sealed class QueryExecutor
             case "difference":
                 for (int i = 1; i < values.Count; i++) result[values[i].TimestampNs] = values[i].Value - values[i - 1].Value;
                 break;
+            case "non_negative_difference":
+                for (int i = 1; i < values.Count; i++)
+                {
+                    var diff = values[i].Value - values[i - 1].Value;
+                    result[values[i].TimestampNs] = diff < 0 ? 0 : diff;
+                }
+                break;
             case "derivative":
             case "non_negative_derivative":
                 var unitNs = item.UnitNs ?? 1_000_000_000L;
@@ -2311,6 +2326,13 @@ public sealed class QueryExecutor
             "derivative" => CalcDerivative(timestamps, nums, false, effectiveUnitNs),
             "non_negative_derivative" => CalcDerivative(timestamps, nums, true, effectiveUnitNs),
             "difference" => nums.Count < 2 ? null : nums[^1] - nums[0],
+            "non_negative_difference" => nums.Count < 2 ? null : Math.Max(0, nums[^1] - nums[0]),
+            "mode" => nums.Count == 0 ? null : CalcMode(nums),
+            "abs" => nums.Count == 0 ? null : Math.Abs(nums[^1]),
+            "ceil" => nums.Count == 0 ? null : Math.Ceiling(nums[^1]),
+            "floor" => nums.Count == 0 ? null : Math.Floor(nums[^1]),
+            "round" => nums.Count == 0 ? null : Math.Round(nums[^1]),
+            "sqrt" => nums.Count == 0 ? null : Math.Sqrt(nums[^1]),
             "cumulative_sum" => nums.Count == 0 ? null : nums.Sum(),
             "moving_average" => nums.Count == 0 ? null : nums.Average(),
             "integral" => timestamps == null ? null : CalcIntegral(timestamps, nums, effectiveUnitNs),
@@ -2359,6 +2381,107 @@ public sealed class QueryExecutor
             area += ((nums[i - 1] + nums[i]) / 2.0) * deltaNs / unitNs;
         }
         return area;
+    }
+
+    static double CalcMode(List<double> nums)
+    {
+        if (nums.Count == 0) return 0;
+        var groups = nums.GroupBy(n => n).OrderByDescending(g => g.Count()).ThenBy(g => g.Key);
+        return groups.First().Key;
+    }
+
+    /// <summary>
+    /// Active query registry for SHOW QUERIES / KILL QUERY.
+    /// </summary>
+    static int _nextQueryId = 1;
+    static readonly Dictionary<long, ActiveQueryInfo> _activeQueries = new();
+    static readonly object _activeQueriesLock = new();
+
+    record ActiveQueryInfo(int Id, string Query, string? Database, long StartedAtMs);
+
+    static int RegisterActiveQuery(string query, string? db)
+    {
+        lock (_activeQueriesLock)
+        {
+            var id = _nextQueryId++;
+            _activeQueries[id] = new ActiveQueryInfo(id, query, db, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            return id;
+        }
+    }
+
+    static void UnregisterActiveQuery(int id)
+    {
+        lock (_activeQueriesLock)
+        {
+            _activeQueries.Remove(id);
+        }
+    }
+
+    static void CancelQuery(long id)
+    {
+        lock (_activeQueriesLock)
+        {
+            _activeQueries.Remove(id);
+        }
+    }
+
+    List<QuerySeries>? ShowQueries()
+    {
+        lock (_activeQueriesLock)
+        {
+            return [new()
+            {
+                Name = "queries",
+                Columns = ["qid", "query", "database", "duration"],
+                Values = _activeQueries.Values
+                    .Select(q => new List<object?>
+                    {
+                        (long)q.Id,
+                        q.Query,
+                        q.Database ?? "",
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - q.StartedAtMs
+                    })
+                    .ToList()
+            }];
+        }
+    }
+
+    List<QuerySeries>? KillQueryResult(ParsedQuery q)
+    {
+        if (q.KillQueryId.HasValue)
+            CancelQuery(q.KillQueryId.Value);
+        return null;
+    }
+
+    List<QuerySeries>? ExplainQuery(TsdbEngine e, string? db, ParsedQuery q, CancellationToken cancellationToken, QueryExecutionReport report)
+    {
+        // Execute the inner query and return the execution report as a result series
+        var innerReport = new QueryExecutionReport();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        List<QuerySeries>? series = null;
+        try { series = Run(e, db, q, cancellationToken, innerReport); }
+        catch (Exception ex) { innerReport.Error = ex.Message; }
+        sw.Stop();
+
+        var rows = new List<List<object?>>
+        {
+            new() { "QUERY PLAN", "SCAN" },
+            new() { "measurement", q.Measurement ?? "" },
+            new() { "scanned_points", (long)innerReport.ScannedPoints },
+            new() { "rows_returned", (long)innerReport.RowsReturned },
+            new() { "duration_ms", sw.ElapsedMilliseconds },
+            new() { "used_series_index_pushdown", innerReport.UsedSeriesIndexPushdown },
+            new() { "used_aggregate_pushdown", innerReport.UsedAggregatePushdown },
+            new() { "used_streaming_raw_select", innerReport.UsedStreamingRawSelect },
+            new() { "estimated_input_bytes", innerReport.EstimatedInputBytes },
+            new() { "estimated_result_bytes", innerReport.EstimatedResultBytes },
+            new() { "segment_columns_read", innerReport.SegmentColumnsRead },
+            new() { "points_materialized", innerReport.PointsMaterialized },
+        };
+        if (!string.IsNullOrEmpty(innerReport.Error))
+            rows.Add(new() { "error", innerReport.Error });
+
+        return [new() { Name = "explain", Columns = ["KEY", "VALUE"], Values = rows }];
     }
 
     static List<(long TimestampNs, FieldValue Value)> BuildValuePairs(List<Point> points, string field)
@@ -2414,7 +2537,7 @@ public sealed class QueryExecutor
     {
         var items = q.Select.Where(s => s.Func != "").ToList();
         if (items.Count == 0) return null;
-        if (items.Any(i => i.Func is "difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last"))
+        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt"))
             return null;
         if (q.FieldFilters.Count > 0) return null;
 
@@ -2527,7 +2650,7 @@ public sealed class QueryExecutor
         var items = q.Select.Where(s => s.Func != "").ToList();
         if (items.Count == 0)
             return null;
-        if (items.Any(i => i.Func is "difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last"))
+        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt"))
             return null;
         if (q.FieldFilters.Count > 0)
             return null;
