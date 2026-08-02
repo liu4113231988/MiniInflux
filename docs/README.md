@@ -192,7 +192,7 @@ dotnet run -c Release --project .\MiniInflux\MiniInflux.csproj
     "MaxBufferBytes": 0,
     "MaxQueryMemoryBytes": 536870912,
     "FlushColdDurationMs": 600000,
-    "CompactionTargetBytes": 268435456
+    "CompactionTargetBytes": 536870912
   },
   "Tls": {
     "Enabled": false,
@@ -244,7 +244,7 @@ dotnet run -c Release --project .\MiniInflux\MiniInflux.csproj
 - `ContinuousQuery.InitialBackfillDuration`：当 CQ 未显式声明 `RESAMPLE FOR` 时，首次创建或长时间停机恢复后默认允许补跑的窗口
 - `Storage.MinFreeDiskBytes`：健康检查要求的数据卷最小剩余空间；Production 必须设置为非零值
 - `Storage.FlushColdDurationMs`：低于 `FlushThreshold` 的缓冲数据连续无写入多久后生成 segment；默认 10 分钟，期间数据已由 WAL 持久化且查询可见
-- `Storage.CompactionTargetBytes`：分层压缩每批目标大小；默认 256 MiB，用于减少小 segment 数量，并受单个 shard 实际数据量限制
+- `Storage.CompactionTargetBytes`：分层压缩每批目标大小；默认 512 MiB，用于减少小 segment 数量，并受单个 shard 实际数据量限制
 
 环境变量兼容：
 

@@ -131,7 +131,7 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
         Assert.Equal(512L * 1024 * 1024, options.Storage.MaxQueryMemoryBytes);
         Assert.Equal(1L * 1024 * 1024 * 1024, options.Storage.MinFreeDiskBytes);
         Assert.Equal(600_000, options.Storage.FlushColdDurationMs);
-        Assert.Equal(256L * 1024 * 1024, options.Storage.CompactionTargetBytes);
+        Assert.Equal(512L * 1024 * 1024, options.Storage.CompactionTargetBytes);
     }
 
     [Fact]

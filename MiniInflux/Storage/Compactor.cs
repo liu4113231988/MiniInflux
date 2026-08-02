@@ -29,7 +29,7 @@ public sealed class Compactor
 
     public Compactor(Manifest manifest, ShardManager shardManager, TombstoneStore tombstones,
         SchemaRegistry schema, int maxL0Segments = 10, int maxL1Segments = 4,
-        long maxL0Bytes = 256 * 1024 * 1024, long maxL1Bytes = 256 * 1024 * 1024,
+        long maxL0Bytes = 512 * 1024 * 1024, long maxL1Bytes = 512 * 1024 * 1024,
         int minFilesPerCompaction = 2, int maxPassesPerRun = 8, StorageHealth? health = null)
     {
         _manifest = manifest;
