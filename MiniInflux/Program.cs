@@ -30,9 +30,9 @@ if (cliExitCode.HasValue)
 builder.Logging.ClearProviders();
 var appLevel = ParseLogLevel(options.Logging.Level);
 var systemLevel = ParseLogLevel(options.Logging.SystemLevel);
-// Set default minimum level to the higher of the two
+// Keep the lower threshold globally, then enforce each namespace's configured threshold.
 builder.Logging.SetMinimumLevel(appLevel < systemLevel ? appLevel : systemLevel);
-// Apply separate levels for system vs application loggers
+builder.Logging.AddFilter("MiniInflux", appLevel);
 builder.Logging.AddFilter("Microsoft", systemLevel);
 builder.Logging.AddFilter("Microsoft.AspNetCore", systemLevel);
 builder.Logging.AddFilter("Microsoft.Hosting", systemLevel);
@@ -117,7 +117,7 @@ builder.Services.AddSingleton<ContinuousQueryRunner>();
 builder.Services.AddHostedService<ContinuousQueryHostedService>();
 
 var app = builder.Build();
-var runtimeLogger = app.Logger;
+var runtimeLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("MiniInflux.Runtime");
 var accessLogWriter = app.Services.GetRequiredService<AccessLogWriter>();
 var staticAssets = Assembly.GetExecutingAssembly()
     .GetManifestResourceNames()

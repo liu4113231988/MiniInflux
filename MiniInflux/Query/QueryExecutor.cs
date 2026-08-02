@@ -242,7 +242,7 @@ public sealed class QueryExecutor
         {
             return new QueryChunkedExecutionOutcome
             {
-                Responses = ExecuteStreamingRawSelect(e, db, parsed, safeChunkSize, report, cancellationToken),
+                Responses = ExecuteStreamingRawSelect(e, db, q, parsed, safeChunkSize, report, cancellationToken),
                 Report = report,
                 UsedStreamingRawSelect = true
             };
@@ -260,13 +260,13 @@ public sealed class QueryExecutor
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var report = new QueryExecutionReport();
-        var queryId = RegisterActiveQuery(q, db);
+        using var timeoutCts = _maxQueryDurationMs > 0 ? new CancellationTokenSource(_maxQueryDurationMs) : null;
+        using var linkedCts = timeoutCts != null
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
+            : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var queryId = RegisterActiveQuery(q, db, linkedCts);
         try
         {
-            using var timeoutCts = _maxQueryDurationMs > 0 ? new CancellationTokenSource(_maxQueryDurationMs) : null;
-            using var linkedCts = timeoutCts != null
-                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
-                : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             var token = linkedCts.Token;
 
             var parsed = InfluxQlParser.Parse(q);
@@ -287,7 +287,7 @@ public sealed class QueryExecutor
             report.DurationMs = sw.ElapsedMilliseconds;
             return new QueryExecutionOutcome { Response = response, Report = report };
         }
-        catch (OperationCanceledException) when (_maxQueryDurationMs > 0 && !cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (timeoutCts?.IsCancellationRequested == true)
         {
             sw.Stop();
             report.DurationMs = sw.ElapsedMilliseconds;
@@ -364,7 +364,7 @@ public sealed class QueryExecutor
         return new QueryResponse { Results = [new QueryResult { StatementId = 0, Series = [firstSeries] }] };
     }
 
-    IEnumerable<QueryResponse> ExecuteStreamingRawSelect(TsdbEngine e, string? db, ParsedQuery q, int chunkSize, QueryExecutionReport report, CancellationToken cancellationToken)
+    IEnumerable<QueryResponse> ExecuteStreamingRawSelect(TsdbEngine e, string? db, string queryText, ParsedQuery q, int chunkSize, QueryExecutionReport report, CancellationToken cancellationToken)
     {
         report.UsedStreamingRawSelect = true;
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -372,6 +372,7 @@ public sealed class QueryExecutor
         using var linkedCts = timeoutCts != null
             ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
             : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var queryId = RegisterActiveQuery(queryText, db, linkedCts);
         using var enumerator = StreamRawSelectChunks(e, db, q, chunkSize, report, linkedCts.Token).GetEnumerator();
 
         try
@@ -388,7 +389,7 @@ public sealed class QueryExecutor
                     else
                         done = true;
                 }
-                catch (OperationCanceledException) when (_maxQueryDurationMs > 0 && !cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (timeoutCts?.IsCancellationRequested == true)
                 {
                     report.TimedOut = true;
                     report.Error = $"query timed out after {_maxQueryDurationMs} ms";
@@ -420,6 +421,7 @@ public sealed class QueryExecutor
         }
         finally
         {
+            UnregisterActiveQuery(queryId);
             sw.Stop();
             report.DurationMs = sw.ElapsedMilliseconds;
         }
@@ -538,17 +540,13 @@ public sealed class QueryExecutor
         // Apply WITH MEASUREMENT filter
         if (!string.IsNullOrEmpty(q.MeasurementFilter))
         {
-            if (q.MeasurementFilter.StartsWith("/") || q.MeasurementFilter.Contains(".*"))
-            {
-                // Regex filter
-                var pattern = q.MeasurementFilter.Trim('/');
-                measurements = measurements.Where(m => Regex.IsMatch(m, pattern)).ToList();
-            }
+            if (q.MeasurementFilterIsRegex)
+                measurements = measurements.Where(m => Regex.IsMatch(m, q.MeasurementFilter)).ToList();
             else
-            {
                 measurements = measurements.Where(m => m.Equals(q.MeasurementFilter, StringComparison.Ordinal)).ToList();
-            }
         }
+        if (HasTagFilters(q))
+            measurements = measurements.Where(m => e.ListSeries(db!, m).Any(series => PassesTagFilters(ParseTagsCanonical(series), q))).ToList();
         return [new() { Name = "measurements", Columns = ["name"], Values = measurements.Select(x => new List<object?> { x }).ToList() }];
     }
 
@@ -566,31 +564,23 @@ public sealed class QueryExecutor
     List<QuerySeries>? ShowTagKeys(TsdbEngine e, string? db, ParsedQuery q)
     {
         Req(db);
-        return [new() { Name = q.Measurement ?? "tagKeys", Columns = ["tagKey"], Values = e.ListTagKeys(db!, q.Measurement).Select(x => new List<object?> { x }).ToList() }];
+        var keys = HasTagFilters(q) && !e.ListSeries(db!, q.Measurement).Any(series => PassesTagFilters(ParseTagsCanonical(series), q))
+            ? []
+            : e.ListTagKeys(db!, q.Measurement);
+        return [new() { Name = q.Measurement ?? "tagKeys", Columns = ["tagKey"], Values = keys.Select(x => new List<object?> { x }).ToList() }];
     }
 
     List<QuerySeries>? ShowTagValues(TsdbEngine e, string? db, ParsedQuery q)
     {
         Req(db);
-        var tagValues = e.ListTagValues(db!, q.Measurement, q.TagKey ?? "");
-        // Apply WHERE filter for tag values
-        if (q.ShowTagFilters.Count > 0)
-        {
-            foreach (var filter in q.ShowTagFilters)
-            {
-                if (filter.Key.Equals(q.TagKey, StringComparison.OrdinalIgnoreCase))
-                {
-                    tagValues = filter.Op switch
-                    {
-                        TagOp.Eq => tagValues.Where(tv => tv.Value == filter.Value).ToList(),
-                        TagOp.Neq => tagValues.Where(tv => tv.Value != filter.Value).ToList(),
-                        TagOp.Regex => tagValues.Where(tv => Regex.IsMatch(tv.Value, filter.Value)).ToList(),
-                        TagOp.NotRegex => tagValues.Where(tv => !Regex.IsMatch(tv.Value, filter.Value)).ToList(),
-                        _ => tagValues
-                    };
-                }
-            }
-        }
+        var key = q.TagKey ?? "";
+        var tagValues = e.ListSeries(db!, q.Measurement)
+            .Select(ParseTagsCanonical)
+            .Where(tags => PassesTagFilters(tags, q) && tags.ContainsKey(key))
+            .Select(tags => (Key: key, Value: tags[key]))
+            .Distinct()
+            .OrderBy(value => value.Value, StringComparer.Ordinal)
+            .ToList();
         return [new()
         {
             Name = q.Measurement ?? "tagValues",
@@ -926,6 +916,11 @@ public sealed class QueryExecutor
         }
 
         var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        var distinctField = q.Select.SingleOrDefault(item => item.IsDistinct)?.Field;
+        if (distinctField != null)
+            pts = pts.DistinctBy(point => point.Fields.TryGetValue(distinctField, out var field)
+                ? field.ToObject()
+                : point.Tags.GetValueOrDefault(distinctField)).ToList();
         if (!pointsAreDescending || (q.Offset ?? 0) != 0)
             pts = pts.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
 
@@ -962,17 +957,6 @@ public sealed class QueryExecutor
 
         EnsureWithinLimit(vals.Count);
 
-        // Handle SELECT DISTINCT: deduplicate rows by the selected field values
-        if (q.Select.Any(s => s.IsDistinct))
-        {
-            var distinctFields = q.Select.Where(s => s.IsDistinct).Select(s => s.Field).ToHashSet(StringComparer.Ordinal);
-            var fieldIndices = fields.Select((f, i) => (f, i)).Where(fi => distinctFields.Contains(fi.f)).Select(fi => fi.i).ToList();
-            vals = vals
-                .GroupBy(row => string.Join("|", fieldIndices.Select(idx => row[1 + tags.Count + idx]?.ToString() ?? "")))
-                .Select(g => g.First())
-                .ToList();
-        }
-
         List<QuerySeries> rawResult =
         [
             new()
@@ -1004,6 +988,7 @@ public sealed class QueryExecutor
             || q.Subquery != null
             || q.GroupByNs.HasValue
             || q.Select.Any(s => !string.IsNullOrEmpty(s.Func))
+            || q.Select.Any(s => s.IsDistinct)
             || !string.IsNullOrWhiteSpace(q.IntoTarget)
             || string.IsNullOrWhiteSpace(q.Measurement)
             || (seriesFilter == null && (q.TagFilters.Count != 0 || q.HasOrFilters))
@@ -1074,7 +1059,12 @@ public sealed class QueryExecutor
             }
         }
 
-        var orderedRows = rows.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit).ToList();
+        var groupedByTags = q.GroupByTags.Count > 0 || q.GroupByAllTags;
+        var orderedRows = groupedByTags
+            ? rows.GroupBy(row => BuildGroupByTagKey(ParseTagsCanonical(row.TagsCanonical), q.GroupByTags, q.GroupByAllTags), StringComparer.Ordinal)
+                .SelectMany(group => group.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit))
+                .ToList()
+            : rows.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit).ToList();
         foreach (var row in orderedRows)
             resultBytes += 16 + row.Row.Sum(EstimateObjectBytes);
 
@@ -1090,14 +1080,13 @@ public sealed class QueryExecutor
         EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
 
         // When GROUP BY tags is specified, return one series per tag value combination
-        if (q.GroupByTags.Count > 0 || q.GroupByAllTags)
+        if (groupedByTags)
         {
-            var grouped = orderedRows.GroupBy(r => r.TagsCanonical, StringComparer.Ordinal);
+            var grouped = orderedRows.GroupBy(r => BuildGroupByTagKey(ParseTagsCanonical(r.TagsCanonical), q.GroupByTags, q.GroupByAllTags), StringComparer.Ordinal);
             var result = new List<QuerySeries>();
             foreach (var group in grouped)
             {
-                var groupTags = ParseTagsCanonical(group.Key);
-                var groupTagDict = new Dictionary<string, string>(groupTags, StringComparer.Ordinal);
+                var groupTagDict = BuildGroupByTags(group.Key, q.GroupByTags, q.GroupByAllTags);
                 result.Add(new QuerySeries
                 {
                     Name = resultMeasurement,
@@ -1131,6 +1120,7 @@ public sealed class QueryExecutor
             || q.GroupByTags.Count > 0
             || q.GroupByAllTags
             || q.Select.Any(s => !string.IsNullOrEmpty(s.Func))
+            || q.Select.Any(s => s.IsDistinct)
             || !string.IsNullOrWhiteSpace(q.IntoTarget)
             || string.IsNullOrWhiteSpace(q.Measurement)
             || seriesFilter == null
@@ -1156,6 +1146,8 @@ public sealed class QueryExecutor
             return null;
 
         if (items.Count == 0 || items.Count != q.Select.Count)
+            return null;
+        if (items.Any(item => item.IsCountDistinct))
             return null;
         if (items.Any(i => !IsSimpleStreamingAggregate(i) || (i.Field == "*" && i.Func != "count")))
             return null;
@@ -1467,10 +1459,7 @@ public sealed class QueryExecutor
                 {
                     var matches = GetMatchingSeries(e, db, q.Measurement, filter, fieldKeys);
                     if (matches == null)
-                    {
-                        groupMatches = null;
-                        break; // This group has an unmatched filter, skip it
-                    }
+                        return null;
                     if (groupMatches == null)
                         groupMatches = new HashSet<string>(matches, StringComparer.Ordinal);
                     else
@@ -2149,7 +2138,7 @@ public sealed class QueryExecutor
     {
         var targetDb = q.SourceDatabase ?? db;
         var targetRp = q.SourceRpName;
-        if (q.TagFilters.Count == 0 && q.FieldFilters.Count == 0)
+        if (!HasTagFilters(q) && q.FieldFilters.Count == 0)
         {
             if (targetRp != null)
                 e.DeleteFromMeasurement(targetDb, targetRp, q.Measurement!, q.MinTimeNs, q.MaxTimeNs);
@@ -2161,12 +2150,12 @@ public sealed class QueryExecutor
         if (targetRp != null)
         {
             e.DeleteFromMeasurement(targetDb, targetRp, q.Measurement!, q.MinTimeNs, q.MaxTimeNs, p =>
-                MatchesTagFilters(p, q.TagFilters) && MatchesFieldFilters(p, q.FieldFilters));
+                PassesTagFilters(p, q) && MatchesFieldFilters(p, q.FieldFilters));
             return;
         }
 
         e.DeleteFromMeasurement(targetDb, q.Measurement!, q.MinTimeNs, q.MaxTimeNs, p =>
-            MatchesTagFilters(p, q.TagFilters) && MatchesFieldFilters(p, q.FieldFilters));
+            PassesTagFilters(p, q) && MatchesFieldFilters(p, q.FieldFilters));
     }
 
     static void DropSeries(TsdbEngine e, string db, ParsedQuery q)
@@ -2181,10 +2170,10 @@ public sealed class QueryExecutor
                 .DefaultIfEmpty(e.GetDefaultRpName(db))
                 .SelectMany(rp => e.ReadAllPoints(db, rp, measurement, q.MinTimeNs, q.MaxTimeNs, fieldFilters: q.FieldFilters))
                 .ToList();
-            points = ApplyTagFilters(points, q.TagFilters);
+            points = points.Where(point => PassesTagFilters(point, q)).ToList();
             points = ApplyFieldFilters(points, q.FieldFilters);
             var series = points.Select(p => SeriesKey.From(p).TagsCanonical).Distinct(StringComparer.Ordinal).ToList();
-            if (q.TagFilters.Count == 0 && q.FieldFilters.Count == 0 && series.Count == 0)
+            if (!HasTagFilters(q) && q.FieldFilters.Count == 0 && series.Count == 0)
                 series = e.ListSeries(db, measurement).ToList();
             e.DropSeries(db, measurement, series);
         }
@@ -2233,10 +2222,31 @@ public sealed class QueryExecutor
             return countResult;
         }
 
-        var values = pts
-            .Where(p => p.Fields.TryGetValue(item.Field, out var v) && v.AsDouble().HasValue)
-            .Select(p => (p.TimestampNs, Value: p.Fields[item.Field].AsDouble()!.Value))
-            .OrderBy(p => p.TimestampNs)
+        var fieldValues = pts
+            .Where(point => point.Fields.ContainsKey(item.Field))
+            .Select(point => (point.TimestampNs, Value: point.Fields[item.Field]))
+            .OrderBy(point => point.TimestampNs)
+            .ToList();
+        if (item.Func == "mode" && fieldValues.Count > 0)
+        {
+            var mode = fieldValues.GroupBy(value => value.Value)
+                .OrderByDescending(group => group.Count())
+                .ThenBy(group => group.Min(value => value.TimestampNs))
+                .First();
+            return new SortedDictionary<long, object?> { [mode.Last().TimestampNs] = mode.Key.ToObject() };
+        }
+        if (item.Func is "count" or "first" or "last" && fieldValues.Count > 0)
+        {
+            var timestamp = item.Func == "first" ? fieldValues[0].TimestampNs : fieldValues[^1].TimestampNs;
+            return new SortedDictionary<long, object?>
+            {
+                [timestamp] = Calc(fieldValues.Select(value => value.Value).ToList(), item.Func, isCountDistinct: item.IsCountDistinct)
+            };
+        }
+
+        var values = fieldValues
+            .Where(value => value.Value.AsDouble().HasValue)
+            .Select(value => (value.TimestampNs, Value: value.Value.AsDouble()!.Value))
             .ToList();
 
         var result = new SortedDictionary<long, object?>();
@@ -2251,7 +2261,7 @@ public sealed class QueryExecutor
                 for (int i = 1; i < values.Count; i++)
                 {
                     var diff = values[i].Value - values[i - 1].Value;
-                    result[values[i].TimestampNs] = diff < 0 ? 0 : diff;
+                    if (diff >= 0) result[values[i].TimestampNs] = diff;
                 }
                 break;
             case "derivative":
@@ -2262,8 +2272,24 @@ public sealed class QueryExecutor
                     var deltaNs = values[i].TimestampNs - values[i - 1].TimestampNs;
                     if (deltaNs <= 0) continue;
                     var rate = (values[i].Value - values[i - 1].Value) * unitNs / deltaNs;
-                    result[values[i].TimestampNs] = item.Func == "non_negative_derivative" && rate < 0 ? 0 : rate;
+                    if (item.Func != "non_negative_derivative" || rate >= 0)
+                        result[values[i].TimestampNs] = rate;
                 }
+                break;
+            case "abs":
+            case "ceil":
+            case "floor":
+            case "round":
+            case "sqrt":
+                foreach (var value in values)
+                    result[value.TimestampNs] = item.Func switch
+                    {
+                        "abs" => Math.Abs(value.Value),
+                        "ceil" => Math.Ceiling(value.Value),
+                        "floor" => Math.Floor(value.Value),
+                        "round" => Math.Round(value.Value, (int)item.Param),
+                        _ => Math.Sqrt(value.Value)
+                    };
                 break;
             case "moving_average":
                 var window = Math.Max(1, (int)item.Param);
@@ -2307,8 +2333,10 @@ public sealed class QueryExecutor
 
     static object? Calc(List<FieldValue> vs, string fn, double param = 0, List<long>? timestamps = null, long? unitNs = null, bool isCountDistinct = false)
     {
-        if (fn == "count") return isCountDistinct ? (long)vs.Select(v => v.ToObject()?.ToString()).Distinct().Count() : (long)vs.Count;
+        if (fn == "count") return isCountDistinct ? vs.Distinct().LongCount() : (long)vs.Count;
         if (vs.Count == 0) return null;
+        if (fn == "mode")
+            return vs.GroupBy(value => value).OrderByDescending(group => group.Count()).First().Key.ToObject();
         var nums = vs.Select(v => v.AsDouble()).Where(x => x.HasValue).Select(x => x!.Value).ToList();
         var effectiveUnitNs = unitNs ?? 1_000_000_000L;
         return fn switch
@@ -2326,8 +2354,7 @@ public sealed class QueryExecutor
             "derivative" => CalcDerivative(timestamps, nums, false, effectiveUnitNs),
             "non_negative_derivative" => CalcDerivative(timestamps, nums, true, effectiveUnitNs),
             "difference" => nums.Count < 2 ? null : nums[^1] - nums[0],
-            "non_negative_difference" => nums.Count < 2 ? null : Math.Max(0, nums[^1] - nums[0]),
-            "mode" => nums.Count == 0 ? null : CalcMode(nums),
+            "non_negative_difference" => nums.Count < 2 || nums[^1] < nums[0] ? null : nums[^1] - nums[0],
             "abs" => nums.Count == 0 ? null : Math.Abs(nums[^1]),
             "ceil" => nums.Count == 0 ? null : Math.Ceiling(nums[^1]),
             "floor" => nums.Count == 0 ? null : Math.Floor(nums[^1]),
@@ -2366,7 +2393,7 @@ public sealed class QueryExecutor
         var timeDiffNs = timestamps[^1] - timestamps[0];
         if (timeDiffNs <= 0) return null;
         var rate = valDiff * unitNs / timeDiffNs;
-        if (nonNegative && rate < 0) return 0;
+        if (nonNegative && rate < 0) return null;
         return rate;
     }
 
@@ -2383,33 +2410,26 @@ public sealed class QueryExecutor
         return area;
     }
 
-    static double CalcMode(List<double> nums)
-    {
-        if (nums.Count == 0) return 0;
-        var groups = nums.GroupBy(n => n).OrderByDescending(g => g.Count()).ThenBy(g => g.Key);
-        return groups.First().Key;
-    }
-
     /// <summary>
     /// Active query registry for SHOW QUERIES / KILL QUERY.
     /// </summary>
-    static int _nextQueryId = 1;
+    static long _nextQueryId;
     static readonly Dictionary<long, ActiveQueryInfo> _activeQueries = new();
     static readonly object _activeQueriesLock = new();
 
-    record ActiveQueryInfo(int Id, string Query, string? Database, long StartedAtMs);
+    record ActiveQueryInfo(long Id, string Query, string? Database, long StartedAtMs, CancellationTokenSource Cancellation);
 
-    static int RegisterActiveQuery(string query, string? db)
+    static long RegisterActiveQuery(string query, string? db, CancellationTokenSource cancellation)
     {
         lock (_activeQueriesLock)
         {
-            var id = _nextQueryId++;
-            _activeQueries[id] = new ActiveQueryInfo(id, query, db, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            var id = ++_nextQueryId;
+            _activeQueries[id] = new ActiveQueryInfo(id, query, db, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), cancellation);
             return id;
         }
     }
 
-    static void UnregisterActiveQuery(int id)
+    static void UnregisterActiveQuery(long id)
     {
         lock (_activeQueriesLock)
         {
@@ -2419,10 +2439,10 @@ public sealed class QueryExecutor
 
     static void CancelQuery(long id)
     {
+        CancellationTokenSource? cancellation;
         lock (_activeQueriesLock)
-        {
-            _activeQueries.Remove(id);
-        }
+            cancellation = _activeQueries.GetValueOrDefault(id)?.Cancellation;
+        cancellation?.Cancel();
     }
 
     List<QuerySeries>? ShowQueries()
@@ -2455,18 +2475,21 @@ public sealed class QueryExecutor
 
     List<QuerySeries>? ExplainQuery(TsdbEngine e, string? db, ParsedQuery q, CancellationToken cancellationToken, QueryExecutionReport report)
     {
-        // Execute the inner query and return the execution report as a result series
+        var inner = q.ExplainedQuery ?? throw new InvalidOperationException("EXPLAIN query is missing its SELECT statement");
         var innerReport = new QueryExecutionReport();
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        List<QuerySeries>? series = null;
-        try { series = Run(e, db, q, cancellationToken, innerReport); }
-        catch (Exception ex) { innerReport.Error = ex.Message; }
+        if (q.ExplainAnalyze)
+        {
+            try { Run(e, db, inner, cancellationToken, innerReport); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { innerReport.Error = ex.Message; }
+        }
         sw.Stop();
 
         var rows = new List<List<object?>>
         {
             new() { "QUERY PLAN", "SCAN" },
-            new() { "measurement", q.Measurement ?? "" },
+            new() { "measurement", inner.Measurement ?? "" },
             new() { "scanned_points", (long)innerReport.ScannedPoints },
             new() { "rows_returned", (long)innerReport.RowsReturned },
             new() { "duration_ms", sw.ElapsedMilliseconds },
@@ -2492,7 +2515,7 @@ public sealed class QueryExecutor
                 .ToList();
 
         return points
-            .Where(p => p.Fields.TryGetValue(field, out var v) && v.AsDouble().HasValue)
+            .Where(p => p.Fields.ContainsKey(field))
             .OrderBy(p => p.TimestampNs)
             .Select(p => (p.TimestampNs, p.Fields[field]))
             .ToList();
@@ -2537,6 +2560,7 @@ public sealed class QueryExecutor
     {
         var items = q.Select.Where(s => s.Func != "").ToList();
         if (items.Count == 0) return null;
+        if (items.Any(item => item.IsCountDistinct)) return null;
         if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt"))
             return null;
         if (q.FieldFilters.Count > 0) return null;
@@ -2600,6 +2624,7 @@ public sealed class QueryExecutor
     {
         var items = q.Select.Where(s => s.Func != "").ToList();
         if (items.Count == 0) return null;
+        if (items.Any(item => item.IsCountDistinct)) return null;
         // Only handle count queries (not sum, min, max, mean, etc.)
         if (items.Any(i => i.Func != "count")) return null;
         if (q.FieldFilters.Count > 0) return null;
@@ -2649,6 +2674,8 @@ public sealed class QueryExecutor
 
         var items = q.Select.Where(s => s.Func != "").ToList();
         if (items.Count == 0)
+            return null;
+        if (items.Any(item => item.IsCountDistinct))
             return null;
         if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt"))
             return null;
@@ -2945,6 +2972,7 @@ public sealed class QueryExecutor
         && q.GroupByTags.Count == 0
         && !q.GroupByAllTags
         && q.Select.All(s => string.IsNullOrEmpty(s.Func))
+        && q.Select.All(s => !s.IsDistinct)
         && string.IsNullOrWhiteSpace(q.IntoTarget)
         && !q.Desc
         && !string.IsNullOrWhiteSpace(q.Measurement);
@@ -2966,6 +2994,7 @@ public sealed class QueryExecutor
         && q.GroupByTags.Count == 0
         && !q.GroupByAllTags
         && q.Select.All(s => string.IsNullOrEmpty(s.Func))
+        && q.Select.All(s => !s.IsDistinct)
         && string.IsNullOrWhiteSpace(q.IntoTarget)
         && q.Desc
         && q.FieldFilters.Count == 0
@@ -3246,6 +3275,24 @@ public sealed class QueryExecutor
         return true;
     }
 
+    static bool MatchesTagFilters(IReadOnlyDictionary<string, string> tags, List<TagFilter> filters)
+    {
+        foreach (var filter in filters)
+        {
+            tags.TryGetValue(filter.Key, out var value);
+            var matches = filter.Op switch
+            {
+                TagOp.Eq => value == filter.Value,
+                TagOp.Neq => value != filter.Value,
+                TagOp.Regex => value != null && Regex.IsMatch(value, filter.Value),
+                TagOp.NotRegex => value == null || !Regex.IsMatch(value, filter.Value),
+                _ => false
+            };
+            if (!matches) return false;
+        }
+        return true;
+    }
+
     /// <summary>
     /// Match point against OR filter groups.
     /// Returns true if the point matches ANY of the OR groups.
@@ -3275,6 +3322,10 @@ public sealed class QueryExecutor
         }
         return MatchesTagFilters(point, q.TagFilters);
     }
+
+    static bool PassesTagFilters(IReadOnlyDictionary<string, string> tags, ParsedQuery q) =>
+        MatchesTagFilters(tags, q.TagFilters)
+        && (!q.HasOrFilters || q.OrTagFilterGroups.Any(group => MatchesTagFilters(tags, group)));
 
     /// <summary>
     /// Check if any tag filtering is needed (either regular or OR filters).

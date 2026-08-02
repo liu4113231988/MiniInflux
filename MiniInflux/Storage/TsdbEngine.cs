@@ -966,11 +966,19 @@ return Interlocked.Read(ref _bufferedByteCount);
 
     public CompactionStatsSnapshot GetCompactionStats() => _compactor.GetStats();
     public StorageHealth Health => _health;
-    public int CompactNow() => _compactor.CompactAll();
+    public int CompactNow()
+    {
+        var merged = _compactor.CompactAll();
+        if (merged > 0) _segmentMetadataCache.Clear();
+        return merged;
+    }
 
     private void RunCompaction()
     {
-        try { _compactor.CompactAll(); }
+        try
+        {
+            if (_compactor.CompactAll() > 0) _segmentMetadataCache.Clear();
+        }
         catch (Exception ex) { _health.RecordFailure("compaction", ex); }
     }
 
@@ -979,6 +987,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         FlushDatabase(db);
         var dbDir = Path.Combine(_root, "db", db);
         if (Directory.Exists(dbDir)) try { Directory.Delete(dbDir, true); } catch { }
+        _segmentMetadataCache.Clear();
         _manifest.DropDatabase(db); _manifest.SaveIfDirty(); _tombstones.DropDatabase(db);
         _globalLock.EnterWriteLock();
         try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); _locks.TryRemove(k, out var lk); lk?.Dispose(); _bufferReplayFloors.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
@@ -1104,6 +1113,7 @@ return Interlocked.Read(ref _bufferedByteCount);
                 if (shard == null) continue;
                 var dir = _shards.ShardDir(db, rp, shardId);
                 if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+                _segmentMetadataCache.Clear();
                 _manifest.RemoveShardGroup(db, rp, shardId);
                 return true;
             }
@@ -1613,7 +1623,11 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
 
     private void CleanupExpiredShards()
     {
-        try { _shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000); }
+        try
+        {
+            if (_shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000) > 0)
+                _segmentMetadataCache.Clear();
+        }
         catch (Exception ex) { _health.RecordFailure("retention_cleanup", ex); }
     }
 
