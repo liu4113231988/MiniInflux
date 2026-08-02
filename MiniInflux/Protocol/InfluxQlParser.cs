@@ -15,7 +15,11 @@ public enum TagOp { Eq, Neq, Regex, NotRegex }
 public enum FieldOp { Gt, Gte, Lt, Lte, Eq, Neq }
 public enum FillMode { None, Null, Zero, Previous, Linear }
 
-public sealed record SelectItem(string Func, string Field, string Alias, double Param = 0, long? UnitNs = null);
+public sealed record SelectItem(string Func, string Field, string Alias, double Param = 0, long? UnitNs = null)
+{
+    public bool IsDistinct { get; init; }
+    public bool IsCountDistinct { get; init; }
+}
 public sealed record TagFilter(string Key, string Value, TagOp Op);
 public sealed record FieldFilter(string Field, double Value, FieldOp Op);
 public sealed class ParsedQuery
@@ -40,6 +44,8 @@ public sealed class ParsedQuery
     public bool GroupByAllTags { get; init; }
     public FillMode Fill { get; init; } = FillMode.None;
     public string? TagKey { get; init; }
+    public string? MeasurementFilter { get; init; }
+    public List<TagFilter> ShowTagFilters { get; init; } = [];
     public List<TagFilter> TagFilters { get; init; } = [];
     public List<FieldFilter> FieldFilters { get; init; } = [];
 
@@ -96,6 +102,8 @@ public static class InfluxQlParser
             return new() { Kind = QueryKind.ShowDatabases };
         if (q.Equals("SHOW MEASUREMENTS", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowMeasurements };
+        if (q.StartsWith("SHOW MEASUREMENTS", StringComparison.OrdinalIgnoreCase))
+            return ParseShowMeasurements(q);
         if (q.StartsWith("SHOW SERIES CARDINALITY", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowSeriesCardinality, Measurement = AfterFrom(q) };
         if (q.StartsWith("SHOW SERIES", StringComparison.OrdinalIgnoreCase))
@@ -107,12 +115,9 @@ public static class InfluxQlParser
         if (q.StartsWith("SHOW FIELD KEYS", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowFieldKeys, Measurement = AfterFrom(q) };
         if (q.StartsWith("SHOW TAG KEYS", StringComparison.OrdinalIgnoreCase))
-            return new() { Kind = QueryKind.ShowTagKeys, Measurement = AfterFrom(q) };
+            return ParseShowTagKeys(q);
         if (q.StartsWith("SHOW TAG VALUES", StringComparison.OrdinalIgnoreCase))
-        {
-            var m = AfterFrom(q); var key = AfterKey(q);
-            return new() { Kind = QueryKind.ShowTagValues, Measurement = m, TagKey = key };
-        }
+            return ParseShowTagValues(q);
         if (q.StartsWith("SELECT ", StringComparison.OrdinalIgnoreCase)) return ParseSelect(q);
         throw new NotSupportedException($"unsupported query: {q}");
     }
@@ -278,6 +283,86 @@ Kind = QueryKind.DropSeries,
             OrTagFilterGroups = orGroups,
             HasOrFilters = hasOr
         };
+    }
+
+    static ParsedQuery ParseShowMeasurements(string q)
+    {
+        var u = q.ToUpperInvariant();
+        string? measurementFilter = null;
+        List<TagFilter> tagFilters = [];
+
+        // Parse WITH MEASUREMENT =~ /regex/
+        var withIdx = u.IndexOf(" WITH MEASUREMENT ");
+        if (withIdx >= 0)
+        {
+            var rest = q[(withIdx + 18)..].Trim();
+            if (rest.Contains("=~"))
+            {
+                var parts = rest.Split("=~", 2);
+                measurementFilter = ExtractRegex(parts[1].Trim());
+            }
+            else
+            {
+                measurementFilter = Unq(rest.Trim().Trim('\''));
+            }
+        }
+
+        // Parse WHERE clause
+        var whereIdx = u.IndexOf(" WHERE ");
+        if (whereIdx >= 0)
+        {
+            var whereEnd = EndClause(u, whereIdx + 7);
+            var whereClause = q[(whereIdx + 7)..whereEnd];
+            long? min, max;
+            List<FieldFilter> fieldFilters = [];
+            List<List<TagFilter>> orGroups;
+            bool hasOr;
+            ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr);
+        }
+
+        return new() { Kind = QueryKind.ShowMeasurements, MeasurementFilter = measurementFilter, ShowTagFilters = tagFilters };
+    }
+
+    static ParsedQuery ParseShowTagKeys(string q)
+    {
+        var m = AfterFrom(q);
+        var u = q.ToUpperInvariant();
+        var whereIdx = u.IndexOf(" WHERE ");
+        var tagFilters = new List<TagFilter>();
+        if (whereIdx >= 0)
+        {
+            var whereEnd = EndClause(u, whereIdx + 7);
+            var whereClause = q[(whereIdx + 7)..whereEnd];
+            long? min, max;
+            List<FieldFilter> fieldFilters = [];
+            List<List<TagFilter>> orGroups;
+            bool hasOr;
+            ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr);
+        }
+        return new() { Kind = QueryKind.ShowTagKeys, Measurement = m, ShowTagFilters = tagFilters };
+    }
+
+    static ParsedQuery ParseShowTagValues(string q)
+    {
+        var m = AfterFrom(q);
+        var key = AfterKey(q);
+        var u = q.ToUpperInvariant();
+        var tagFilters = new List<TagFilter>();
+
+        // Parse WHERE clause for tag value filtering
+        var whereIdx = u.IndexOf(" WHERE ");
+        if (whereIdx >= 0)
+        {
+            var whereEnd = EndClause(u, whereIdx + 7);
+            var whereClause = q[(whereIdx + 7)..whereEnd];
+            long? min, max;
+            List<FieldFilter> fieldFilters = [];
+            List<List<TagFilter>> orGroups;
+            bool hasOr;
+            ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr);
+        }
+
+        return new() { Kind = QueryKind.ShowTagValues, Measurement = m, TagKey = key, ShowTagFilters = tagFilters };
     }
 
     static ParsedQuery ParseSelect(string q)
@@ -455,13 +540,31 @@ Kind = QueryKind.DropSeries,
         {
             var x = raw.Trim();
             if (string.IsNullOrEmpty(x)) continue;
+
+            // Handle DISTINCT: SELECT DISTINCT field FROM ...
+            if (x.StartsWith("DISTINCT ", StringComparison.OrdinalIgnoreCase))
+            {
+                var fld = Unq(x["DISTINCT ".Length..].Trim());
+                items.Add(new SelectItem("distinct", fld, "distinct_" + fld) { IsDistinct = true });
+                continue;
+            }
+
             var p = x.IndexOf('(');
             if (p > 0 && x.EndsWith(')'))
             {
                 var f = x[..p].Trim().ToLowerInvariant();
                 var inner = x[(p + 1)..^1].Trim();
+
+                // Handle COUNT(DISTINCT field)
+                if (f == "count" && inner.StartsWith("DISTINCT ", StringComparison.OrdinalIgnoreCase))
+                {
+                    var fld = Unq(inner["DISTINCT ".Length..].Trim());
+                    items.Add(new SelectItem("count", fld, "count_distinct_" + fld) { IsCountDistinct = true });
+                    continue;
+                }
+
                 var args = inner.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-                var fld = Unq(args[0]);
+                var fld2 = Unq(args[0]);
                 double param = 0;
                 long? unitNs = null;
                 if (args.Length > 1)
@@ -473,8 +576,8 @@ Kind = QueryKind.DropSeries,
                         unitNs = DurationToNs(second);
                 }
                 var aliasSuffix = args.Length > 1 ? "_" + args[1].Trim().Replace("\"", "").Replace("'", "") : "";
-                var alias = $"{f}_{fld}{aliasSuffix}";
-                items.Add(new SelectItem(f, fld, alias, param, unitNs));
+                var alias = $"{f}_{fld2}{aliasSuffix}";
+                items.Add(new SelectItem(f, fld2, alias, param, unitNs));
             }
             else
             {
@@ -590,6 +693,30 @@ Kind = QueryKind.DropSeries,
     {
         s = s.Trim().Trim('\'');
         if (long.TryParse(s, out var n)) return n;
+        // Support epoch with unit suffix: 1234567890s, 1234567890ms, 1234567890u, 1234567890ns
+        if (s.Length > 2)
+        {
+            var suffix = s[^2..].ToLowerInvariant();
+            var numPart = s[..^2];
+            if (long.TryParse(numPart, out var epoch) && suffix is "ns" or "us" or "ms" or ".s")
+                return suffix switch { "ns" => epoch, "us" => epoch * 1000, "ms" => epoch * 1_000_000, _ => 0 };
+        }
+        if (s.Length > 1)
+        {
+            var last = s[^1];
+            var numPart = s[..^1];
+            if (long.TryParse(numPart, out var epoch))
+            {
+                return last switch
+                {
+                    's' => epoch * 1_000_000_000,
+                    'u' => epoch * 1000,
+                    'm' => epoch * 60_000_000_000,
+                    'h' => epoch * 3600_000_000_000,
+                    _ => 0
+                };
+            }
+        }
         if (s.StartsWith("now()", StringComparison.OrdinalIgnoreCase)) return ParseNowTime(s);
         return DateTimeOffset.Parse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal).ToUnixTimeMilliseconds() * 1_000_000;
     }

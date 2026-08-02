@@ -310,6 +310,69 @@ public class InfluxQlParserTests
     }
 
     [Fact]
+    public void Parse_ShowMeasurementsWithRegex_ParsesMeasurementFilter()
+    {
+        var query = InfluxQlParser.Parse("SHOW MEASUREMENTS WITH MEASUREMENT =~ /cpu.*/");
+
+        Assert.Equal(QueryKind.ShowMeasurements, query.Kind);
+        Assert.NotNull(query.MeasurementFilter);
+        Assert.Equal("cpu.*", query.MeasurementFilter);
+    }
+
+    [Fact]
+    public void Parse_ShowTagValuesWithWhere_ParsesTagFilters()
+    {
+        var query = InfluxQlParser.Parse("SHOW TAG VALUES FROM cpu WITH KEY = \"host\" WHERE host = 'server01'");
+
+        Assert.Equal(QueryKind.ShowTagValues, query.Kind);
+        Assert.Equal("cpu", query.Measurement);
+        Assert.Equal("host", query.TagKey);
+        Assert.Single(query.ShowTagFilters);
+        Assert.Equal("host", query.ShowTagFilters[0].Key);
+        Assert.Equal("server01", query.ShowTagFilters[0].Value);
+    }
+
+    [Fact]
+    public void Parse_SelectDistinct_ParsesDistinctField()
+    {
+        var query = InfluxQlParser.Parse("SELECT DISTINCT host FROM cpu");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.Single(query.Select);
+        Assert.True(query.Select[0].IsDistinct);
+        Assert.Equal("host", query.Select[0].Field);
+    }
+
+    [Fact]
+    public void Parse_CountDistinct_ParsesCountDistinctField()
+    {
+        var query = InfluxQlParser.Parse("SELECT COUNT(DISTINCT host) FROM cpu");
+
+        Assert.Equal(QueryKind.Select, query.Kind);
+        Assert.Single(query.Select);
+        Assert.True(query.Select[0].IsCountDistinct);
+        Assert.Equal("host", query.Select[0].Field);
+    }
+
+    [Fact]
+    public void Parse_TimeWithEpochSeconds_ParsesCorrectly()
+    {
+        var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE time >= 1672531200s");
+
+        Assert.NotNull(query.MinTimeNs);
+        Assert.Equal(1672531200L * 1_000_000_000L, query.MinTimeNs.Value);
+    }
+
+    [Fact]
+    public void Parse_TimeWithEpochMilliseconds_ParsesCorrectly()
+    {
+        var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE time >= 1672531200000ms");
+
+        Assert.NotNull(query.MinTimeNs);
+        Assert.Equal(1672531200000L * 1_000_000L, query.MinTimeNs.Value);
+    }
+
+    [Fact]
     public void Parse_CreateContinuousQuery_ParsesDefinition()
     {
         var query = InfluxQlParser.Parse("CREATE CONTINUOUS QUERY cq_cpu ON metrics RESAMPLE EVERY 10s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(10s),host END");

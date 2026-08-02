@@ -492,7 +492,7 @@ public sealed class QueryExecutor
         {
             QueryKind.CreateDatabase => CreateDatabase(e, q),
             QueryKind.ShowDatabases => [new() { Name = "databases", Columns = ["name"], Values = e.ListDatabases().Select(x => new List<object?> { x }).ToList() }],
-            QueryKind.ShowMeasurements => ShowMeasurements(e, db),
+            QueryKind.ShowMeasurements => ShowMeasurements(e, db, q),
             QueryKind.ShowFieldKeys => ShowFieldKeys(e, db, q),
             QueryKind.ShowTagKeys => ShowTagKeys(e, db, q),
             QueryKind.ShowTagValues => ShowTagValues(e, db, q),
@@ -523,10 +523,25 @@ public sealed class QueryExecutor
         return null;
     }
 
-    List<QuerySeries>? ShowMeasurements(TsdbEngine e, string? db)
+    List<QuerySeries>? ShowMeasurements(TsdbEngine e, string? db, ParsedQuery q)
     {
         Req(db);
-        return [new() { Name = "measurements", Columns = ["name"], Values = e.ListMeasurements(db!).Select(x => new List<object?> { x }).ToList() }];
+        var measurements = e.ListMeasurements(db!);
+        // Apply WITH MEASUREMENT filter
+        if (!string.IsNullOrEmpty(q.MeasurementFilter))
+        {
+            if (q.MeasurementFilter.StartsWith("/") || q.MeasurementFilter.Contains(".*"))
+            {
+                // Regex filter
+                var pattern = q.MeasurementFilter.Trim('/');
+                measurements = measurements.Where(m => Regex.IsMatch(m, pattern)).ToList();
+            }
+            else
+            {
+                measurements = measurements.Where(m => m.Equals(q.MeasurementFilter, StringComparison.Ordinal)).ToList();
+            }
+        }
+        return [new() { Name = "measurements", Columns = ["name"], Values = measurements.Select(x => new List<object?> { x }).ToList() }];
     }
 
     List<QuerySeries>? ShowFieldKeys(TsdbEngine e, string? db, ParsedQuery q)
@@ -549,11 +564,30 @@ public sealed class QueryExecutor
     List<QuerySeries>? ShowTagValues(TsdbEngine e, string? db, ParsedQuery q)
     {
         Req(db);
+        var tagValues = e.ListTagValues(db!, q.Measurement, q.TagKey ?? "");
+        // Apply WHERE filter for tag values
+        if (q.ShowTagFilters.Count > 0)
+        {
+            foreach (var filter in q.ShowTagFilters)
+            {
+                if (filter.Key.Equals(q.TagKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    tagValues = filter.Op switch
+                    {
+                        TagOp.Eq => tagValues.Where(tv => tv.Value == filter.Value).ToList(),
+                        TagOp.Neq => tagValues.Where(tv => tv.Value != filter.Value).ToList(),
+                        TagOp.Regex => tagValues.Where(tv => Regex.IsMatch(tv.Value, filter.Value)).ToList(),
+                        TagOp.NotRegex => tagValues.Where(tv => !Regex.IsMatch(tv.Value, filter.Value)).ToList(),
+                        _ => tagValues
+                    };
+                }
+            }
+        }
         return [new()
         {
             Name = q.Measurement ?? "tagValues",
             Columns = ["key", "value"],
-            Values = e.ListTagValues(db!, q.Measurement, q.TagKey ?? "").Select(x => new List<object?> { x.Key, x.Value }).ToList()
+            Values = tagValues.Select(x => new List<object?> { x.Key, x.Value }).ToList()
         }];
     }
 
@@ -919,6 +953,18 @@ public sealed class QueryExecutor
         }
 
         EnsureWithinLimit(vals.Count);
+
+        // Handle SELECT DISTINCT: deduplicate rows by the selected field values
+        if (q.Select.Any(s => s.IsDistinct))
+        {
+            var distinctFields = q.Select.Where(s => s.IsDistinct).Select(s => s.Field).ToHashSet(StringComparer.Ordinal);
+            var fieldIndices = fields.Select((f, i) => (f, i)).Where(fi => distinctFields.Contains(fi.f)).Select(fi => fi.i).ToList();
+            vals = vals
+                .GroupBy(row => string.Join("|", fieldIndices.Select(idx => row[1 + tags.Count + idx]?.ToString() ?? "")))
+                .Select(g => g.First())
+                .ToList();
+        }
+
         List<QuerySeries> rawResult =
         [
             new()
@@ -1363,7 +1409,7 @@ public sealed class QueryExecutor
             var pairs = BuildValuePairs(groupPts, item.Field);
             var values = pairs.Select(p => p.Value).ToList();
             var timestamps = pairs.Select(p => p.TimestampNs).ToList();
-            var scalar = Calc(values, item.Func, item.Param, timestamps, item.UnitNs);
+            var scalar = Calc(values, item.Func, item.Param, timestamps, item.UnitNs, item.IsCountDistinct);
             var timeline = new SortedDictionary<long, object?>();
             if (bucketTimeNs.HasValue)
                 timeline[bucketTimeNs.Value] = scalar;
@@ -2238,15 +2284,15 @@ public sealed class QueryExecutor
                 break;
             default:
                 var pairs = BuildValuePairs(pts, item.Field);
-                result[values[^1].TimestampNs] = Calc(pairs.Select(p => p.Value).ToList(), item.Func, item.Param, pairs.Select(p => p.TimestampNs).ToList(), item.UnitNs);
+                result[values[^1].TimestampNs] = Calc(pairs.Select(p => p.Value).ToList(), item.Func, item.Param, pairs.Select(p => p.TimestampNs).ToList(), item.UnitNs, item.IsCountDistinct);
                 break;
         }
         return result;
     }
 
-    static object? Calc(List<FieldValue> vs, string fn, double param = 0, List<long>? timestamps = null, long? unitNs = null)
+    static object? Calc(List<FieldValue> vs, string fn, double param = 0, List<long>? timestamps = null, long? unitNs = null, bool isCountDistinct = false)
     {
-        if (fn == "count") return (long)vs.Count;
+        if (fn == "count") return isCountDistinct ? (long)vs.Select(v => v.ToObject()?.ToString()).Distinct().Count() : (long)vs.Count;
         if (vs.Count == 0) return null;
         var nums = vs.Select(v => v.AsDouble()).Where(x => x.HasValue).Select(x => x!.Value).ToList();
         var effectiveUnitNs = unitNs ?? 1_000_000_000L;
