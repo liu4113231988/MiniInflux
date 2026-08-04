@@ -1720,16 +1720,46 @@ return Interlocked.Read(ref _bufferedByteCount);
         if (stats == null)
             return true;
 
-        return filter.Op switch
+        // 增强的统计信息过滤，更精确地判断segment是否可能匹配查询条件
+        switch (filter.Op)
         {
-            FieldOp.Eq => stats.Min <= filter.Value && stats.Max >= filter.Value,
-            FieldOp.Neq => !(stats.Count > 0 && Math.Abs(stats.Min - filter.Value) < 1e-9 && Math.Abs(stats.Max - filter.Value) < 1e-9),
-            FieldOp.Gt => stats.Max > filter.Value,
-            FieldOp.Gte => stats.Max >= filter.Value,
-            FieldOp.Lt => stats.Min < filter.Value,
-            FieldOp.Lte => stats.Min <= filter.Value,
-            _ => true
-        };
+            case FieldOp.Eq:
+                // 对于等于操作，只有当filter值在min-max范围内且count>0时才可能匹配
+                if (stats.Count == 0) return false;
+                if (filter.Value < stats.Min || filter.Value > stats.Max) return false;
+                return true;
+                
+            case FieldOp.Neq:
+                // 对于不等于，只要不是所有值都等于filter值就可能匹配
+                if (stats.Count == 0) return true;
+                if (Math.Abs(stats.Min - filter.Value) < 1e-9 && 
+                    Math.Abs(stats.Max - filter.Value) < 1e-9 && 
+                    Math.Abs(stats.Min - stats.Max) < 1e-9) return false;
+                return true;
+                
+            case FieldOp.Gt:
+                // 对于大于，max必须大于filter值且count > 0
+                if (stats.Count == 0 || stats.Max <= filter.Value) return false;
+                return true;
+                
+            case FieldOp.Gte:
+                // 对于大于等于，max必须大于等于filter值且count > 0
+                if (stats.Count == 0 || stats.Max < filter.Value) return false;
+                return true;
+                
+            case FieldOp.Lt:
+                // 对于小于，min必须小于filter值且count > 0
+                if (stats.Count == 0 || stats.Min >= filter.Value) return false;
+                return true;
+                
+            case FieldOp.Lte:
+                // 对于小于等于，min必须小于等于filter值且count > 0
+                if (stats.Count == 0 || stats.Min > filter.Value) return false;
+                return true;
+                
+            default:
+                return true;
+        }
     }
 
     private void FlushLocked(string db, string rp, List<BufferedPoint> l, bool updateCheckpoint = true)

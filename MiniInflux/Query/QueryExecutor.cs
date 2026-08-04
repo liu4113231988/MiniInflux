@@ -1056,7 +1056,11 @@ public sealed class QueryExecutor
             report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + groupingStateBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
 
-            var aggregateResult = AggGroupBy(pts, q, cancellationToken, resultMeasurement);
+            // 并行聚合优化：对大数据集使用并行处理
+            var aggregateResult = pts.Count > 10000 && (q.GroupByTags.Count > 0 || q.GroupByAllTags)
+                ? AggGroupByParallel(pts, q, cancellationToken, resultMeasurement)
+                : AggGroupBy(pts, q, cancellationToken, resultMeasurement);
+                
             report.EstimatedResultBytes = EstimateQuerySeriesBytes(aggregateResult);
             report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + groupingStateBytes + report.EstimatedResultBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
@@ -1499,6 +1503,121 @@ public sealed class QueryExecutor
         var seriesMap = new Dictionary<string, QuerySeries>();
         foreach (var (key, groupPts) in groups.OrderBy(g => g.Key.BucketTime ?? 0))
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            var tagsDict = BuildGroupByTags(key.TagKey, tagNames, groupByAllTags);
+            var seriesKey = key.TagKey;
+            if (!seriesMap.TryGetValue(seriesKey, out var series))
+            {
+                var cols = new List<string> { "time" };
+                cols.AddRange(items.Select(x => x.Alias));
+                series = new QuerySeries { Name = resultMeasurement, Tags = tagsDict, Columns = cols, Values = [] };
+                seriesMap[seriesKey] = series;
+            }
+
+            foreach (var row in BuildGroupedRows(groupPts, items, key.BucketTime, cancellationToken))
+                series.Values.Add(row);
+        }
+
+        if (!hasRowExpandingFunctions && step.HasValue && q.Fill != FillMode.None && q.MinTimeNs.HasValue && q.MaxTimeNs.HasValue)
+            ApplyFill(seriesMap, q, step.Value, items);
+
+        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        foreach (var s in seriesMap.Values)
+        {
+            s.Values = OrderRowsByTime(s.Values, q.Desc);
+            s.Values = s.Values.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
+        }
+
+        var seriesList = ApplySeriesWindow(seriesMap.Values, q.SeriesOffset, q.SeriesLimit);
+        EnsureWithinLimit(seriesList.Sum(s => s.Values.Count));
+        return seriesList;
+    }
+
+    /// <summary>
+    /// Parallel GROUP BY implementation for large datasets with tag grouping.
+    /// Uses parallel processing to speed up grouping operations on multi-core systems.
+    /// </summary>
+    List<QuerySeries> AggGroupByParallel(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken, string resultMeasurement)
+    {
+        long? step = q.GroupByNs;
+        var tagNames = q.GroupByTags;
+        var groupByAllTags = q.GroupByAllTags;
+        var items = q.Select.Where(x => x.Func != "").ToList();
+        if (items.Count == 0) items = [new("count", "*", "count")];
+        var hasRowExpandingFunctions = items.Any(IsRowExpandingGroupFunction);
+
+        // For time-only grouping, use the optimized single-threaded path
+        if (step.HasValue && tagNames.Count == 0 && !groupByAllTags)
+        {
+            return AggGroupByTimeOnly(pts, q, cancellationToken, resultMeasurement, step, items, hasRowExpandingFunctions);
+        }
+
+        // Parallel grouping: divide points into chunks and process in parallel
+        var processorCount = Environment.ProcessorCount;
+        var chunkSize = Math.Max(pts.Count / processorCount, 1000);
+        var chunks = new List<List<Point>>();
+        for (int i = 0; i < pts.Count; i += chunkSize)
+        {
+            var chunk = pts.Skip(i).Take(chunkSize).ToList();
+            chunks.Add(chunk);
+        }
+
+        // Parallel grouping phase
+        var allGroups = new Dictionary<(string TagKey, long? BucketTime), List<Point>>[chunks.Count];
+        var options = new ParallelOptions
+        {
+            CancellationToken = cancellationToken,
+            MaxDegreeOfParallelism = processorCount
+        };
+
+        Parallel.For(0, chunks.Count, options, i =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var chunkGroups = new Dictionary<(string TagKey, long? BucketTime), List<Point>>();
+            
+            foreach (var p in chunks[i])
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var tagKey = BuildGroupByTagKey(p.Tags, tagNames, groupByAllTags);
+                long? bucketTime = step.HasValue ? p.TimestampNs / step.Value * step.Value : null;
+                var key = (tagKey, bucketTime);
+                
+                if (!chunkGroups.TryGetValue(key, out var list))
+                {
+                    list = [];
+                    chunkGroups[key] = list;
+                }
+                list.Add(p);
+            }
+            
+            allGroups[i] = chunkGroups;
+        });
+
+        // Merge phase: combine all chunk results
+        var finalGroups = new Dictionary<(string TagKey, long? BucketTime), List<Point>>();
+        foreach (var chunkGroups in allGroups)
+        {
+            if (chunkGroups == null) continue;
+            
+            foreach (var kvp in chunkGroups)
+            {
+                var key = kvp.Key;
+                var groupPts = kvp.Value;
+                if (!finalGroups.TryGetValue(key, out var finalList))
+                {
+                    finalList = [];
+                    finalGroups[key] = finalList;
+                }
+                finalList.AddRange(groupPts);
+            }
+        }
+
+        // Build result series (single-threaded for now to maintain consistency)
+        var seriesMap = new Dictionary<string, QuerySeries>();
+        foreach (var kvp in finalGroups.OrderBy(g => g.Key.BucketTime ?? 0))
+        {
+            var key = kvp.Key;
+            var groupPts = kvp.Value;
             cancellationToken.ThrowIfCancellationRequested();
             var tagsDict = BuildGroupByTags(key.TagKey, tagNames, groupByAllTags);
             var seriesKey = key.TagKey;
