@@ -1017,7 +1017,20 @@ public sealed class QueryExecutor
             }
             else
             {
-                pts = e.ReadAllPoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken);
+                var ascendingRead = TryReadRawAscending(e, sourceDb, sourceRp, q, requestedFields, seriesFilter, _maxResponseRows, cancellationToken);
+                if (ascendingRead != null)
+                {
+                    // pts must be ASC for the Skip/Take below; ReadAllPoints returns ascending, so
+                    // pointsAreDescending stays false and the global read already honors the limit.
+                    pts = ascendingRead.Points;
+                    tagFiltersApplied = true;
+                    report.UsedStreamingRawSelect = true;
+                    ApplyRawReadReport(report, ascendingRead);
+                }
+                else
+                {
+                    pts = e.ReadAllPoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken);
+                }
             }
             EnsureQueryPointLimit(pts.Count);
             report.ScannedPoints += pts.Count;
@@ -1180,48 +1193,86 @@ public sealed class QueryExecutor
         var pointsMaterialized = 0;
         var usedFallbackForSeries = false;
         var fieldSet = new HashSet<string>(fields, StringComparer.Ordinal);
-        foreach (var tagsCanonical in series)
+        var groupedByTags = q.GroupByTags.Count > 0 || q.GroupByAllTags;
+        var globalReadUsed = false;
+
+        // Single-pass global descending read across all series. This walks segments newest-first
+        // and stops once the limit is satisfied, avoiding the per-series scan and the full-scan
+        // fallback that dominated high-cardinality "ORDER BY time DESC ... LIMIT n" queries.
+        // Group-by-tag queries still need per-series reads (LIMIT applies per group), so they
+        // keep the per-series path below.
+        if (!groupedByTags)
         {
-            var read = e.TryReadFlushedFieldsDescending(sourceDb, sourceRp, q.Measurement, tagsCanonical, fields, q.MinTimeNs, q.MaxTimeNs, readLimit, cancellationToken);
-            var tags = ParseTagsCanonical(tagsCanonical);
-            if (read == null)
+            var globalRead = e.TryReadGlobalDescending(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs,
+                requestedFields, seriesFilter, readLimit, cancellationToken);
+            if (globalRead != null)
             {
-                // Fast path unavailable for this series (buffer points exist or field alignment mismatch).
-                // Fall back to full point read for this series only instead of aborting the entire fast path.
-                usedFallbackForSeries = true;
-                var singleSeriesFilter = new HashSet<string>(StringComparer.Ordinal) { tagsCanonical };
-                foreach (var point in e.EnumeratePoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, fieldSet, singleSeriesFilter, null, cancellationToken))
+                globalReadUsed = true;
+                foreach (var point in globalRead.Points)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    scanned++;
-                    pointsMaterialized++;
                     inputBytes += EstimatePointBytes(point);
+                    scanned++;
                     var row = new List<object?>(columns.Count) { Time(point.TimestampNs) };
                     foreach (var tag in tagKeys)
-                        row.Add(tags.TryGetValue(tag, out var value) ? value : null);
+                        row.Add(point.Tags.TryGetValue(tag, out var value) ? value : null);
                     foreach (var field in fields)
                         row.Add(point.Fields.TryGetValue(field, out var fv) ? fv.ToObject() : null);
-                    rows.Add((point.TimestampNs, row, tagsCanonical));
+                    rows.Add((point.TimestampNs, row, ToCanonicalTagKey(point.Tags)));
                 }
-                continue;
-            }
-
-            scanned += read.Timestamps.Count;
-            inputBytes += EstimateFieldRowsBytes(read.Timestamps, read.Rows);
-            segmentColumnsRead += read.SegmentColumnsRead;
-            for (var i = 0; i < read.Timestamps.Count; i++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var row = new List<object?>(columns.Count) { Time(read.Timestamps[i]) };
-                foreach (var tag in tagKeys)
-                    row.Add(tags.TryGetValue(tag, out var value) ? value : null);
-                foreach (var value in read.Rows[i])
-                    row.Add(value.HasValue ? value.Value.ToObject() : null);
-                rows.Add((read.Timestamps[i], row, tagsCanonical));
+                segmentColumnsRead += globalRead.SegmentColumnsRead;
+                report.LimitPushdownStopReason = globalRead.LimitPushdownStopReason;
+                usedFallbackForSeries = globalRead.PointsMaterialized > 0;
             }
         }
 
-        var groupedByTags = q.GroupByTags.Count > 0 || q.GroupByAllTags;
+        if (!globalReadUsed)
+        {
+            // Per-series path: used for GROUP BY tags, or when the global read was unavailable.
+            if (!groupedByTags)
+                usedFallbackForSeries = true;
+            foreach (var tagsCanonical in series)
+            {
+                var read = e.TryReadFlushedFieldsDescending(sourceDb, sourceRp, q.Measurement, tagsCanonical, fields, q.MinTimeNs, q.MaxTimeNs, readLimit, cancellationToken);
+                var tags = ParseTagsCanonical(tagsCanonical);
+                if (read == null)
+                {
+                    // Fast path unavailable for this series (buffer points exist or field alignment mismatch).
+                    // Fall back to full point read for this series only instead of aborting the entire fast path.
+                    usedFallbackForSeries = true;
+                    var singleSeriesFilter = new HashSet<string>(StringComparer.Ordinal) { tagsCanonical };
+                    foreach (var point in e.EnumeratePoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, fieldSet, singleSeriesFilter, null, cancellationToken))
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        scanned++;
+                        pointsMaterialized++;
+                        inputBytes += EstimatePointBytes(point);
+                        var row = new List<object?>(columns.Count) { Time(point.TimestampNs) };
+                        foreach (var tag in tagKeys)
+                            row.Add(tags.TryGetValue(tag, out var value) ? value : null);
+                        foreach (var field in fields)
+                            row.Add(point.Fields.TryGetValue(field, out var fv) ? fv.ToObject() : null);
+                        rows.Add((point.TimestampNs, row, tagsCanonical));
+                    }
+                    continue;
+                }
+
+                scanned += read.Timestamps.Count;
+                inputBytes += EstimateFieldRowsBytes(read.Timestamps, read.Rows);
+                segmentColumnsRead += read.SegmentColumnsRead;
+                for (var i = 0; i < read.Timestamps.Count; i++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var row = new List<object?>(columns.Count) { Time(read.Timestamps[i]) };
+                    foreach (var tag in tagKeys)
+                        row.Add(tags.TryGetValue(tag, out var value) ? value : null);
+                    foreach (var value in read.Rows[i])
+                        row.Add(value.HasValue ? value.Value.ToObject() : null);
+                    rows.Add((read.Timestamps[i], row, tagsCanonical));
+                }
+            }
+        }
+
         var orderedRows = groupedByTags
             ? rows.GroupBy(row => BuildGroupByTagKey(ParseTagsCanonical(row.TagsCanonical), q.GroupByTags, q.GroupByAllTags), StringComparer.Ordinal)
                 .SelectMany(group => group.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit))
@@ -1235,7 +1286,8 @@ public sealed class QueryExecutor
         report.RowsReturned = orderedRows.Count;
         report.SegmentColumnsRead += segmentColumnsRead;
         report.PointsMaterialized = pointsMaterialized;
-        report.LimitPushdownStopReason = usedFallbackForSeries ? "mixed-fallback" : (series.Count == 1 ? "segment-limit" : "series-limit");
+        if (!globalReadUsed)
+            report.LimitPushdownStopReason = usedFallbackForSeries ? "mixed-fallback" : (series.Count == 1 ? "segment-limit" : "series-limit");
         report.EstimatedInputBytes = inputBytes;
         report.EstimatedResultBytes = resultBytes;
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, inputBytes + resultBytes);
@@ -1294,6 +1346,29 @@ public sealed class QueryExecutor
         var rowLimit = Math.Min(q.Limit ?? maxResponseRows, maxResponseRows);
         var readLimit = checked(Math.Max(0, q.Offset ?? 0) + rowLimit);
         return e.TryReadSeriesDescending(sourceDb, sourceRp, q.Measurement, seriesFilter.First(), q.MinTimeNs, q.MaxTimeNs, requestedFields, readLimit, cancellationToken);
+    }
+
+    static TsdbEngine.DescendingSeriesReadResult? TryReadRawAscending(TsdbEngine e, string sourceDb, string sourceRp, ParsedQuery q,
+        HashSet<string>? requestedFields, HashSet<string>? seriesFilter, int maxResponseRows, CancellationToken cancellationToken)
+    {
+        if (q.Desc
+            || q.Subquery != null
+            || q.GroupByNs.HasValue
+            || q.GroupByTags.Count > 0
+            || q.GroupByAllTags
+            || q.Select.Any(s => !string.IsNullOrEmpty(s.Func))
+            || q.Select.Any(s => s.IsDistinct)
+            || !string.IsNullOrWhiteSpace(q.IntoTarget)
+            || string.IsNullOrWhiteSpace(q.Measurement)
+            || !q.Limit.HasValue
+            || q.Limit.Value <= 0
+            || (seriesFilter == null && (q.TagFilters.Count != 0 || q.HasOrFilters))
+            || q.FieldFilters.Count != 0)
+            return null;
+
+        var rowLimit = Math.Min(q.Limit.Value, maxResponseRows);
+        var readLimit = checked(Math.Max(0, q.Offset ?? 0) + rowLimit);
+        return e.TryReadGlobalAscending(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, readLimit, cancellationToken);
     }
 
     List<QuerySeries>? TryGroupByStreamingFunctions(TsdbEngine e, string db, string rp, ParsedQuery q,

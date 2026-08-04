@@ -116,6 +116,78 @@ public class MediumPriorityFixTests : IDisposable
         Assert.Equal(3.0, rows[1][^1]);
     }
 
+[Fact]
+    public async Task RawDescLimit_GlobalRead_ReturnsNewestAcrossSeriesAndSegments()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 3);
+        var points = new List<Point>();
+        for (var s = 1; s <= 4; s++)
+            for (var i = 1; i <= 3; i++)
+                points.Add(Point("INDEX", "value", (i * 4 + s) * 10, $"server{s:00}", i * 4 + s));
+        await engine.WriteAsync("testdb", "autogen", points);
+        engine.FlushAll();
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb",
+            "SELECT * FROM \"INDEX\" ORDER BY time DESC LIMIT 4");
+
+        var rows = Assert.Single(outcome.Response.Results[0].Series!).Values;
+        Assert.Equal(4, rows.Count);
+        Assert.Equal(160.0, rows[0][^1]);
+        Assert.Equal(150.0, rows[1][^1]);
+        Assert.Equal(140.0, rows[2][^1]);
+        Assert.Equal(130.0, rows[3][^1]);
+        Assert.True(outcome.Report.UsedStreamingRawSelect);
+        Assert.Equal(0, outcome.Report.PointsMaterialized);
+        Assert.True(outcome.Report.SegmentColumnsRead > 0);
+    }
+
+    [Fact]
+    public async Task RawAscLimit_GlobalRead_ReturnsOldestAcrossSeriesAndSegments()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 3);
+        var points = new List<Point>();
+        for (var s = 1; s <= 4; s++)
+            for (var i = 1; i <= 3; i++)
+                points.Add(Point("INDEX", "value", (i * 4 + s) * 10, $"server{s:00}", i * 4 + s));
+        await engine.WriteAsync("testdb", "autogen", points);
+        engine.FlushAll();
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb",
+            "SELECT * FROM \"INDEX\" LIMIT 4");
+
+        var rows = Assert.Single(outcome.Response.Results[0].Series!).Values;
+        Assert.Equal(4, rows.Count);
+        Assert.Equal(50.0, rows[0][^1]);
+        Assert.Equal(60.0, rows[1][^1]);
+        Assert.Equal(70.0, rows[2][^1]);
+        Assert.Equal(80.0, rows[3][^1]);
+        Assert.True(outcome.Report.UsedStreamingRawSelect);
+        Assert.Equal(0, outcome.Report.PointsMaterialized);
+        Assert.True(outcome.Report.SegmentColumnsRead > 0);
+    }
+
+    [Fact]
+    public async Task RawAscLimit_GlobalRead_AppliesOffset()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            Point("cpu", "value", 1, "server01", 1),
+            Point("cpu", "value", 2, "server01", 2),
+            Point("cpu", "value", 3, "server01", 3)
+        ]);
+        engine.FlushAll();
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "testdb",
+            "SELECT * FROM cpu OFFSET 1 LIMIT 1");
+
+        if (outcome.Response.Results[0].Error != null)
+            throw new Exception("query error: " + outcome.Response.Results[0].Error + " | report: " + outcome.Report.Error);
+        var row = Assert.Single(outcome.Response.Results[0].Series![0].Values);
+        Assert.Equal(2.0, row[^1]);
+        Assert.True(outcome.Report.UsedStreamingRawSelect);
+    }
+
     [Fact]
     public async Task Select_StringPredicate_MatchesLegacyFieldAndCurrentTag()
     {

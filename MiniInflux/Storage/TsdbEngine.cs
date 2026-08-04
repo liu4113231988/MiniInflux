@@ -715,6 +715,334 @@ public sealed class TsdbEngine : IDisposable
         return new DescendingFieldsReadResult(timestamps, rows, segmentColumnsRead, "segments-exhausted");
     }
 
+    /// <summary>
+    /// Single-pass global descending read across all series in a measurement for
+    /// "ORDER BY time DESC ... LIMIT n" queries. Uses cached segment metadata to walk segments
+    /// newest-first and stops as soon as the limit is satisfied, rejecting points older than the
+    /// current kth-newest cutoff. This avoids the per-series scan and the full-scan fallback that
+    /// previously materialized far more points than needed on high-cardinality measurements with
+    /// many segments or field-misaligned columns.
+    /// Returns null when no bounded limit is provided so callers can fall back.
+    /// </summary>
+    public DescendingSeriesReadResult? TryReadGlobalDescending(
+        string db, string rp, string measurement, long? min, long? max,
+        HashSet<string>? requestedFields, HashSet<string>? allowedTagsCanonical,
+        int? limit, CancellationToken cancellationToken)
+    {
+        if (!limit.HasValue || limit.Value <= 0)
+            return null;
+
+        var key = K(db, rp);
+        var lk = GetLock(key);
+        lk.EnterReadLock();
+        List<(string Tags, long Ts, Point Point)> bufferRows;
+        try
+        {
+            bufferRows = ReadGlobalBufferedPoints(key, measurement, min, max, requestedFields, allowedTagsCanonical);
+        }
+        finally { lk.ExitReadLock(); }
+
+        // Buffer holds the newest writes and wins over segments for the same field.
+        var result = new Dictionary<(string Tags, long Ts), Point>();
+        foreach (var (tags, ts, point) in bufferRows)
+        {
+            if (result.TryGetValue((tags, ts), out var existing))
+            {
+                foreach (var field in point.Fields)
+                    existing.Fields[field.Key] = field.Value;
+            }
+            else
+            {
+                result[(tags, ts)] = point;
+            }
+        }
+
+        long cutoff = limit.HasValue && result.Count >= limit.Value ? KthLargestTimestamp(result, limit.Value) : long.MinValue;
+
+        var candidates = new List<(string Path, long MaxTime)>();
+        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var maxTime = long.MinValue;
+            try
+            {
+                foreach (var m in ReadSegmentMetadataCached(segPath).Metas)
+                {
+                    if (m.Measurement != measurement) continue;
+                    if (allowedTagsCanonical != null && !allowedTagsCanonical.Contains(m.TagsCanonical)) continue;
+                    if (requestedFields != null && !requestedFields.Contains(m.Field)) continue;
+                    if (min.HasValue && m.MaxTime < min.Value) continue;
+                    if (max.HasValue && m.MinTime > max.Value) continue;
+                    if (m.MaxTime > maxTime) maxTime = m.MaxTime;
+                }
+            }
+            catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
+            if (maxTime != long.MinValue) candidates.Add((segPath, maxTime));
+        }
+        candidates.Sort((a, b) => b.MaxTime.CompareTo(a.MaxTime));
+
+        var segmentColumnsRead = 0;
+        var stopReason = "segments-exhausted";
+        foreach (var (segPath, segMaxTime) in candidates)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (result.Count >= limit.Value && segMaxTime <= cutoff)
+            {
+                stopReason = "segment-limit";
+                break;
+            }
+
+            List<SegmentColumn> columns;
+            try { columns = ReadSegmentColumns(db, segPath, requestedFields, measurement, min, max, allowedTagsCanonical); }
+            catch (InvalidDataException) { continue; }
+            catch (FileNotFoundException) { continue; }
+            segmentColumnsRead += columns.Count;
+
+            AddGlobalSegmentColumns(result, columns, cutoff);
+            if (result.Count >= limit.Value)
+            {
+                cutoff = KthLargestTimestamp(result, limit.Value);
+                TrimResultBelowCutoff(result, cutoff);
+            }
+        }
+
+        if (result.Count >= limit.Value)
+            stopReason = "segment-limit";
+
+        var ordered = result.OrderByDescending(kv => kv.Key.Item2)
+            .ThenBy(kv => kv.Key.Item1, StringComparer.Ordinal)
+            .ToList();
+        var points = new List<Point>(Math.Min(ordered.Count, limit.Value));
+        for (var i = 0; i < ordered.Count && i < limit.Value; i++)
+            points.Add(ordered[i].Value);
+
+        return new DescendingSeriesReadResult(points, segmentColumnsRead, 0, stopReason);
+    }
+
+    /// <summary>
+    /// Single-pass global ascending read across all series in a measurement for raw
+    /// "SELECT ... FROM m LIMIT n" queries (no ORDER BY DESC). Uses cached segment metadata to walk
+    /// segments oldest-first and stops as soon as the limit is satisfied, rejecting points newer
+    /// than the current kth-smallest cutoff. This avoids the full-scan materialization that
+    /// ReadAllPoints performs when a raw LIMIT query spans many segments.
+    /// Returns null when no bounded limit is provided so callers can fall back.
+    /// </summary>
+    public DescendingSeriesReadResult? TryReadGlobalAscending(
+        string db, string rp, string measurement, long? min, long? max,
+        HashSet<string>? requestedFields, HashSet<string>? allowedTagsCanonical,
+        int? limit, CancellationToken cancellationToken)
+    {
+        if (!limit.HasValue || limit.Value <= 0)
+            return null;
+
+        var key = K(db, rp);
+        var lk = GetLock(key);
+        List<(string Tags, long Ts, Point Point)> bufferRows;
+        lk.EnterReadLock();
+        try
+        {
+            bufferRows = ReadGlobalBufferedPoints(key, measurement, min, max, requestedFields, allowedTagsCanonical);
+        }
+        finally { lk.ExitReadLock(); }
+
+        var result = new Dictionary<(string Tags, long Ts), Point>();
+        foreach (var (tags, ts, point) in bufferRows)
+        {
+            if (result.TryGetValue((tags, ts), out var existing))
+            {
+                foreach (var field in point.Fields)
+                    existing.Fields[field.Key] = field.Value;
+            }
+            else
+            {
+                result[(tags, ts)] = point;
+            }
+        }
+
+        long cutoff = limit.HasValue && result.Count >= limit.Value ? KthSmallestTimestamp(result, limit.Value) : long.MaxValue;
+
+        var candidates = new List<(string Path, long MinTime)>();
+        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            long minTime = long.MaxValue;
+            try
+            {
+                foreach (var m in ReadSegmentMetadataCached(segPath).Metas)
+                {
+                    if (m.Measurement != measurement) continue;
+                    if (allowedTagsCanonical != null && !allowedTagsCanonical.Contains(m.TagsCanonical)) continue;
+                    if (requestedFields != null && !requestedFields.Contains(m.Field)) continue;
+                    if (min.HasValue && m.MaxTime < min.Value) continue;
+                    if (max.HasValue && m.MinTime > max.Value) continue;
+                    if (m.MinTime < minTime) minTime = m.MinTime;
+                }
+            }
+            catch (InvalidDataException) { }
+            catch (FileNotFoundException) { }
+            if (minTime != long.MaxValue) candidates.Add((segPath, minTime));
+        }
+        candidates.Sort((a, b) => a.MinTime.CompareTo(b.MinTime));
+
+        var segmentColumnsRead = 0;
+        var stopReason = "segments-exhausted";
+        foreach (var (segPath, segMinTime) in candidates)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (result.Count >= limit.Value && segMinTime >= cutoff)
+            {
+                stopReason = "segment-limit";
+                break;
+            }
+
+            List<SegmentColumn> columns;
+            try { columns = ReadSegmentColumns(db, segPath, requestedFields, measurement, min, max, allowedTagsCanonical); }
+            catch (InvalidDataException) { continue; }
+            catch (FileNotFoundException) { continue; }
+            segmentColumnsRead += columns.Count;
+
+            AddGlobalSegmentColumnsAscending(result, columns, cutoff);
+            if (result.Count >= limit.Value)
+            {
+                cutoff = KthSmallestTimestamp(result, limit.Value);
+                TrimResultAboveCutoff(result, cutoff);
+            }
+        }
+
+        if (result.Count >= limit.Value)
+            stopReason = "segment-limit";
+
+        var ordered = result.OrderBy(kv => kv.Key.Item2)
+            .ThenBy(kv => kv.Key.Item1, StringComparer.Ordinal)
+            .ToList();
+        var points = new List<Point>(Math.Min(ordered.Count, limit.Value));
+        for (var i = 0; i < ordered.Count && i < limit.Value; i++)
+            points.Add(ordered[i].Value);
+
+        return new DescendingSeriesReadResult(points, segmentColumnsRead, 0, stopReason);
+    }
+
+    private static void AddGlobalSegmentColumnsAscending(Dictionary<(string, long), Point> result, List<SegmentColumn> columns, long cutoff)
+    {
+        foreach (var column in columns)
+        {
+            var tags = ParseTags(column.TagsCanonical);
+            for (var i = 0; i < column.Timestamps.Count; i++)
+            {
+                var ts = column.Timestamps[i];
+                if (ts > cutoff) break; // timestamps ascend within a column, so the rest are newer
+                if (result.TryGetValue((column.TagsCanonical, ts), out var existing))
+                {
+                    if (!existing.Fields.ContainsKey(column.Field))
+                        existing.Fields[column.Field] = column.Values[i];
+                }
+                else
+                {
+                    result[(column.TagsCanonical, ts)] = new Point
+                    {
+                        Measurement = column.Measurement,
+                        Tags = tags,
+                        TimestampNs = ts,
+                        Fields = new Dictionary<string, FieldValue>(StringComparer.Ordinal) { [column.Field] = column.Values[i] }
+                    };
+                }
+            }
+        }
+    }
+
+    private static long KthSmallestTimestamp(Dictionary<(string, long), Point> result, int limit)
+    {
+        var ts = new long[result.Count];
+        var i = 0;
+        foreach (var kv in result) ts[i++] = kv.Key.Item2;
+        Array.Sort(ts);
+        return ts[limit - 1];
+    }
+
+    private static void TrimResultAboveCutoff(Dictionary<(string, long), Point> result, long cutoff)
+    {
+        List<(string, long)>? toRemove = null;
+        foreach (var kv in result)
+            if (kv.Key.Item2 > cutoff)
+                (toRemove ??= []).Add(kv.Key);
+        if (toRemove == null) return;
+        foreach (var key in toRemove)
+            result.Remove(key);
+    }
+
+    private List<(string Tags, long Ts, Point Point)> ReadGlobalBufferedPoints(
+        string key, string measurement, long? min, long? max,
+        HashSet<string>? requestedFields, HashSet<string>? allowedTagsCanonical)
+    {
+        var result = new List<(string, long, Point)>();
+        if (!_buf.TryGetValue(key, out var list)) return result;
+        foreach (var buffered in BufferedCandidates(key, list, measurement, allowedTagsCanonical))
+        {
+            var p = buffered.Point;
+            if (!Match(p, measurement, min, max)) continue;
+            var point = requestedFields == null ? p : new Point
+            {
+                Measurement = p.Measurement,
+                Tags = p.Tags,
+                Fields = SelectFields(p.Fields, requestedFields),
+                TimestampNs = p.TimestampNs,
+                TagsCanonical = p.TagsCanonical
+            };
+            if (requestedFields != null && point.Fields.Count == 0) continue;
+            result.Add((buffered.SeriesKey.TagsCanonical, point.TimestampNs, point));
+        }
+        return result;
+    }
+
+    private static void AddGlobalSegmentColumns(Dictionary<(string, long), Point> result, List<SegmentColumn> columns, long cutoff)
+    {
+        foreach (var column in columns)
+        {
+            var tags = ParseTags(column.TagsCanonical);
+            for (var i = column.Timestamps.Count - 1; i >= 0; i--)
+            {
+                var ts = column.Timestamps[i];
+                if (ts < cutoff) break; // timestamps ascend within a column, so the rest are older
+                if (result.TryGetValue((column.TagsCanonical, ts), out var existing))
+                {
+                    if (!existing.Fields.ContainsKey(column.Field))
+                        existing.Fields[column.Field] = column.Values[i];
+                }
+                else
+                {
+                    result[(column.TagsCanonical, ts)] = new Point
+                    {
+                        Measurement = column.Measurement,
+                        Tags = tags,
+                        TimestampNs = ts,
+                        Fields = new Dictionary<string, FieldValue>(StringComparer.Ordinal) { [column.Field] = column.Values[i] }
+                    };
+                }
+            }
+        }
+    }
+
+    private static long KthLargestTimestamp(Dictionary<(string, long), Point> result, int limit)
+    {
+        var ts = new long[result.Count];
+        var i = 0;
+        foreach (var kv in result) ts[i++] = kv.Key.Item2;
+        Array.Sort(ts);
+        return ts[ts.Length - limit];
+    }
+
+    private static void TrimResultBelowCutoff(Dictionary<(string, long), Point> result, long cutoff)
+    {
+        List<(string, long)>? toRemove = null;
+        foreach (var kv in result)
+            if (kv.Key.Item2 < cutoff)
+                (toRemove ??= []).Add(kv.Key);
+        if (toRemove == null) return;
+        foreach (var key in toRemove)
+            result.Remove(key);
+    }
+
     public IEnumerable<Point> EnumeratePoints(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, List<FieldFilter>? fieldFilters = null,
         CancellationToken cancellationToken = default)

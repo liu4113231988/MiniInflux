@@ -119,7 +119,7 @@ public class P0TodoTests : IDisposable
     }
 
     [Fact]
-    public async Task RawSelect_WithSegments_UsesBufferedMaterializedPath()
+    public async Task RawSelect_WithSegments_UsesGlobalAscendingPushdown()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0);
         await engine.WriteAsync("testdb", "autogen", [Point("cpu", 2, "server01", 2)]);
@@ -130,7 +130,8 @@ public class P0TodoTests : IDisposable
             .ExecuteWithReport(engine, "testdb", "SELECT value FROM cpu LIMIT 2");
 
         var rows = outcome.Response.Results[0].Series![0].Values;
-        Assert.False(outcome.Report.UsedStreamingRawSelect);
+        Assert.True(outcome.Report.UsedStreamingRawSelect);
+        Assert.Equal(0, outcome.Report.PointsMaterialized);
         Assert.Equal("1970-01-01T00:00:00.000000001Z", rows[0][0]);
         Assert.Equal("1970-01-01T00:00:00.000000002Z", rows[1][0]);
     }
