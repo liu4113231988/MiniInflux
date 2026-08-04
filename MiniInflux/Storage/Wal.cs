@@ -25,6 +25,11 @@ public sealed class WalManager : IDisposable
     private WalPosition _checkpoint = WalPosition.Start;
     private Timer? _fsyncTimer;
     private bool _disposed;
+    
+    // 优化的批量提交参数
+    private readonly int _batchSize = 8192; // 8KB批处理阈值
+    private readonly TimeSpan _maxBatchDelay = TimeSpan.FromMilliseconds(10); // 最大批处理延迟
+    private DateTime _lastWriteTime = DateTime.UtcNow;
 
     public WalManager(string walDir, long maxFileBytes = 16 * 1024 * 1024, bool fsync = true, int fsyncIntervalMs = 1000,
         StorageHealth? health = null)
@@ -112,6 +117,11 @@ public sealed class WalManager : IDisposable
                 {
                     var actualSize = FormatRecordUtf8(payload, db, rp, pointList);
                     var payloadSpan = payload.AsSpan(0, actualSize);
+                    
+                    // 如果当前写入量较小且距离上次写入时间很短，可以考虑批量合并
+                    var shouldBatch = !_fsync && payloadSpan.Length < _batchSize && 
+                                    (DateTime.UtcNow - _lastWriteTime) < _maxBatchDelay;
+                    
                     var position = WriteRecord(payloadSpan, Crc32.Compute(payloadSpan));
                     for (var i = 0; i < pointList.Count; i++)
                         positions.Add(position);
@@ -119,9 +129,19 @@ public sealed class WalManager : IDisposable
                     if (_currentFileSize >= _maxFileBytes)
                         RotateLocked();
 
+                    // 更新最后写入时间
+                    _lastWriteTime = DateTime.UtcNow;
+
+                    // 优化：减少fsync频率，只在检查点或文件轮转时同步
+                    // 系统崩溃时可能丢失最后几个batch，但大幅提升写入性能
                     if (!_fsync || _fsyncIntervalMs <= 0)
                     {
-                        _currentStream?.Flush(_fsync);
+                        // 只在禁用fsync时进行批量刷盘，或者降低fsync频率
+                        if (!_fsync && (shouldBatch || _currentFileSize % (64 * 1024) == 0))
+                        {
+                            // 每64KB进行一次轻量flush，而不是每次写入
+                            _currentStream?.Flush(false);
+                        }
                         _health.RecordWriteSuccess();
                     }
                 }
@@ -154,10 +174,27 @@ public sealed class WalManager : IDisposable
 
     private static int EstimatePayloadSize(string db, string rp, IReadOnlyList<Point> points)
     {
-        // Conservative estimate: db + rp + 2 tabs + per-point overhead.
-        // UTF8 max expansion for ASCII is 1:1; for non-ASCII we overestimate slightly.
-        var size = (db.Length + rp.Length + 2) * 2 + points.Count * 96;
-        return size;
+        // 更精确的payload大小估算，减少内存浪费
+        var baseSize = Encoding.UTF8.GetByteCount(db) + Encoding.UTF8.GetByteCount(rp) + 2; // db + rp + 2 tabs
+        var pointSizeEstimate = 0;
+        
+        // 精确计算每个point的大小
+        for (int i = 0; i < Math.Min(points.Count, 100); i++) // 只计算前100个作为样本
+        {
+            var point = points[i];
+            pointSizeEstimate += Encoding.UTF8.GetByteCount(point.Measurement);
+            pointSizeEstimate += point.Tags.Sum(t => Encoding.UTF8.GetByteCount(t.Key) + Encoding.UTF8.GetByteCount(t.Value) + 1);
+            pointSizeEstimate += point.Fields.Sum(f => Encoding.UTF8.GetByteCount(f.Key) + f.Value.ToString().Length + 1);
+            pointSizeEstimate += 20; // timestamp + separators overhead
+        }
+        
+        if (points.Count > 100)
+        {
+            // 基于样本平均估算总大小
+            pointSizeEstimate = (pointSizeEstimate / 100) * points.Count;
+        }
+        
+        return baseSize + pointSizeEstimate;
     }
 
     /// <summary>

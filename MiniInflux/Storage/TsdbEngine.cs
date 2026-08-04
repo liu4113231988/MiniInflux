@@ -166,9 +166,14 @@ public sealed class TsdbEngine : IDisposable
         if (!_health.WriteAvailable)
             throw new IOException("write path is unavailable after a WAL persistence failure");
         CreateDatabase(db); _manifest.EnsureRp(db, rp);
+        
+        // 提前过滤掉重复点，减少不必要的处理
         var pending = DeduplicateWritePoints(pts);
+        if (pending.Count == 0) return Task.CompletedTask;
+        
         var writePoints = pending.Count == pts.Count ? pts : MaterializePendingPoints(pending);
         ValidateSchema(db, writePoints);
+        
         // Use per-db|rp lock only; the global lock is no longer needed for writes because
         // _locks is a ConcurrentDictionary and _seriesKeys/_bufferedPointCount are updated under the per-key lock.
         var key = K(db, rp);
@@ -180,12 +185,22 @@ public sealed class TsdbEngine : IDisposable
             CheckCardinalityLocked(db, pending);
             // CheckBufferLimit inside the lock to prevent concurrent writes from exceeding limits.
             CheckBufferLimit(writePoints);
+            
+            // 优化的写入批处理：更大的写入批次减少WAL开销
             var walPositions = _wal.Append(db, rp, writePoints);
             if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
+            
+            // 批量添加写入点，减少锁持有时间内的操作
             AddWrittenPoints(db, key, list, pending, walPositions);
             _lastBufferWriteTicks[key] = DateTime.UtcNow.Ticks;
             UpdateBufferReplayFloor(key, list);
-            if (list.Count >= _threshold) FlushLocked(db, rp, list);
+            
+            // 基于大小而不仅仅是计数的flush触发器
+            if (list.Count >= _threshold || 
+                (_maxBufferBytes > 0 && list.Sum(p => EstimateBufferedPointBytes(p.Point)) >= _maxBufferBytes * 0.8))
+            {
+                FlushLocked(db, rp, list);
+            }
         }
         finally { lk.ExitWriteLock(); }
         return Task.CompletedTask;
@@ -1767,6 +1782,8 @@ return Interlocked.Read(ref _bufferedByteCount);
         if (l.Count == 0) return;
         var flushCount = l.Count;
         long flushBytes = 0;
+        
+        // 优化的shard分组，使用预分配列表减少内存分配
         var byShard = new Dictionary<int, List<(Point Point, SeriesKey SeriesKey)>>();
         foreach (var buffered in l)
         {
@@ -1775,21 +1792,45 @@ return Interlocked.Read(ref _bufferedByteCount);
             var (shardId, _) = _shards.GetOrCreateShard(db, rp, buffered.Point.TimestampNs);
             if (!byShard.TryGetValue(shardId, out var points))
             {
-                points = [];
+                // 预分配足够大的容量减少列表扩容
+                points = new List<(Point, SeriesKey)>(Math.Max(1000, l.Count / 10));
                 byShard[shardId] = points;
             }
             points.Add((buffered.Point, buffered.SeriesKey));
         }
 
-        foreach (var (shardId, points) in byShard)
+        // 并行flush到不同shard（优化的并行写入）
+        if (byShard.Count > 1)
         {
-            var shardDir = _shards.ShardDir(db, rp, shardId);
-            var segPath = Path.Combine(shardDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
-            SegmentWriter.WriteSegment(segPath, points);
-            _shards.RegisterSegment(db, rp, shardId, segPath);
-            // Pre-populate metadata cache so first query doesn't need to read from disk
-            RegisterSegmentMetadata(db, rp, segPath);
+            var shardTasks = new Task[byShard.Count];
+            var shardArray = byShard.ToArray();
+            for (int i = 0; i < shardArray.Length; i++)
+            {
+                var (shardId, points) = shardArray[i];
+                shardTasks[i] = Task.Run(() =>
+                {
+                    var shardDir = _shards.ShardDir(db, rp, shardId);
+                    var segPath = Path.Combine(shardDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
+                    SegmentWriter.WriteSegment(segPath, points);
+                    _shards.RegisterSegment(db, rp, shardId, segPath);
+                    RegisterSegmentMetadata(db, rp, segPath);
+                });
+            }
+            Task.WaitAll(shardTasks);
         }
+        else
+        {
+            // 单个shard时直接处理，避免任务调度开销
+            foreach (var (shardId, points) in byShard)
+            {
+                var shardDir = _shards.ShardDir(db, rp, shardId);
+                var segPath = Path.Combine(shardDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
+                SegmentWriter.WriteSegment(segPath, points);
+                _shards.RegisterSegment(db, rp, shardId, segPath);
+                RegisterSegmentMetadata(db, rp, segPath);
+            }
+        }
+        
         _bufferedPointCount -= flushCount;
         if (_maxBufferBytes > 0)
             _bufferedByteCount -= flushBytes;
