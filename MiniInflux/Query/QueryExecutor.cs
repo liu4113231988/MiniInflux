@@ -3202,17 +3202,33 @@ public sealed class QueryExecutor
     static int CountRows(QueryResponse response) =>
         response.Results.SelectMany(r => r.Series ?? []).Sum(s => s.Values.Count);
 
-    static bool CanStreamRawSelect(ParsedQuery q) =>
-        q.Kind == QueryKind.Select
-        && q.Subquery == null
-        && q.GroupByNs == null
-        && q.GroupByTags.Count == 0
-        && !q.GroupByAllTags
-        && q.Select.All(s => string.IsNullOrEmpty(s.Func))
-        && q.Select.All(s => !s.IsDistinct)
-        && string.IsNullOrWhiteSpace(q.IntoTarget)
-        && !q.Desc
-        && !string.IsNullOrWhiteSpace(q.Measurement);
+    static bool CanStreamRawSelect(ParsedQuery q)
+    {
+        if (q.Kind != QueryKind.Select || q.Subquery != null || string.IsNullOrWhiteSpace(q.Measurement))
+            return false;
+            
+        // 不允许有非原始字段选择（聚合、计算等）
+        if (q.Select.Any(s => !string.IsNullOrEmpty(s.Func) || s.IsDistinct))
+            return false;
+            
+        // 不允许SELECT INTO
+        if (!string.IsNullOrWhiteSpace(q.IntoTarget))
+            return false;
+            
+        // 不允许降序查询（走专门的descending优化路径）
+        if (q.Desc)
+            return false;
+            
+        // 扩展支持：允许简单的时间窗口聚合查询走流式路径
+        if (q.GroupByNs != null && q.GroupByTags.Count == 0 && !q.GroupByAllTags)
+        {
+            // 简单的时间窗口聚合，不支持field filters以保证效率
+            return q.FieldFilters.Count == 0;
+        }
+        
+        // 原有的非聚合查询支持：不允许任何GROUP BY
+        return q.GroupByNs == null && q.GroupByTags.Count == 0 && !q.GroupByAllTags;
+    }
 
     static bool CanStreamRawSelectResponse(TsdbEngine e, string? db, ParsedQuery q)
     {

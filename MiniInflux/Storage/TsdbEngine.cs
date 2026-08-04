@@ -64,7 +64,10 @@ public sealed class TsdbEngine : IDisposable
         _shards = new ShardManager(_root, _manifest);
         _tombstones = new TombstoneStore(_root);
         _compactor = new Compactor(_manifest, _shards, _tombstones, _schema,
-            maxL0Bytes: compactionTargetBytes, maxL1Bytes: compactionTargetBytes, health: _health);
+            maxL0Segments: 6, maxL1Segments: 3,                    // 更积极的segment数量阈值
+            maxL0Bytes: compactionTargetBytes, maxL1Bytes: compactionTargetBytes,
+            minFilesPerCompaction: 2, maxPassesPerRun: 12,        // 更多合并轮次
+            health: _health);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
         if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => RunCompaction(), null, compactionIntervalMs, compactionIntervalMs);
         if (flushIntervalMs > 0) _flushTimer = new Timer(_ => PeriodicFlush(), null, flushIntervalMs, flushIntervalMs);
