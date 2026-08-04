@@ -784,7 +784,7 @@ public sealed class TsdbEngine : IDisposable
             var maxTime = long.MinValue;
             try
             {
-                foreach (var m in ReadSegmentMetadataCached(segPath).Metas)
+                foreach (var m in ReadSegmentMetadataCached(segPath, db, rp).Metas)
                 {
                     if (m.Measurement != measurement) continue;
                     if (allowedTagsCanonical != null && !allowedTagsCanonical.Contains(m.TagsCanonical)) continue;
@@ -887,7 +887,7 @@ public sealed class TsdbEngine : IDisposable
             long minTime = long.MaxValue;
             try
             {
-                foreach (var m in ReadSegmentMetadataCached(segPath).Metas)
+                foreach (var m in ReadSegmentMetadataCached(segPath, db, rp).Metas)
                 {
                     if (m.Measurement != measurement) continue;
                     if (allowedTagsCanonical != null && !allowedTagsCanonical.Contains(m.TagsCanonical)) continue;

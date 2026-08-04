@@ -174,27 +174,8 @@ public sealed class WalManager : IDisposable
 
     private static int EstimatePayloadSize(string db, string rp, IReadOnlyList<Point> points)
     {
-        // 更精确的payload大小估算，减少内存浪费
-        var baseSize = Encoding.UTF8.GetByteCount(db) + Encoding.UTF8.GetByteCount(rp) + 2; // db + rp + 2 tabs
-        var pointSizeEstimate = 0;
-        
-        // 精确计算每个point的大小
-        for (int i = 0; i < Math.Min(points.Count, 100); i++) // 只计算前100个作为样本
-        {
-            var point = points[i];
-            pointSizeEstimate += Encoding.UTF8.GetByteCount(point.Measurement);
-            pointSizeEstimate += point.Tags.Sum(t => Encoding.UTF8.GetByteCount(t.Key) + Encoding.UTF8.GetByteCount(t.Value) + 1);
-            pointSizeEstimate += point.Fields.Sum(f => Encoding.UTF8.GetByteCount(f.Key) + f.Value.ToString().Length + 1);
-            pointSizeEstimate += 20; // timestamp + separators overhead
-        }
-        
-        if (points.Count > 100)
-        {
-            // 基于样本平均估算总大小
-            pointSizeEstimate = (pointSizeEstimate / 100) * points.Count;
-        }
-        
-        return baseSize + pointSizeEstimate;
+        var size = (db.Length + rp.Length + 2) * 2 + points.Count * 96;
+        return size;
     }
 
     /// <summary>
