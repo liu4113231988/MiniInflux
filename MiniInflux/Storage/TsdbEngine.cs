@@ -30,6 +30,13 @@ public sealed class TsdbEngine : IDisposable
     private readonly Compactor _compactor;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ReaderWriterLockSlim> _locks = new(StringComparer.Ordinal);
     private readonly ReaderWriterLockSlim _globalLock = new();
+    // ponytail: global concurrency gate for slow read paths. Without it, N concurrent slow queries each
+    // spawn up to 8 reader threads, exhausting the thread pool so *every* query times out together.
+    private readonly SemaphoreSlim _queryGate;
+    // ponytail: per-query materialization budget. ReadAllPoints enforces this *while* reading segments
+    // (not just after, as the QueryExecutor layer does) so a huge LIMIT-less query cannot blow up the
+    // process heap before the executor's post-hoc memory check ever runs.
+    private readonly long _maxQueryMemoryBytes;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Length, DateTime LastWriteUtc, List<SegmentColumnMeta> Metas, bool UsedFooter)> _segmentMetadataCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(string DbRp, string Measurement, string Tags), System.Collections.Concurrent.ConcurrentDictionary<string, IndexedSegmentMetadata>> _segmentMetadataBySeries = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _segmentMetadataIndexReady = new(StringComparer.Ordinal);
@@ -53,9 +60,13 @@ public sealed class TsdbEngine : IDisposable
         long maxWalFileBytes = 16 * 1024 * 1024, bool walFsync = true, int walFsyncIntervalMs = 1000,
         int rpCheckIntervalMs = 60000, long maxSeriesPerDb = 10_000_000, int maxFieldsPerMeasurement = 1024,
         int flushIntervalMs = 5000, long maxBufferPoints = 1_000_000, long maxBufferBytes = 0, int compactionIntervalMs = 30000,
-        int flushColdDurationMs = 600_000, long compactionTargetBytes = 512L * 1024 * 1024)
+        int flushColdDurationMs = 600_000, long compactionTargetBytes = 512L * 1024 * 1024,
+        int maxConcurrentQueries = 0,
+        long maxQueryMemoryBytes = 0)
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
+        _queryGate = new SemaphoreSlim(maxConcurrentQueries > 0 ? maxConcurrentQueries : Math.Min(Environment.ProcessorCount, 8), int.MaxValue);
+        _maxQueryMemoryBytes = maxQueryMemoryBytes > 0 ? maxQueryMemoryBytes : 512L * 1024 * 1024;
         _flushColdTicks = TimeSpan.FromMilliseconds(Math.Max(0, flushColdDurationMs)).Ticks;
         Directory.CreateDirectory(_root);
         _wal = new WalManager(Path.Combine(_root, "wal"), maxWalFileBytes, walFsync, walFsyncIntervalMs, _health);
@@ -291,35 +302,6 @@ public sealed class TsdbEngine : IDisposable
         return SeriesKey.From(p);
     }
 
-    /// <summary>
-    /// Deduplicate points within a batch: same measurement+tags+timestamp = field set merge,
-    /// same-named field last-write-wins (InfluxDB semantics).
-    /// </summary>
-    private static List<Point> DeduplicatePoints(List<Point> pts)
-    {
-        if (pts.Count <= 1) return pts;
-        var map = new Dictionary<(string Meas, string Tags, long Ts), Point>();
-        foreach (var p in pts)
-        {
-            var key = (p.Measurement, QuerySeriesIdentity(p), p.TimestampNs);
-            if (map.TryGetValue(key, out var existing))
-            {
-                foreach (var kv in p.Fields) existing.Fields[kv.Key] = kv.Value;
-            }
-            else
-            {
-                map[key] = new Point
-                {
-                    Measurement = p.Measurement,
-                    Tags = p.Tags,
-                    Fields = new Dictionary<string, FieldValue>(p.Fields, StringComparer.Ordinal),
-                    TimestampNs = p.TimestampNs
-                };
-            }
-        }
-        return map.Values.ToList();
-    }
-
     private static string QuerySeriesIdentity(Point point)
     {
         var tags = SeriesKey.From(point).TagsCanonical;
@@ -347,10 +329,142 @@ public sealed class TsdbEngine : IDisposable
     public int GetMeasurementCardinality(string db) => _manifest.ListMeasurements(db).Count;
     public int GetTagValueCardinality(string db, string? measurement, string? tagKey) => _manifest.GetTagValueCardinality(db, measurement, tagKey);
 
+    /// <summary>
+    /// Deduplicate and merge buffered + segment points by (measurement, seriesIdentity, timestamp),
+    /// keeping buffered writes as the last-write-wins source. Returns points ordered by timestamp
+    /// ascending. When <paramref name="limit"/> is provided, stops collecting once reached so a
+    /// <c>LIMIT</c> no longer forces a full scan of every segment (ponytail).
+    /// </summary>
+    private List<Point> MergeAndDeduplicate(IEnumerable<Point> buffered, IEnumerable<List<Point>> segmentBatches, int? limit, long maxMemoryBytes)
+    {
+        // Series identity is cached per (measurement, canonical tags) so the canonical tag string is
+        // not rebuilt for every point. Points with no tags are NOT cached: QuerySeriesIdentity falls
+        // back to the legacy "tag" *field value* in that case, so identity then depends on Fields and
+        // caching by tags alone would collapse distinct legacy series into one.
+        var identityCache = new Dictionary<(string Meas, string Tags), string>();
+        string IdentityOf(Point p)
+        {
+            // Mirror SeriesKey.From: it yields "" whenever Tags is empty (ignoring TagsCanonical),
+            // which is exactly when the legacy "tag" field fallback kicks in.
+            var tagsCanonical = p.Tags.Count == 0 ? null : p.TagsCanonical;
+            if (string.IsNullOrEmpty(tagsCanonical))
+                return QuerySeriesIdentity(p);
+
+            var cacheKey = (p.Measurement, tagsCanonical);
+            if (!identityCache.TryGetValue(cacheKey, out var id))
+                identityCache[cacheKey] = id = QuerySeriesIdentity(p);
+            return id;
+        }
+
+        // The points handed to us are the engine's live buffer/segment objects. Never store them
+        // directly, because merging writes into Fields would mutate the write buffer itself.
+        static Point Clone(Point p) => new()
+        {
+            Measurement = p.Measurement,
+            Tags = p.Tags,
+            TagsCanonical = p.TagsCanonical,
+            TimestampNs = p.TimestampNs,
+            Fields = new Dictionary<string, FieldValue>(p.Fields, StringComparer.Ordinal)
+        };
+
+        var map = new Dictionary<(string Meas, string Tags, long Ts), Point>(capacity: limit ?? 1024);
+
+        // ponytail: materialization budget. We track (map bytes) + (sum of all segment batch list
+        // bytes already in memory) so we reject a LIMIT-less or huge query *during* the scan instead
+        // of only after the whole working set has been paged in (the QueryExecutor layer also checks
+        // this, but only post-hoc). EstimatePointBytes mirrors the formula QueryExecutor uses so the
+        // two layers see consistent numbers.
+        long estimatedBytes = 0;
+        long EstimatePointBytes(Point p)
+        {
+            long size = 96 + (p.Measurement?.Length ?? 0) * 2L + 8;
+            foreach (var tag in p.Tags)
+                size += 32 + (tag.Key.Length + tag.Value.Length) * 2L;
+            foreach (var field in p.Fields)
+            {
+                size += 48 + field.Key.Length * 2L;
+                size += field.Value.Kind switch
+                {
+                    FieldKind.Float => 24,
+                    FieldKind.Integer => 24,
+                    FieldKind.Boolean => 24,
+                    FieldKind.String => 24 + (field.Value.String?.Length ?? 0) * 2L,
+                    _ => 24
+                };
+            }
+            return size;
+        }
+        void CheckMemory()
+        {
+            if (maxMemoryBytes > 0 && estimatedBytes > maxMemoryBytes)
+                throw new InvalidOperationException(
+                    $"query memory limit exceeded: {estimatedBytes} > {maxMemoryBytes} (reduce the time range, add a LIMIT, or raise Storage:MaxQueryMemoryBytes)");
+        }
+
+        void Merge(Point p)
+        {
+            var key = (p.Measurement, IdentityOf(p), p.TimestampNs);
+            if (map.TryGetValue(key, out var existing))
+            {
+                // Last writer wins, matching InfluxDB field-merge semantics.
+                foreach (var kv in p.Fields) existing.Fields[kv.Key] = kv.Value;
+            }
+            else
+            {
+                map[key] = Clone(p);
+                estimatedBytes += EstimatePointBytes(p);
+                CheckMemory();
+            }
+        }
+
+        // Order matters for last-write-wins. Segments arrive from ListSegments ordered by level
+        // descending, i.e. older compacted levels first and the newest L0 segments last; the write
+        // buffer holds the very newest points and therefore must be merged last of all. Materialize
+        // segmentBatches once so we can also count each batch list's own footprint in the memory
+        // budget (those lists are live in memory for the whole merge, not just until iterated).
+        var materializedBatches = segmentBatches as IList<List<Point>> ?? segmentBatches.ToList();
+        foreach (var batch in materializedBatches)
+        {
+            // ponytail: include the segment batch list itself in the estimate, not just the points
+            // it eventually moves into the map. A parallel path with N huge segments has them all
+            // pinned in memory until this loop ends; we must account for them to enforce the limit.
+            // Sample the first point (if any) as a per-point size estimate; this is conservative-ish
+            // since FieldValue sizes vary little but string tags can vary. Empty batches contribute
+            // only their list overhead which we model with the base constant.
+            long perPoint = batch.Count > 0 ? EstimatePointBytes(batch[0]) : 96;
+            estimatedBytes += batch.Count * perPoint;
+            CheckMemory();
+            foreach (var p in batch)
+            {
+                if (limit.HasValue && map.Count >= limit.Value) break;
+                Merge(p);
+            }
+        }
+
+        foreach (var p in buffered)
+        {
+            // Buffered points must always be applied so they can override stale segment values, even
+            // once the limit is reached; only *new* keys are gated by the limit.
+            if (limit.HasValue && map.Count >= limit.Value
+                && !map.ContainsKey((p.Measurement, IdentityOf(p), p.TimestampNs))) continue;
+            Merge(p);
+        }
+
+        // Points are already mostly time-ordered within each segment; a single stable sort is the
+        // only ordering step (replaces the old DeduplicatePoints + ToList + OrderBy + spread copy).
+        var result = map.Values.ToList();
+        result.Sort(static (a, b) => a.TimestampNs.CompareTo(b.TimestampNs));
+        return result;
+    }
+
     public List<Point> ReadAllPoints(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, List<FieldFilter>? fieldFilters = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, int? limit = null)
     {
+        // ponytail: throttle concurrent slow queries to protect the thread pool.
+        _queryGate.Wait(cancellationToken);
+        try
+        {
         var buffered = new List<Point>();
         var lk = GetLock(K(db, rp));
         lk.EnterReadLock();
@@ -376,46 +490,51 @@ public sealed class TsdbEngine : IDisposable
 
         var segments = _shards.ListSegments(db, rp, min, max);
 
-        // Fast path: single segment or small result — read sequentially.
+        // Fast path: single segment — read sequentially and merge with buffer (limit-aware).
         if (segments.Count <= 1)
         {
-            var result = new List<Point>(buffered);
+            var batch = new List<Point>();
+            var perSegBudget = limit.HasValue ? Math.Max(0, limit.Value - buffered.Count) : int.MaxValue;
             foreach (var (segPath, _) in segments)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                ReadSegmentInto(result, db, segPath, requestedFields, meas, min, max, allowedTagsCanonical, fieldFilters);
+                ReadSegmentInto(batch, db, segPath, requestedFields, meas, min, max, allowedTagsCanonical, fieldFilters, perSegBudget);
+                if (limit.HasValue && batch.Count + buffered.Count >= limit.Value) break;
             }
-            result.AddRange(buffered);
-            return [.. DeduplicatePoints(result).OrderBy(x => x.TimestampNs)];
+            return MergeAndDeduplicate(buffered, new[] { batch }, limit, _maxQueryMemoryBytes);
         }
 
-        // Parallel path: multiple segments — read concurrently.
+        // Parallel path: multiple segments — read concurrently, then merge with buffer (limit-aware).
         var segmentResults = new List<Point>[segments.Count];
         var options = new ParallelOptions
         {
             CancellationToken = cancellationToken,
             MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8)
         };
+        // Tracks how many points have been gathered so far so the remaining segments can be skipped
+        // once a pushed-down limit is already satisfied. Uses an interlocked counter rather than
+        // summing segmentResults, which other threads are concurrently writing to.
+        var gathered = buffered.Count;
         Parallel.For(0, segments.Count, options, i =>
         {
+            if (limit.HasValue && Volatile.Read(ref gathered) >= limit.Value) return;
             var segPath = segments[i].SegPath;
             cancellationToken.ThrowIfCancellationRequested();
             var list = new List<Point>();
-            ReadSegmentInto(list, db, segPath, requestedFields, meas, min, max, allowedTagsCanonical, fieldFilters);
+            // ponytail: each segment stops at the remaining budget so a giant segment cannot alone
+            // materialize the whole dataset; the budget is shared across segments via `gathered`.
+            var budget = limit.HasValue
+                ? Math.Max(0, limit.Value - Volatile.Read(ref gathered))
+                : int.MaxValue;
+            ReadSegmentInto(list, db, segPath, requestedFields, meas, min, max, allowedTagsCanonical, fieldFilters, budget);
             segmentResults[i] = list;
+            if (limit.HasValue) Interlocked.Add(ref gathered, list.Count);
         });
 
-        // Merge results in order
-        long totalCount = 0;
-        for (var i = 0; i < segmentResults.Length; i++)
-            totalCount += segmentResults[i].Count;
-        totalCount += buffered.Count;
-
-        var res = new List<Point>((int)Math.Min(totalCount, int.MaxValue));
-        for (var i = 0; i < segmentResults.Length; i++)
-            res.AddRange(segmentResults[i]);
-        res.AddRange(buffered); // Buffer contains the newest writes and must win over flushed segments.
-        return [.. DeduplicatePoints(res).OrderBy(x => x.TimestampNs)];
+        var merged = MergeAndDeduplicate(buffered, segmentResults.Where(b => b != null)!, limit, _maxQueryMemoryBytes);
+        return merged;
+        }
+        finally { _queryGate.Release(); }
     }
 
     /// <summary>
@@ -423,8 +542,12 @@ public sealed class TsdbEngine : IDisposable
     /// </summary>
     private void ReadSegmentInto(List<Point> target, string db, string segPath,
         HashSet<string>? requestedFields, string? meas, long? min, long? max,
-        HashSet<string>? allowedTagsCanonical, List<FieldFilter>? fieldFilters)
+        HashSet<string>? allowedTagsCanonical, List<FieldFilter>? fieldFilters, int budget = int.MaxValue)
     {
+        // ponytail: budget<=0 means the shared LIMIT has already been satisfied elsewhere, so
+        // skip ReadSegmentColumns entirely — it would load every column's timestamps/values arrays
+        // into memory (the dominant cost for big segments) just to throw them away.
+        if (budget <= 0) return;
         try
         {
             if (meas != null || (min.HasValue && max.HasValue) || (fieldFilters != null && fieldFilters.Count > 0) || allowedTagsCanonical != null)
@@ -432,17 +555,37 @@ public sealed class TsdbEngine : IDisposable
                 try
                 {
                     var metas = ReadSegmentMetadataCached(segPath).Metas;
-                    if (meas != null && !metas.Any(m => m.Measurement == meas)) return;
-                    if (min.HasValue && !metas.Any(m => m.MaxTime >= min.Value)) return;
-                    if (max.HasValue && !metas.Any(m => m.MinTime <= max.Value)) return;
-                    if (allowedTagsCanonical != null && !metas.Any(m => allowedTagsCanonical.Contains(m.TagsCanonical))) return;
+
+                    // Single pass over the metadata instead of four independent LINQ traversals
+                    // (each of which used to walk the whole column list separately).
+                    var hasMeas = meas == null;
+                    var hasMinOk = !min.HasValue;
+                    var hasMaxOk = !max.HasValue;
+                    var hasTag = allowedTagsCanonical == null;
+                    for (var mi = 0; mi < metas.Count; mi++)
+                    {
+                        var m = metas[mi];
+                        if (!hasMeas && m.Measurement == meas) hasMeas = true;
+                        if (!hasMinOk && m.MaxTime >= min!.Value) hasMinOk = true;
+                        if (!hasMaxOk && m.MinTime <= max!.Value) hasMaxOk = true;
+                        if (!hasTag && allowedTagsCanonical!.Contains(m.TagsCanonical)) hasTag = true;
+                        if (hasMeas && hasMinOk && hasMaxOk && hasTag) break;
+                    }
+                    if (!hasMeas || !hasMinOk || !hasMaxOk || !hasTag) return;
+
                     if (fieldFilters != null && fieldFilters.Count > 0 && !CouldSegmentMatchFieldFilters(metas, meas, allowedTagsCanonical, fieldFilters))
                         return;
                 }
                 catch { /* fall through to full read */ }
             }
 
-            target.AddRange(Rebuild(ReadSegmentColumns(db, segPath, requestedFields, meas, min, max, allowedTagsCanonical), min, max));
+            // ponytail: Rebuild is lazy. Drain it but stop at `budget` matching points so a giant
+            // segment costs memory proportional to LIMIT, not to its total matched size.
+            foreach (var p in Rebuild(ReadSegmentColumns(db, segPath, requestedFields, meas, min, max, allowedTagsCanonical), min, max))
+            {
+                target.Add(p);
+                if (target.Count >= budget) break;
+            }
         }
         catch (InvalidDataException) { }
         catch (FileNotFoundException) { }
@@ -943,9 +1086,10 @@ public sealed class TsdbEngine : IDisposable
 
     private static void AddGlobalSegmentColumnsAscending(Dictionary<(string, long), Point> result, List<SegmentColumn> columns, long cutoff)
     {
+        var tagCache = new Dictionary<string, KeyValuePair<string, string>[]>(StringComparer.Ordinal);
         foreach (var column in columns)
         {
-            var tags = ParseTags(column.TagsCanonical);
+            var tags = ParseTagsCached(column.TagsCanonical, tagCache);
             for (var i = 0; i < column.Timestamps.Count; i++)
             {
                 var ts = column.Timestamps[i];
@@ -1015,9 +1159,10 @@ public sealed class TsdbEngine : IDisposable
 
     private static void AddGlobalSegmentColumns(Dictionary<(string, long), Point> result, List<SegmentColumn> columns, long cutoff)
     {
+        var tagCache = new Dictionary<string, KeyValuePair<string, string>[]>(StringComparer.Ordinal);
         foreach (var column in columns)
         {
-            var tags = ParseTags(column.TagsCanonical);
+            var tags = ParseTagsCached(column.TagsCanonical, tagCache);
             for (var i = column.Timestamps.Count - 1; i >= 0; i--)
             {
                 var ts = column.Timestamps[i];
@@ -1200,7 +1345,7 @@ return Interlocked.Read(ref _bufferedByteCount);
             return new SegmentMetadataQueryResult(indexedResult, indexed.Values.Count(metadata => metadata.UsedFooter), indexed.Values.Count(metadata => !metadata.UsedFooter));
         }
 
-        var reads = new System.Collections.Concurrent.ConcurrentBag<(List<SegmentColumnMeta> Metas, bool UsedFooter)>();
+        var reads = new System.Collections.Concurrent.ConcurrentBag<(IReadOnlyList<SegmentColumnMeta> Metas, bool UsedFooter)>();
         Parallel.ForEach(
             _shards.ListSegments(db, rp, min, max),
             new ParallelOptions { CancellationToken = cancellationToken, MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8) },
@@ -1541,7 +1686,8 @@ return Interlocked.Read(ref _bufferedByteCount);
             if (!map.TryGetValue(key, out var fs)) { fs = new(StringComparer.Ordinal); map[key] = fs; }
             fs[c.Field] = c.Values[i];
         }
-        foreach (var it in map) yield return new Point { Measurement = it.Key.Item1, Tags = ParseTags(it.Key.Item2), TimestampNs = it.Key.Item3, Fields = it.Value };
+        var tagCache = new Dictionary<string, KeyValuePair<string, string>[]>(StringComparer.Ordinal);
+        foreach (var it in map) yield return new Point { Measurement = it.Key.Item1, Tags = ParseTagsCached(it.Key.Item2, tagCache), TimestampNs = it.Key.Item3, Fields = it.Value };
     }
 
     private static void AddDescendingPoints(Dictionary<long, Point> result, IEnumerable<Point> points, int? limit)
@@ -1564,9 +1710,10 @@ return Interlocked.Read(ref _bufferedByteCount);
 
     private static void AddSegmentColumnsDescending(Dictionary<long, Point> result, List<SegmentColumn> columns, long? min, long? max, int? limit)
     {
+        var tagCache = new Dictionary<string, KeyValuePair<string, string>[]>(StringComparer.Ordinal);
         foreach (var column in columns)
         {
-            var tags = ParseTags(column.TagsCanonical);
+            var tags = ParseTagsCached(column.TagsCanonical, tagCache);
             for (var i = column.Timestamps.Count - 1; i >= 0; i--)
             {
                 var ts = column.Timestamps[i];
@@ -1594,6 +1741,29 @@ return Interlocked.Read(ref _bufferedByteCount);
     private static Dictionary<string, string> ParseTags(string s)
     { var d = new Dictionary<string, string>(StringComparer.Ordinal); if (string.IsNullOrEmpty(s)) return d; foreach (var p in s.Split(',')) { var i = p.IndexOf('='); if (i > 0) d[p[..i]] = p[(i + 1)..]; } return d; }
 
+    /// <summary>
+    /// Parse a canonical tag string into key/value pairs, memoizing the split result per distinct
+    /// canonical string. Callers previously re-parsed the identical string once per column (and once
+    /// per rebuilt point), so the same <c>string.Split</c> ran thousands of times for one series.
+    /// A fresh dictionary is still returned each time because <see cref="Point.Tags"/> is mutable.
+    /// </summary>
+    private static Dictionary<string, string> ParseTagsCached(string s, Dictionary<string, KeyValuePair<string, string>[]> cache)
+    {
+        if (string.IsNullOrEmpty(s)) return new Dictionary<string, string>(StringComparer.Ordinal);
+        if (!cache.TryGetValue(s, out var pairs))
+        {
+            var parsed = ParseTags(s);
+            pairs = new KeyValuePair<string, string>[parsed.Count];
+            var idx = 0;
+            foreach (var kv in parsed) pairs[idx++] = kv;
+            cache[s] = pairs;
+        }
+
+        var d = new Dictionary<string, string>(pairs.Length, StringComparer.Ordinal);
+        for (var i = 0; i < pairs.Length; i++) d[pairs[i].Key] = pairs[i].Value;
+        return d;
+    }
+
     private List<SegmentColumn> ReadSegmentColumns(string db, string segPath, HashSet<string>? requestedFields, string? meas, long? min, long? max, HashSet<string>? allowedTagsCanonical)
     {
         var cols = SegmentReader.ReadSegment(segPath, requestedFields, meas, min, max, allowedTagsCanonical);
@@ -1610,14 +1780,20 @@ return Interlocked.Read(ref _bufferedByteCount);
     private long _metadataCacheHits;
     private long _metadataCacheMisses;
 
-    private (List<SegmentColumnMeta> Metas, bool UsedFooter) ReadSegmentMetadataCached(string path, string? db = null, string? rp = null)
+    /// <summary>
+    /// Returns cached segment column metadata. The returned list is shared and MUST be treated as
+    /// read-only by callers: segment files are immutable once written, so copying the list on every
+    /// cache hit was pure overhead (a "hit" used to allocate a full list copy, which for
+    /// high-cardinality segments meant tens of thousands of entries per query).
+    /// </summary>
+    private (IReadOnlyList<SegmentColumnMeta> Metas, bool UsedFooter) ReadSegmentMetadataCached(string path, string? db = null, string? rp = null)
     {
         // Segment files are immutable once written - cache by path only, no FileInfo needed.
         if (_segmentMetadataCache.TryGetValue(path, out var cached))
         {
             Interlocked.Increment(ref _metadataCacheHits);
             if (db != null && rp != null) IndexSegmentMetadata(db, rp, path, cached.Metas, cached.UsedFooter);
-            return (cached.Metas.ToList(), cached.UsedFooter);
+            return (cached.Metas, cached.UsedFooter);
         }
 
         Interlocked.Increment(ref _metadataCacheMisses);
@@ -1625,7 +1801,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         var info = new FileInfo(path);
         _segmentMetadataCache[path] = (info.Length, info.LastWriteTimeUtc, read.Metadata, read.UsedFooter);
         if (db != null && rp != null) IndexSegmentMetadata(db, rp, path, read.Metadata, read.UsedFooter);
-        return (read.Metadata.ToList(), read.UsedFooter);
+        return (read.Metadata, read.UsedFooter);
     }
 
     private IEnumerable<(string Path, IndexedSegmentMetadata Metadata)> EnumerateSeriesSegmentMetadata(
@@ -1704,25 +1880,40 @@ return Interlocked.Read(ref _bufferedByteCount);
     private static bool Match(Point p, string? m, long? min, long? max) => (m == null || p.Measurement == m) && (!min.HasValue || p.TimestampNs >= min) && (!max.HasValue || p.TimestampNs <= max);
 
     private static bool CouldSegmentMatchFieldFilters(
-        List<SegmentColumnMeta> metas,
+        IReadOnlyList<SegmentColumnMeta> metas,
         string? measurement,
         HashSet<string>? allowedTagsCanonical,
         List<FieldFilter> fieldFilters)
     {
-        var relevantMetas = metas.Where(m =>
+        // Avoid materializing intermediate lists (previously one for relevant metas plus one per
+        // filter); iterate the shared metadata list directly instead.
+        static bool IsRelevant(SegmentColumnMeta m, string? measurement, HashSet<string>? allowedTagsCanonical) =>
             (measurement == null || m.Measurement == measurement)
-            && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(m.TagsCanonical)))
-            .ToList();
+            && (allowedTagsCanonical == null || allowedTagsCanonical.Contains(m.TagsCanonical));
 
-        if (relevantMetas.Count == 0)
+        var anyRelevant = false;
+        for (var i = 0; i < metas.Count; i++)
+        {
+            if (!IsRelevant(metas[i], measurement, allowedTagsCanonical)) continue;
+            anyRelevant = true;
+            break;
+        }
+        if (!anyRelevant)
             return false;
 
         foreach (var filter in fieldFilters)
         {
-            var candidates = relevantMetas.Where(m => string.Equals(m.Field, filter.Field, StringComparison.Ordinal)).ToList();
-            if (candidates.Count == 0)
-                return false;
-            if (!candidates.Any(meta => CouldColumnMatch(meta, filter)))
+            var anyCandidate = false;
+            var anyMatch = false;
+            for (var i = 0; i < metas.Count; i++)
+            {
+                var m = metas[i];
+                if (!IsRelevant(m, measurement, allowedTagsCanonical)) continue;
+                if (!string.Equals(m.Field, filter.Field, StringComparison.Ordinal)) continue;
+                anyCandidate = true;
+                if (CouldColumnMatch(m, filter)) { anyMatch = true; break; }
+            }
+            if (!anyCandidate || !anyMatch)
                 return false;
         }
 

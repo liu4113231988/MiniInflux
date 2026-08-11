@@ -39,6 +39,19 @@ public static class SegmentReader
     private const uint MetadataFooterMagic = 0x4D455446;
     private const int MetadataFooterSize = 16;
 
+    /// <summary>
+    /// Segments larger than this are read through a buffered <see cref="FileStream"/> instead of being
+    /// slurped into one big <c>byte[]</c>. Compacted L2 segments can reach hundreds of megabytes, and
+    /// with up to 8 segments read in parallel the old full-file buffering alone could pin multiple GB
+    /// of memory per query. Streaming lets skipped column payloads never enter memory at all.
+    /// </summary>
+    private const long StreamingReadThresholdBytes = 8L * 1024 * 1024;
+
+    /// <summary>
+    /// Buffer size used for the streaming segment reads.
+    /// </summary>
+    private const int StreamingBufferBytes = 128 * 1024;
+
     public static List<SegmentColumn> ReadSegment(string path)
     {
         return ReadSegment(path, null);
@@ -61,15 +74,8 @@ public static class SegmentReader
         long? maxTimeNs,
         HashSet<string>? allowedTagsCanonical)
     {
-        var allBytes = ReadAllBytesShared(path);
-        if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
-        var dataLength = allBytes.Length - 4;
-        var storedCrc = BitConverter.ToUInt32(allBytes, dataLength);
-        if (storedCrc != Crc32.Compute(allBytes.AsSpan(0, dataLength)))
-            throw new InvalidDataException("segment CRC mismatch");
-
         var result = new List<SegmentColumn>();
-        using var ms = new MemoryStream(allBytes, 0, dataLength, writable: false);
+        using var ms = OpenSegmentForSequentialRead(path, out var dataLength);
         using var br = new BinaryReader(ms, Encoding.UTF8);
         if (br.ReadUInt32() != Magic) throw new InvalidDataException("invalid segment magic");
 
@@ -77,6 +83,9 @@ public static class SegmentReader
 
         for (int i = 0; i < count; i++)
         {
+            // The metadata block follows the columns, so never decode past the column area.
+            if (ms.Position >= dataLength) break;
+
             var m = ReadString(br); var tags = ReadString(br); var f = ReadString(br);
             var k = (FieldKind)br.ReadByte();
             var min = br.ReadInt64(); var max = br.ReadInt64();
@@ -115,15 +124,8 @@ public static class SegmentReader
         long? maxTimeNs,
         HashSet<string>? allowedTagsCanonical)
     {
-        var allBytes = ReadAllBytesShared(path);
-        if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
-        var dataLength = allBytes.Length - 4;
-        var storedCrc = BitConverter.ToUInt32(allBytes, dataLength);
-        if (storedCrc != Crc32.Compute(allBytes.AsSpan(0, dataLength)))
-            throw new InvalidDataException("segment CRC mismatch");
-
         var result = new List<SegmentTimestampColumn>();
-        using var ms = new MemoryStream(allBytes, 0, dataLength, writable: false);
+        using var ms = OpenSegmentForSequentialRead(path, out var dataLength);
         using var br = new BinaryReader(ms, Encoding.UTF8);
         if (br.ReadUInt32() != Magic) throw new InvalidDataException("invalid segment magic");
 
@@ -131,6 +133,9 @@ public static class SegmentReader
 
         for (int i = 0; i < count; i++)
         {
+            // The metadata block follows the columns, so never decode past the column area.
+            if (ms.Position >= dataLength) break;
+
             var m = ReadString(br); var tags = ReadString(br); var f = ReadString(br);
             var k = (FieldKind)br.ReadByte();
             var min = br.ReadInt64(); var max = br.ReadInt64();
@@ -146,9 +151,9 @@ public static class SegmentReader
             var codecs = ReadCodecInfo(version, br);
             var tl = br.ReadInt32(); var tb = br.ReadBytes(tl);
             // Skip value block instead of decoding it.
-            var vl = br.ReadInt32(); ms.Position += vl;
+            var vl = br.ReadInt32(); SkipBytes(ms, vl);
             // Skip stats block if present.
-            if (version >= 2) ms.Position += 28; // 3 doubles + 1 int
+            if (version >= 2) SkipBytes(ms, 28); // 3 doubles + 1 int
 
             result.Add(new SegmentTimestampColumn(m, tags, f, k, min, max,
                 CompressionCodec.DecodeTimestamps(codecs.TimestampCodec, codecs.TimestampCompression, tb)));
@@ -241,6 +246,48 @@ public static class SegmentReader
         return bytes;
     }
 
+    /// <summary>
+    /// Open a segment's column area for sequential reading.
+    /// <para>
+    /// Small segments keep the original behaviour: the whole file is buffered and its CRC verified up
+    /// front. Large segments are streamed through a buffered <see cref="FileStream"/>; the trailing
+    /// CRC is not recomputed there because doing so would require reading every byte, which defeats
+    /// the purpose of column skipping. Structural corruption is still caught by the magic-number and
+    /// length checks below, and by the decoders themselves.
+    /// </para>
+    /// </summary>
+    private static Stream OpenSegmentForSequentialRead(string path, out long dataLength)
+    {
+        var fileLength = new FileInfo(path).Length;
+        if (fileLength < 8) throw new InvalidDataException("segment file too small");
+
+        if (fileLength > StreamingReadThresholdBytes)
+        {
+            dataLength = fileLength - 4;
+            return new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete, StreamingBufferBytes, FileOptions.SequentialScan);
+        }
+
+        var allBytes = ReadAllBytesShared(path);
+        if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
+        dataLength = allBytes.Length - 4;
+        var storedCrc = BitConverter.ToUInt32(allBytes, (int)dataLength);
+        if (storedCrc != Crc32.Compute(allBytes.AsSpan(0, (int)dataLength)))
+            throw new InvalidDataException("segment CRC mismatch");
+        return new MemoryStream(allBytes, 0, (int)dataLength, writable: false);
+    }
+
+    /// <summary>
+    /// Advance a segment stream by <paramref name="count"/> bytes. <see cref="MemoryStream"/> and
+    /// <see cref="FileStream"/> are both seekable, so this is a cheap position adjustment; for the
+    /// streaming case it also means the skipped payload is never materialized.
+    /// </summary>
+    private static void SkipBytes(Stream stream, long count)
+    {
+        if (count <= 0) return;
+        stream.Seek(count, SeekOrigin.Current);
+    }
+
     private static (TimestampCodecKind TimestampCodec, BlockCompressionKind TimestampCompression, ValueCodecKind ValueCodec, BlockCompressionKind ValueCompression) ReadCodecInfo(byte version, BinaryReader br)
     {
         if (version < 3)
@@ -253,7 +300,7 @@ public static class SegmentReader
             (BlockCompressionKind)br.ReadByte());
     }
 
-    private static (byte Version, int Count) ReadVersionAndCount(BinaryReader br, MemoryStream ms)
+    private static (byte Version, int Count) ReadVersionAndCount(BinaryReader br, Stream ms)
     {
         var nextBytes = br.ReadBytes(5);
         if (nextBytes[0] is >= 2 and <= 4)
@@ -288,16 +335,16 @@ public static class SegmentReader
         return true;
     }
 
-    private static void SkipColumnPayload(byte version, BinaryReader br, MemoryStream ms)
+    private static void SkipColumnPayload(byte version, BinaryReader br, Stream ms)
     {
         if (version >= 3)
-            ms.Position += 4; // timestamp/value codec + compression ids
+            SkipBytes(ms, 4); // timestamp/value codec + compression ids
         var skipTl = br.ReadInt32();
-        ms.Position += skipTl;
+        SkipBytes(ms, skipTl);
         var skipVl = br.ReadInt32();
-        ms.Position += skipVl;
+        SkipBytes(ms, skipVl);
         if (version >= 2)
-            ms.Position += 28; // 3 doubles + 1 int
+            SkipBytes(ms, 28); // 3 doubles + 1 int
     }
 
     private static string ReadString(BinaryReader br)

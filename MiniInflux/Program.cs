@@ -102,7 +102,9 @@ var engine = new TsdbEngine(
     maxBufferPoints: options.Storage.MaxBufferPoints,
     maxBufferBytes: options.Storage.MaxBufferBytes,
     flushColdDurationMs: options.Storage.FlushColdDurationMs,
-    compactionTargetBytes: options.Storage.CompactionTargetBytes);
+    compactionTargetBytes: options.Storage.CompactionTargetBytes,
+    maxConcurrentQueries: options.Storage.MaxConcurrentQueries,
+    maxQueryMemoryBytes: options.Storage.MaxQueryMemoryBytes);
 
 builder.Services.AddSingleton(engine);
 var writeQueue = new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize);

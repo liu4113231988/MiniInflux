@@ -90,7 +90,8 @@ public sealed class MiniInfluxOptions
                 MaxResponseRows = ReadInt(config, 100_000, "Storage:MaxResponseRows"),
                 MaxQueryPoints = ReadInt(config, 1_000_000, "Storage:MaxQueryPoints"),
                 MaxBufferPoints = ReadLong(config, 1_000_000, "Storage:MaxBufferPoints"),
-                MaxQueryDurationMs = ReadInt(config, 30_000, "Storage:MaxQueryDurationMs"),
+                MaxQueryDurationMs = ReadInt(config, 10_000, "Storage:MaxQueryDurationMs"),
+                MaxConcurrentQueries = ReadInt(config, 0, "Storage:MaxConcurrentQueries"),
                 MaxBufferBytes = ReadLong(config, 0, "Storage:MaxBufferBytes"),
                 MaxQueryMemoryBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:MaxQueryMemoryBytes"),
                 MinFreeDiskBytes = ReadLong(config, 1L * 1024 * 1024 * 1024, "Storage:MinFreeDiskBytes"),
@@ -273,7 +274,8 @@ public sealed class StorageOptions
     public int MaxResponseRows { get; init; } = 100_000;
     public int MaxQueryPoints { get; init; } = 1_000_000;
     public long MaxBufferPoints { get; init; } = 1_000_000;
-    public int MaxQueryDurationMs { get; init; } = 30_000;
+    public int MaxQueryDurationMs { get; init; } = 10_000;
+    public int MaxConcurrentQueries { get; init; } = 0;
     public long MaxBufferBytes { get; init; }
     public long MaxQueryMemoryBytes { get; init; } = 512L * 1024 * 1024;
     public long MinFreeDiskBytes { get; init; } = 1L * 1024 * 1024 * 1024;

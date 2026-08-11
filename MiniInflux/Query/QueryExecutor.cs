@@ -1029,7 +1029,11 @@ public sealed class QueryExecutor
                 }
                 else
                 {
-                    pts = e.ReadAllPoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken);
+                    // ponytail: push LIMIT down into ReadAllPoints so we never fully materialize every
+                    // point across all segments before applying Skip/Take. Deduplication can only shrink
+                    // the result set, so stopping once (offset + limit) points are gathered is safe.
+                    var readLimit = q.Limit.HasValue ? q.Offset + q.Limit.Value : (int?)null;
+                    pts = e.ReadAllPoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken, readLimit);
                 }
             }
             EnsureQueryPointLimit(pts.Count);

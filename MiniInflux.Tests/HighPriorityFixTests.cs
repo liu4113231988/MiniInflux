@@ -400,6 +400,49 @@ public class HighPriorityFixTests : IDisposable
         Assert.Equal(1.0, point.Fields["value"].Float);
     }
 
+    [Fact]
+    public async Task ReadAllPoints_LimitPushedDown_ReturnsAtMostLimitPointsOrderedByTime()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1_000_000);
+        var written = new List<Point>();
+        for (var i = 0; i < 100; i++)
+            written.Add(Point("cpu", "value", i, "server01", i + 1));
+
+        await engine.WriteAsync("testdb", "autogen", written);
+
+        // No limit: full result set, time-ordered.
+        var all = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null);
+        Assert.Equal(100, all.Count);
+        for (var i = 1; i < all.Count; i++)
+            Assert.True(all[i - 1].TimestampNs <= all[i].TimestampNs, "points must be ordered by timestamp");
+
+        // Limit pushed down: must not materialize all 100 points.
+        var limited = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null, limit: 10);
+        Assert.Equal(10, limited.Count);
+        for (var i = 1; i < limited.Count; i++)
+            Assert.True(limited[i - 1].TimestampNs <= limited[i].TimestampNs, "limited points must be ordered by timestamp");
+        Assert.Equal(1_000_000_000L, limited[0].TimestampNs);
+    }
+
+    [Fact]
+    public async Task ReadAllPoints_MergingBufferedAndSegments_DoesNotMutateWriteBuffer()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1_000_000);
+        var original = Point("cpu", "value", 42, "server01", 1);
+        await engine.WriteAsync("testdb", "autogen", [original]);
+
+        // Reading must never write merged fields back into the engine's live buffer objects, so
+        // repeated reads have to keep returning the same value.
+        var first = Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu", null, null));
+        Assert.Equal(42.0, first.Fields["value"].AsDouble());
+
+        // Mutating the returned point must not corrupt engine state either.
+        first.Fields["value"] = FieldValue.FromDouble(-1);
+
+        var second = Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu", null, null));
+        Assert.Equal(42.0, second.Fields["value"].AsDouble());
+    }
+
     private static Point Point(string measurement, string field, double value, string host, long seconds) => new()
     {
         Measurement = measurement,

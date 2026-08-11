@@ -85,7 +85,10 @@ public sealed class ShardManager
     public IReadOnlyList<(string SegPath, ShardGroupInfo Shard)> ListSegments(
         string db, string rp, long? minTimeNs = null, long? maxTimeNs = null)
     {
-        var result = new List<(string, ShardGroupInfo)>();
+        // Precompute the sort keys once per segment. The previous LINQ chain re-parsed the file name
+        // (GetFileName / IndexOf / long.TryParse) inside the comparator, so parsing ran O(n log n)
+        // times per query instead of O(n).
+        var keyed = new List<(int Level, long Sequence, string SegPath, ShardGroupInfo Shard)>();
         var shards = _manifest.GetShards(db, rp, minTimeNs, maxTimeNs);
         foreach (var shard in shards)
         {
@@ -95,14 +98,23 @@ public sealed class ShardManager
             foreach (var file in shard.SegmentFiles)
             {
                 var seg = Path.Combine(dir, file);
-                result.Add((seg, shard));
+                keyed.Add((InferSegmentLevel(seg), InferSegmentSequence(seg), seg, shard));
             }
         }
-        return result
-            .OrderByDescending(x => InferSegmentLevel(x.Item1))
-            .ThenBy(x => InferSegmentSequence(x.Item1))
-            .ThenBy(x => x.Item1, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+
+        keyed.Sort(static (a, b) =>
+        {
+            var cmp = b.Level.CompareTo(a.Level); // level descending
+            if (cmp != 0) return cmp;
+            cmp = a.Sequence.CompareTo(b.Sequence); // sequence ascending
+            if (cmp != 0) return cmp;
+            return string.Compare(a.SegPath, b.SegPath, StringComparison.OrdinalIgnoreCase);
+        });
+
+        var result = new List<(string SegPath, ShardGroupInfo Shard)>(keyed.Count);
+        foreach (var item in keyed)
+            result.Add((item.SegPath, item.Shard));
+        return result;
     }
 
     /// <summary>

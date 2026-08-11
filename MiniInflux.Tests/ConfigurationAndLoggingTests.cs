@@ -127,7 +127,8 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
     {
         var options = MiniInfluxOptions.Load(new ConfigurationBuilder().Build());
 
-        Assert.Equal(30_000, options.Storage.MaxQueryDurationMs);
+        // Lowered from 30s so slow queries fail fast instead of occupying the query gate.
+        Assert.Equal(10_000, options.Storage.MaxQueryDurationMs);
         Assert.Equal(512L * 1024 * 1024, options.Storage.MaxQueryMemoryBytes);
         Assert.Equal(1L * 1024 * 1024 * 1024, options.Storage.MinFreeDiskBytes);
         Assert.Equal(600_000, options.Storage.FlushColdDurationMs);
