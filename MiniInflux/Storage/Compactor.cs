@@ -19,6 +19,8 @@ public sealed class Compactor
     private readonly long _maxL1Bytes;
     private readonly int _minFilesPerCompaction;
     private readonly int _maxPassesPerRun;
+    private readonly long _maxSegmentFileBytes;
+    private readonly double _segmentFillRatio;
     private readonly object _compactionLock = new();
     private long _totalRuns;
     private long _totalTasks;
@@ -30,7 +32,8 @@ public sealed class Compactor
     public Compactor(Manifest manifest, ShardManager shardManager, TombstoneStore tombstones,
         SchemaRegistry schema, int maxL0Segments = 10, int maxL1Segments = 4,
         long maxL0Bytes = 512 * 1024 * 1024, long maxL1Bytes = 512 * 1024 * 1024,
-        int minFilesPerCompaction = 2, int maxPassesPerRun = 8, StorageHealth? health = null)
+        int minFilesPerCompaction = 2, int maxPassesPerRun = 8, StorageHealth? health = null,
+        long maxSegmentFileBytes = 0, double segmentFillRatio = 0.5)
     {
         _manifest = manifest;
         _shardManager = shardManager;
@@ -43,6 +46,8 @@ public sealed class Compactor
         _maxL1Bytes = maxL1Bytes;
         _minFilesPerCompaction = Math.Max(2, minFilesPerCompaction);
         _maxPassesPerRun = Math.Max(1, maxPassesPerRun);
+        _maxSegmentFileBytes = maxSegmentFileBytes > 0 ? maxSegmentFileBytes : 512L * 1024 * 1024;
+        _segmentFillRatio = segmentFillRatio is > 0 and <= 1 ? segmentFillRatio : 0.5;
     }
 
     public int CompactAll()
@@ -276,7 +281,7 @@ public sealed class Compactor
 
         if (filtered.Count == 0)
         {
-            return FinalizeCompaction(db, rp, shard.Id, orderedInputs, null);
+            return FinalizeCompaction(db, rp, shard.Id, orderedInputs, []);
         }
 
         var merged = MergeColumns(filtered);
@@ -284,15 +289,67 @@ public sealed class Compactor
 
         _schema.ValidateAndRegisterColumns(db, merged);
         var shardDir = _shardManager.ShardDir(db, rp, shard.Id);
-        var mergedPath = Path.Combine(shardDir, $"l{outputLevel}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
-        SegmentWriter.WriteColumns(mergedPath, merged);
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        // ponytail: honor MaxSegmentFileBytes on the *output* too. A merge of N 512MB inputs could
+        // otherwise produce a multi-GB L1/L2 file that violates the configured size cap. Split the
+        // merged columns (kept column-aligned so each output file stays a valid segment) into chunks
+        // of at most the cap. We apply the same tail-merge rule as the flush path: once the current
+        // chunk clears the fill floor and the *remaining* columns are smaller than that floor, we
+        // stop opening new files and pack them in, so compaction never emits a tiny trailing .seg.
+        var mergedPaths = new List<string>();
+        var chunk = new List<SegmentColumn>(Math.Min(merged.Count, 1 << 14));
+        long chunkBytes = 0;
+        long remaining = 0;
+        foreach (var c in merged) remaining += EstimateColumnBytes(c);
+        var fillFloor = (long)(_maxSegmentFileBytes * _segmentFillRatio);
+        for (int i = 0; i < merged.Count; i++)
+        {
+            var col = merged[i];
+            var colBytes = EstimateColumnBytes(col);
+            remaining -= colBytes;
+            if (chunk.Count > 0 && chunkBytes >= fillFloor && chunkBytes + colBytes > _maxSegmentFileBytes
+                && remaining >= fillFloor)
+            {
+                WriteMergedChunk(shardDir, outputLevel, nowMs, chunk, mergedPaths);
+                chunk.Clear();
+                chunkBytes = 0;
+            }
+            chunk.Add(col);
+            chunkBytes += colBytes;
+        }
+        if (chunk.Count > 0)
+            WriteMergedChunk(shardDir, outputLevel, nowMs, chunk, mergedPaths);
+
         _manifest.UpdateIndexes(db, merged
             .GroupBy(c => (c.Measurement, c.TagsCanonical))
             .Select(g => (g.Key.Measurement, g.Key.TagsCanonical, ParseTags(g.Key.TagsCanonical))));
-        return FinalizeCompaction(db, rp, shard.Id, orderedInputs, mergedPath);
+        return FinalizeCompaction(db, rp, shard.Id, orderedInputs, mergedPaths);
     }
 
-    private bool FinalizeCompaction(string db, string rp, int shardId, List<FileCandidate> sourceFiles, string? mergedPath)
+    private static long EstimateColumnBytes(SegmentColumn col)
+    {
+        // ponytail: columnar on-disk estimate (matches SegmentWriter's delta/column encoding). Per
+        // point we store an 8-byte timestamp plus an 8-byte value (non-string field; string fields
+        // are rarer and we overestimate them slightly to stay safe). The series header (measurement,
+        // tags, field name) is stored once for the whole column, so it is amortized here. Using the
+        // old per-point 64-byte estimate over-estimated ~8x and could emit many tiny merged files.
+        long points = col.Timestamps.Count;
+        long perPoint = col.Kind == FieldKind.String
+            ? 8 + 24 + (col.Values.Count > 0 ? (col.Values[0].String?.Length ?? 0) * 2L : 0)
+            : 8 + 8;
+        long header = 64 + col.Measurement.Length * 2L + col.TagsCanonical.Length * 2L + col.Field.Length * 2L;
+        return points * perPoint + header;
+    }
+
+    private void WriteMergedChunk(string shardDir, int outputLevel, long nowMs, List<SegmentColumn> chunk, List<string> mergedPaths)
+    {
+        var path = Path.Combine(shardDir, $"l{outputLevel}-{nowMs}-{Guid.NewGuid():N}.seg");
+        SegmentWriter.WriteColumns(path, chunk);
+        mergedPaths.Add(path);
+    }
+
+    private bool FinalizeCompaction(string db, string rp, int shardId, List<FileCandidate> sourceFiles, List<string> mergedPaths)
     {
         try
         {
@@ -301,13 +358,13 @@ public sealed class Compactor
                 rp,
                 shardId,
                 sourceFiles.Select(f => f.Path),
-                string.IsNullOrWhiteSpace(mergedPath) ? [] : [mergedPath]);
+                mergedPaths);
         }
         catch (Exception ex)
         {
             _health?.RecordFailure("compaction_manifest", ex);
-            if (!string.IsNullOrWhiteSpace(mergedPath))
-                TryDelete(mergedPath);
+            foreach (var p in mergedPaths)
+                TryDelete(p);
             return false;
         }
 

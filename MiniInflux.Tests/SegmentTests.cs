@@ -318,4 +318,89 @@ public class SegmentTests : IDisposable
         bw.Write(bytes.Length);
         bw.Write(bytes);
     }
+
+    [Fact]
+    public async Task Flush_SplitsIntoFilesBoundedByMaxSegmentFileBytes()
+    {
+        // ponytail: regression for the segment-size cap. With a small cap and far more data than it,
+        // FlushLocked must shard the flush into multiple .seg files, none exceeding the cap (within a
+        // tolerance for estimation/compression variance). Data must be merged into big files rather
+        // than scattered across many tiny ones.
+        const long maxSegBytes = 32L * 1024;
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 100, compactionIntervalMs: 0, maxSegmentFileBytes: maxSegBytes);
+
+        var pts = new List<Point>();
+        for (int i = 0; i < 5000; i++)
+        {
+            pts.Add(new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { { "host", "server01" } },
+                Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(i) }, { "load", FieldValue.FromDouble(i * 0.5) } },
+                TimestampNs = (i + 1) * 1_000_000_000L
+            });
+        }
+        await engine.WriteAsync("db", "autogen", pts);
+        engine.FlushAll();
+
+        var segFiles = Directory.GetFiles(_testDir, "*.seg", SearchOption.AllDirectories);
+        Assert.NotEmpty(segFiles);
+        // Should have been split into multiple files (data far exceeds a single cap).
+        Assert.True(segFiles.Length >= 2, $"expected multiple segment files, got {segFiles.Length}");
+        foreach (var f in segFiles)
+        {
+            var len = new FileInfo(f).Length;
+            Assert.True(len <= maxSegBytes * 2,
+                $"segment file {Path.GetFileName(f)} is {len} bytes, exceeds cap tolerance {maxSegBytes * 2}");
+        }
+    }
+
+    [Fact]
+    public async Task Flush_TailMergesInsteadOfTrailingSmallFile()
+    {
+        // ponytail: regression for the tail-merge rule. With a fill ratio below 1, data that only
+        // slightly exceeds the cap must NOT be split into one big file plus a tiny trailing .seg
+        // (which would inflate file count x random IO on HDD/network storage). Instead the remainder
+        // is packed into the current file. Write ~1.4x the cap.
+        const long maxSegBytes = 64L * 1024;
+        const double fillRatio = 0.5;
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1_000_000, compactionIntervalMs: 0,
+            maxSegmentFileBytes: maxSegBytes, segmentFillRatio: fillRatio);
+
+        // Size points so the columnar on-disk payload lands a bit above 1x cap (≈1.4x). With the
+        // columnar estimate (8B ts + 8B/field) each point is small, so we need many points to exceed
+        // the 64KB cap; the point is to confirm a single large flush does NOT scatter many tiny files.
+        long totalBudget = (long)(maxSegBytes * 1.4);
+        var pts = new List<Point>();
+        int i = 0;
+        long acc = 0;
+        while (acc < totalBudget)
+        {
+            var p = new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { { "host", "server01" } },
+                Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(i) }, { "load", FieldValue.FromDouble(i * 0.5) } },
+                TimestampNs = (i + 1) * 1_000_000_000L
+            };
+            pts.Add(p);
+            // columnar estimate: 8 (ts) + 2 * 8 (two double fields) + header amortized below.
+            acc += 8L + 2L * 8L;
+            i++;
+        }
+        await engine.WriteAsync("db", "autogen", pts);
+        engine.FlushAll();
+
+        var segFiles = Directory.GetFiles(_testDir, "*.seg", SearchOption.AllDirectories);
+        Assert.NotEmpty(segFiles);
+        var lengths = segFiles.Select(f => new FileInfo(f).Length).Order().ToList();
+        // ponytail: a single large flush that is only ~1.4x the configured cap must stay as 1 file
+        // (tail-merged). With columnar compression the real payload is far smaller than the cap, so the
+        // splitter must NOT chop it into one big file plus a tiny trailing .seg — that would inflate the
+        // file count x random IO on HDD/network storage. The point is file *count*, not absolute bytes.
+        Assert.True(segFiles.Length == 1,
+            $"tail-merge failed: expected 1 segment file, got {segFiles.Length} lengths=[{string.Join(",", lengths)}]");
+        // The single file must still respect the hard cap (no unbounded growth).
+        Assert.True(lengths[0] <= maxSegBytes * 2, $"segment {lengths[0]} exceeds cap tolerance");
+    }
 }

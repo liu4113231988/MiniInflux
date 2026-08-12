@@ -46,6 +46,9 @@ public sealed class TsdbEngine : IDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _lastBufferWriteTicks = new(StringComparer.Ordinal);
     private readonly int _threshold;
     private readonly long _flushColdTicks;
+    private readonly long _maxSegmentFileBytes;
+    private readonly long _minSegmentFileBytes;
+    private readonly double _segmentFillRatio;
     private readonly long _maxSeriesPerDb;
     private readonly long _maxBufferPoints;
     private readonly long _maxBufferBytes;
@@ -62,11 +65,22 @@ public sealed class TsdbEngine : IDisposable
         int flushIntervalMs = 5000, long maxBufferPoints = 1_000_000, long maxBufferBytes = 0, int compactionIntervalMs = 30000,
         int flushColdDurationMs = 600_000, long compactionTargetBytes = 512L * 1024 * 1024,
         int maxConcurrentQueries = 0,
-        long maxQueryMemoryBytes = 0)
+        long maxQueryMemoryBytes = 0,
+        long maxSegmentFileBytes = 0,
+        long minSegmentFileBytes = 0,
+        double segmentFillRatio = 0.5)
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
         _queryGate = new SemaphoreSlim(maxConcurrentQueries > 0 ? maxConcurrentQueries : Math.Min(Environment.ProcessorCount, 8), int.MaxValue);
         _maxQueryMemoryBytes = maxQueryMemoryBytes > 0 ? maxQueryMemoryBytes : 512L * 1024 * 1024;
+        _maxSegmentFileBytes = maxSegmentFileBytes > 0 ? maxSegmentFileBytes : 512L * 1024 * 1024;
+        _minSegmentFileBytes = minSegmentFileBytes > 0 ? minSegmentFileBytes : 0;
+        // ponytail: tail-merge ratio. When the remaining pending points fit under
+        // (maxSegmentFileBytes * segmentFillRatio), they are merged into the current file instead of
+        // being split off into a tiny trailing .seg. This caps the file count on HDD/network storage
+        // without forcing exact size alignment. Clamped to (0,1]; 1 means "always split at the cap"
+        // (old strict behavior).
+        _segmentFillRatio = segmentFillRatio is > 0 and <= 1 ? segmentFillRatio : 0.5;
         _flushColdTicks = TimeSpan.FromMilliseconds(Math.Max(0, flushColdDurationMs)).Ticks;
         Directory.CreateDirectory(_root);
         _wal = new WalManager(Path.Combine(_root, "wal"), maxWalFileBytes, walFsync, walFsyncIntervalMs, _health);
@@ -78,7 +92,9 @@ public sealed class TsdbEngine : IDisposable
             maxL0Segments: 6, maxL1Segments: 3,                    // 更积极的segment数量阈值
             maxL0Bytes: compactionTargetBytes, maxL1Bytes: compactionTargetBytes,
             minFilesPerCompaction: 2, maxPassesPerRun: 12,        // 更多合并轮次
-            health: _health);
+            health: _health,
+            maxSegmentFileBytes: _maxSegmentFileBytes,
+            segmentFillRatio: _segmentFillRatio);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
         if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => RunCompaction(), null, compactionIntervalMs, compactionIntervalMs);
         if (flushIntervalMs > 0) _flushTimer = new Timer(_ => PeriodicFlush(), null, flushIntervalMs, flushIntervalMs);
@@ -1968,9 +1984,23 @@ return Interlocked.Read(ref _bufferedByteCount);
         }
     }
 
-    private void FlushLocked(string db, string rp, List<BufferedPoint> l, bool updateCheckpoint = true)
+    private void FlushLocked(string db, string rp, List<BufferedPoint> l, bool updateCheckpoint = true, bool force = false)
     {
         if (l.Count == 0) return;
+
+        // ponytail: MinSegmentFileBytes floor. Defer flushing a tiny buffer so cold/low-volume shards
+        // don't scatter many small .seg files; the points merge into larger files as they accumulate.
+        // We only skip when below the floor AND not already at the hard buffer cap (skipping there
+        // would risk OOM). WAL already persists the points, so deferring only delays WAL truncation,
+        // never loses data. `force` (set for a shard that has been cold past 2x FlushColdDurationMs)
+        // bypasses the floor so data is eventually durable.
+        if (!force && _minSegmentFileBytes > 0 && l.Count < _maxBufferPoints)
+        {
+            long est = 0;
+            foreach (var buffered in l) est += EstimateBufferedPointBytes(buffered.Point);
+            if (est < _minSegmentFileBytes) return;
+        }
+
         var flushCount = l.Count;
         long flushBytes = 0;
         
@@ -1998,14 +2028,7 @@ return Interlocked.Read(ref _bufferedByteCount);
             for (int i = 0; i < shardArray.Length; i++)
             {
                 var (shardId, points) = shardArray[i];
-                shardTasks[i] = Task.Run(() =>
-                {
-                    var shardDir = _shards.ShardDir(db, rp, shardId);
-                    var segPath = Path.Combine(shardDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
-                    SegmentWriter.WriteSegment(segPath, points);
-                    _shards.RegisterSegment(db, rp, shardId, segPath);
-                    RegisterSegmentMetadata(db, rp, segPath);
-                });
+                shardTasks[i] = Task.Run(() => WriteShardSegments(db, rp, shardId, points));
             }
             Task.WaitAll(shardTasks);
         }
@@ -2013,13 +2036,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         {
             // 单个shard时直接处理，避免任务调度开销
             foreach (var (shardId, points) in byShard)
-            {
-                var shardDir = _shards.ShardDir(db, rp, shardId);
-                var segPath = Path.Combine(shardDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
-                SegmentWriter.WriteSegment(segPath, points);
-                _shards.RegisterSegment(db, rp, shardId, segPath);
-                RegisterSegmentMetadata(db, rp, segPath);
-            }
+                WriteShardSegments(db, rp, shardId, points);
         }
         
         _bufferedPointCount -= flushCount;
@@ -2032,6 +2049,78 @@ return Interlocked.Read(ref _bufferedByteCount);
         UpdateBufferReplayFloor(key, l);
         if (updateCheckpoint)
             UpdateWalCheckpoint();
+    }
+
+    // ponytail: write one shard's pending points to .seg file(s), honoring the configured max segment
+    // size. A single flush of a hot shard can exceed MaxSegmentFileBytes, so we split the points into
+    // chunks of at most that many (estimated) bytes — each chunk becomes one file. Small flushes that
+    // fit under the cap land in a single file, so data is merged into big files rather than scattered
+    // across many tiny ones. Per-point size is estimated up front; the very last point of a chunk is
+    // always emitted even if it nudges the chunk slightly over the cap (a single point can't be split).
+    private void WriteShardSegments(string db, string rp, int shardId, List<(Point Point, SeriesKey SeriesKey)> points)
+    {
+        if (points.Count == 0) return;
+        var shardDir = _shards.ShardDir(db, rp, shardId);
+        if (!Directory.Exists(shardDir)) Directory.CreateDirectory(shardDir);
+
+        if (_maxSegmentFileBytes <= 0 || points.Count == 1)
+        {
+            var segPath = Path.Combine(shardDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
+            SegmentWriter.WriteSegment(segPath, points);
+            _shards.RegisterSegment(db, rp, shardId, segPath);
+            RegisterSegmentMetadata(db, rp, segPath);
+            return;
+        }
+
+        // ponytail: tail-merge. We never split a chunk once it has reached the fill floor
+        // (maxSegmentFileBytes * segmentFillRatio), and once the *remaining* unwritten points are
+        // smaller than that floor we stop opening new files entirely and pack them into the current
+        // chunk. This avoids a tiny trailing .seg that would otherwise inflate the file count on
+        // HDD/network storage. Files may end up anywhere from floor..cap in size — we deliberately
+        // do not force exact size alignment.
+        long remaining = 0;
+        foreach (var p in points) remaining += EstimateSegmentPointBytes(p.Point);
+        var fillFloor = (long)(_maxSegmentFileBytes * _segmentFillRatio);
+        // If the whole batch is below the floor, a single file is fine (MinSegmentFileBytes handles
+        // the cold-shard deferral case before we get here).
+        var chunk = new List<(Point, SeriesKey)>(Math.Min(points.Count, 1 << 16));
+        long chunkBytes = 0;
+        int fileCount = 0;
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        for (int i = 0; i < points.Count; i++)
+        {
+            var p = points[i];
+            var pBytes = EstimateSegmentPointBytes(p.Point);
+            // Amortize the series header (stored once per file) onto the first point of each chunk.
+            if (chunk.Count == 0) pBytes += SeriesHeaderBytes(p.Point);
+            remaining -= pBytes;
+            // Open a new file only when (a) the current chunk already cleared the fill floor AND
+            // (b) adding this point would breach the hard cap AND (c) there is still enough
+            // remaining data to justify another file (>= floor). Otherwise keep packing.
+            if (chunk.Count > 0 && chunkBytes >= fillFloor && chunkBytes + pBytes > _maxSegmentFileBytes
+                && remaining >= fillFloor)
+            {
+                FlushChunk(shardDir, db, rp, shardId, chunk, nowMs);
+                fileCount++;
+                chunk.Clear();
+                chunkBytes = 0;
+            }
+            chunk.Add(p);
+            chunkBytes += pBytes;
+        }
+        if (chunk.Count > 0)
+        {
+            FlushChunk(shardDir, db, rp, shardId, chunk, nowMs);
+            fileCount++;
+        }
+    }
+
+    private void FlushChunk(string shardDir, string db, string rp, int shardId, List<(Point, SeriesKey)> chunk, long nowMs)
+    {
+        var segPath = Path.Combine(shardDir, $"{nowMs}-{Guid.NewGuid():N}.seg");
+        SegmentWriter.WriteSegment(segPath, chunk);
+        _shards.RegisterSegment(db, rp, shardId, segPath);
+        RegisterSegmentMetadata(db, rp, segPath);
     }
 
     private void FlushDatabase(string db)
@@ -2127,6 +2216,32 @@ return Interlocked.Read(ref _bufferedByteCount);
             size += 32 + EstimateStringBytes(tag.Key) + EstimateStringBytes(tag.Value);
         foreach (var field in point.Fields)
             size += 48 + EstimateStringBytes(field.Key) + EstimateFieldValueBytes(field.Value);
+        return size;
+    }
+
+    // ponytail: columnar on-disk estimate used for .seg file *size* splitting. Unlike
+    // EstimateBufferedPointBytes (which models the in-memory buffered cost where measurement/tags are
+    // repeated per point), the segment format stores the series header (measurement, tags, field names)
+    // once and delta/column-encodes the data, so per-point cost is just the timestamp plus each field
+    // value. Using the in-memory estimate here over-estimated by ~100x and caused the splitter to emit
+    // many tiny files on HDD/network storage. The series header is amortized once per chunk.
+    private static long EstimateSegmentPointBytes(Point point)
+    {
+        long size = 8; // timestamp
+        foreach (var field in point.Fields)
+            size += field.Value.Kind == FieldKind.String ? EstimateStringBytes(field.Value.String) : 8;
+        return size;
+    }
+
+    private static long SeriesHeaderBytes(Point point)
+    {
+        long size = 64 + EstimateStringBytes(point.Measurement);
+        if (point.Tags != null)
+            foreach (var tag in point.Tags)
+                size += EstimateStringBytes(tag.Key) + EstimateStringBytes(tag.Value);
+        if (point.Fields != null)
+            foreach (var field in point.Fields)
+                size += EstimateStringBytes(field.Key);
         return size;
     }
 
@@ -2337,7 +2452,12 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
                     if (kv.Value.Count < _threshold
                         && (_flushColdTicks <= 0 || !_lastBufferWriteTicks.TryGetValue(kv.Key, out var lastWrite) || lastWrite > coldBefore))
                         continue;
-                    FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false);
+                    // ponytail: a shard colder than 2x FlushColdDurationMs bypasses the MinSegmentFileBytes
+                    // floor so its buffered points become durable instead of lingering in the buffer forever.
+                    var force = _flushColdTicks > 0
+                        && _lastBufferWriteTicks.TryGetValue(kv.Key, out var lastWrite2)
+                        && lastWrite2 <= coldBefore - _flushColdTicks;
+                    FlushLocked(p[0], p[1], kv.Value, updateCheckpoint: false, force: force);
                 }
                 finally { lk.ExitWriteLock(); }
             }

@@ -126,4 +126,44 @@ public sealed class LastCommitRegressionTests : IDisposable
         Fields = new Dictionary<string, FieldValue> { [field] = FieldValue.FromDouble(value) },
         TimestampNs = seconds * 1_000_000_000
     };
+
+    [Fact]
+    public async Task Compactor_OutputRespectsMaxSegmentFileBytes()
+    {
+        // ponytail: regression for plan item 1. The merge of many small L0 segments must not produce a
+        // single multi-MB L1/L2 file that violates MaxSegmentFileBytes; it is split into several files
+        // each within the cap. Here 12 tiny segments are merged under a 256-byte cap => multiple l1- files.
+        const long maxSegBytes = 256L;
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, rpCheckIntervalMs: 0,
+            flushIntervalMs: 0, compactionIntervalMs: 0);
+        // 12 distinct series (different host) so MergeColumns keeps them as 12 separate columns;
+        // the merged output must then be split into several files, each within the cap.
+        for (var i = 0; i < 12; i++)
+            await engine.WriteAsync("db", "autogen", [Point("cpu", "value", i, $"h{i}", i + 1)]);
+
+        var compactor = new Compactor(engine.Meta, new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones, engine.Schema, maxL0Segments: 10, maxL1Segments: 99,
+            maxL0Bytes: long.MaxValue, maxSegmentFileBytes: maxSegBytes);
+
+        Assert.Equal(1, compactor.CompactAll());
+
+        var shard = Assert.Single(engine.Meta.GetShards("db", "autogen"));
+        var shardDir = new ShardManager(engine.RootPath, engine.Meta).ShardDir("db", "autogen", shard.Id);
+        var segFiles = shard.SegmentFiles
+            .Select(f => Path.Combine(shardDir, f))
+            .Where(File.Exists)
+            .ToList();
+
+        // Merged data exceeded the cap, so it must have been split into more than one file.
+        Assert.True(segFiles.Count >= 2, $"expected split output, got {segFiles.Count} file(s)");
+        foreach (var f in segFiles)
+            Assert.StartsWith("l1-", Path.GetFileName(f), StringComparison.OrdinalIgnoreCase);
+        // Every merged file stays within the configured cap (with tolerance for estimation variance).
+        foreach (var f in segFiles)
+        {
+            var len = new FileInfo(f).Length;
+            Assert.True(len <= maxSegBytes * 3,
+                $"merged segment {Path.GetFileName(f)} is {len} bytes, exceeds cap tolerance {maxSegBytes * 3}");
+        }
+    }
 }
