@@ -51,6 +51,8 @@ public sealed class AdminDatabaseSummary
     public int ShardCount { get; set; }
     [JsonPropertyName("segmentCount")]
     public int SegmentCount { get; set; }
+    [JsonPropertyName("sizeBytes")]
+    public long SizeBytes { get; set; }
     [JsonPropertyName("retentionPolicies")]
     public List<AdminRetentionPolicySummary> RetentionPolicies { get; set; } = [];
 }
@@ -67,6 +69,8 @@ public sealed class AdminRetentionPolicySummary
     public int ShardCount { get; set; }
     [JsonPropertyName("segmentCount")]
     public int SegmentCount { get; set; }
+    [JsonPropertyName("sizeBytes")]
+    public long SizeBytes { get; set; }
 }
 
 public sealed class AdminContinuousQuerySummary

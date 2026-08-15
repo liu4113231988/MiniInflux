@@ -4,6 +4,7 @@ import { computed, onMounted, ref } from 'vue'
 const tabs = [
   { key: 'overview', label: '概览' },
   { key: 'databases', label: '数据库' },
+  { key: 'query', label: '查询' },
   { key: 'queries', label: 'CQ' },
   { key: 'ops', label: '运维' }
 ]
@@ -27,6 +28,12 @@ const databases = ref([])
 const queries = ref([])
 const backupPath = ref('./backup/admin-snapshot')
 const restorePath = ref('./backup/admin-snapshot')
+
+const queryDb = ref('')
+const queryText = ref('')
+const queryLimit = ref(1000)
+const queryResult = ref(null)
+const queryError = ref('')
 
 const signedIn = computed(() =>
   !session.value.requiresAuthentication
@@ -110,6 +117,19 @@ function formatRetryAfter(seconds) {
   return `${minutes} 分钟后再试`
 }
 
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0
+  if (value < 1024) return `${value} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let size = value / 1024
+  let unit = 0
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024
+    unit++
+  }
+  return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`
+}
+
 function sessionFailureMessage(currentSession, fallbackMessage) {
   if (currentSession?.rateLimited) {
     return `登录失败次数过多，请在 ${formatRetryAfter(currentSession.retryAfterSeconds)}。`
@@ -152,6 +172,79 @@ async function loadQueries() {
 async function loadProtectedData() {
   await loadOverview()
   await Promise.all([loadDatabases(), loadQueries()])
+}
+
+const querySeriesList = computed(() => {
+  const results = queryResult.value?.results || []
+  const series = []
+  for (const result of results) {
+    if (result.error) return { error: result.error }
+    for (const s of result.series || []) series.push(s)
+  }
+  return series
+})
+
+async function runQuery() {
+  queryError.value = ''
+  queryResult.value = null
+  if (!queryText.value.trim()) {
+    queryError.value = '请输入查询语句'
+    return
+  }
+  busy.value = true
+  try {
+    let statement = queryText.value.trim().replace(/;+\s*$/, '')
+    if (/^select\b/i.test(statement) && !/\blimit\b/i.test(statement) && queryLimit.value > 0) {
+      statement = `${statement} LIMIT ${Math.max(1, Math.min(100000, Number(queryLimit.value) || 1000))}`
+    }
+    queryResult.value = await api('/admin/api/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        q: statement,
+        ...(queryDb.value ? { db: queryDb.value } : {})
+      }).toString()
+    })
+  } catch (ex) {
+    queryError.value = ex.message
+  } finally {
+    busy.value = false
+  }
+}
+
+function exportQueryCsv() {
+  const series = querySeriesList.value
+  if (Array.isArray(series)) {
+    const parts = []
+    for (const s of series) {
+      const cols = s.columns || []
+      const header = cols.join(',')
+      parts.push(`# series: ${s.name || ''}${s.tags ? ' ' + JSON.stringify(s.tags) : ''}\n${header}`)
+      for (const row of s.values || []) {
+        parts.push(cols.map((_, i) => csvCell(row[i])).join(','))
+      }
+    }
+    downloadText(parts.join('\n'), 'query-result.csv', 'text/csv')
+    return
+  }
+  error.value = '没有可导出的结果'
+}
+
+function csvCell(value) {
+  if (value === null || value === undefined) return ''
+  const text = String(value)
+  if (/[",\n]/.test(text)) return `"${text.replace(/"/g, '""')}"`
+  return text
+}
+
+function downloadText(content, filename, mime) {
+  const blob = new Blob([content], { type: mime })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  link.click()
+  URL.revokeObjectURL(url)
 }
 
 async function refreshAll() {
@@ -327,6 +420,48 @@ onMounted(async () => {
         </div>
       </section>
 
+      <section v-else-if="activeTab === 'query'" class="page">
+        <article class="panel">
+          <div class="section-title">数据查询（只读）</div>
+          <div class="subtle">仅允许 SELECT / SHOW 类语句，DELETE、DROP、CREATE 等变更语句会被拒绝。</div>
+          <div class="query-form">
+            <select v-model="queryDb" class="query-db">
+              <option value="">默认数据库</option>
+              <option v-for="db in databases" :key="db.name" :value="db.name">{{ db.name }}</option>
+            </select>
+            <input
+              v-model.trim="queryText"
+              class="query-input"
+              placeholder="例如：SELECT * FROM cpu WHERE time > now() - 1h"
+              @keyup.ctrl.enter="runQuery"
+            />
+            <input v-model.number="queryLimit" type="number" min="1" max="100000" class="query-limit" title="SELECT 默认 LIMIT" />
+            <button class="primary" :disabled="busy" @click="runQuery">执行</button>
+            <button :disabled="!queryResult || busy" @click="exportQueryCsv">导出 CSV</button>
+          </div>
+          <div v-if="queryError" class="banner error">{{ queryError }}</div>
+          <div v-else-if="!queryResult" class="empty compact-empty">暂无结果，请输入查询语句后点击「执行」。</div>
+          <div v-else>
+            <div v-if="Array.isArray(querySeriesList)" class="result-scroll">
+              <template v-for="(s, si) in querySeriesList" :key="si">
+                <div class="result-series-head">{{ s.name || 'result' }}<span v-if="s.tags"> {{ JSON.stringify(s.tags) }}</span></div>
+                <div class="table-wrap">
+                  <table class="table">
+                    <thead><tr><th v-for="(col, ci) in s.columns" :key="ci">{{ col }}</th></tr></thead>
+                    <tbody>
+                      <tr v-for="(row, ri) in (s.values || [])" :key="ri">
+                        <td v-for="(cell, ci) in row" :key="ci">{{ cell === null ? 'null' : cell }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </template>
+            </div>
+            <div v-else class="banner error">{{ querySeriesList.error }}</div>
+          </div>
+        </article>
+      </section>
+
       <section v-else-if="activeTab === 'databases'" class="page">
         <div v-if="databases.length === 0" class="empty">暂无数据库</div>
         <article v-for="db in databases" :key="db.name" class="panel">
@@ -340,15 +475,16 @@ onMounted(async () => {
               <span class="pill">{{ db.seriesCardinality }} series</span>
               <span class="pill">{{ db.shardCount }} shards</span>
               <span class="pill">{{ db.segmentCount }} segments</span>
+              <span class="pill">{{ formatBytes(db.sizeBytes) }}</span>
             </div>
           </div>
           <div class="table-wrap">
             <table class="table">
-              <thead><tr><th>Retention Policy</th><th>Duration(ns)</th><th>Default</th><th>Shards</th><th>Segments</th></tr></thead>
+              <thead><tr><th>Retention Policy</th><th>Duration(ns)</th><th>Default</th><th>Shards</th><th>Segments</th><th>占用大小</th></tr></thead>
               <tbody>
                 <tr v-for="rp in db.retentionPolicies" :key="rp.name">
                   <td>{{ rp.name }}</td><td>{{ rp.durationNs }}</td><td>{{ rp.isDefault ? 'yes' : 'no' }}</td>
-                  <td>{{ rp.shardCount }}</td><td>{{ rp.segmentCount }}</td>
+                  <td>{{ rp.shardCount }}</td><td>{{ rp.segmentCount }}</td><td>{{ formatBytes(rp.sizeBytes) }}</td>
                 </tr>
               </tbody>
             </table>
@@ -469,13 +605,20 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-
 .action-stack { margin-top: 14px; }
 .empty { padding: 32px; border: 1px dashed #cbd5e1; border-radius: 8px; text-align: center; color: #64748b; background: rgba(255,255,255,.55); }
 .compact-empty { margin-top: 16px; padding: 24px; }
+.query-form { display: grid; grid-template-columns: 200px minmax(0, 1fr) 120px auto auto; gap: 10px; align-items: stretch; margin-top: 14px; }
+.query-form .query-input { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.query-form .query-limit { width: auto; }
+.result-scroll { margin-top: 18px; display: flex; flex-direction: column; gap: 18px; }
+.result-series-head { font-size: 13px; font-weight: 700; color: #334155; margin-bottom: 6px; }
+.result-series-head span { color: #94a3b8; font-weight: 500; }
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }
   .sidebar { gap: 16px; }
-  .tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .tabs { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
   .tab { text-align: center; padding-inline: 6px; }
   .account { margin-top: 0; }
   .grid.two, .form-grid, .form-grid.compact { grid-template-columns: 1fr; }
+  .query-form { grid-template-columns: 1fr; }
   .row.between { flex-direction: column; }
   .pill-row { justify-content: flex-start; }
 }
@@ -485,6 +628,7 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-
   .toolbar h1 { font-size: 23px; }
   .toolbar p { display: none; }
   .tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .query-form { grid-template-columns: 1fr; }
   .login-panel { padding: 24px 20px; }
 }
 </style>

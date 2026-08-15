@@ -353,6 +353,43 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
 });
 
+// Read-only query console for the admin UI. Only SELECT / SHOW statements are
+// permitted; mutation statements (DELETE/DROP/CREATE/...) are rejected before execution.
+app.MapPost("/admin/api/query", (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics, string? db, string? q) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
+    {
+        var form = request.ReadFormAsync().Result;
+        q = form["q"];
+        db ??= form["db"];
+    }
+
+    if (string.IsNullOrWhiteSpace(q))
+        return Results.BadRequest(new ErrorResponse("missing required parameter q"));
+
+    ParsedQuery parsed;
+    try
+    {
+        parsed = InfluxQlParser.Parse(q);
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ErrorResponse($"parse error: {ex.Message}"));
+    }
+
+    if (!IsAdminQueryAllowed(parsed.Kind))
+        return Results.BadRequest(new ErrorResponse($"statement type '{parsed.Kind}' is not allowed in the admin query console (read-only)"));
+
+    var epoch = request.Query["epoch"].ToString();
+    var outcome = executor.ExecuteWithReport(tsdbEngine, db, q, request.HttpContext.RequestAborted);
+    metrics.RecordQuery(outcome.Report);
+    LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
+    return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
+});
+
 app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string path) =>
 {
         if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
@@ -456,13 +493,22 @@ adminApi.MapGet("/databases", (HttpRequest request) =>
                 .Select(rp =>
                 {
                     var shards = engine.Meta.GetShards(db, rp.Name);
+                    var sizeBytes = shards.Sum(shard =>
+                    {
+                        var shardDir = Path.Combine(engine.RootPath, "db", db, rp.Name, "shards", shard.Id.ToString("D6"));
+                        return shard.SegmentFiles
+                            .Select(file => Path.Combine(shardDir, file))
+                            .Where(File.Exists)
+                            .Sum(seg => new FileInfo(seg).Length);
+                    });
                     return new AdminRetentionPolicySummary
                     {
                         Name = rp.Name,
                         DurationNs = rp.DurationNs,
                         IsDefault = rp.IsDefault,
                         ShardCount = shards.Count,
-                        SegmentCount = shards.Sum(shard => shard.SegmentFiles.Count)
+                        SegmentCount = shards.Sum(shard => shard.SegmentFiles.Count),
+                        SizeBytes = sizeBytes
                     };
                 })
                 .ToList();
@@ -475,6 +521,7 @@ adminApi.MapGet("/databases", (HttpRequest request) =>
                 SeriesCardinality = engine.GetSeriesCardinality(db),
                 ShardCount = rpSummaries.Sum(rp => rp.ShardCount),
                 SegmentCount = rpSummaries.Sum(rp => rp.SegmentCount),
+                SizeBytes = rpSummaries.Sum(rp => rp.SizeBytes),
                 RetentionPolicies = rpSummaries
             };
         })
@@ -881,6 +928,30 @@ static bool TryParseRfc3339Ns(string text, out long ns)
     ns = checked(dto.ToUnixTimeSeconds() * 1_000_000_000L + nanos);
     return true;
 }
+
+static bool IsAdminQueryAllowed(QueryKind kind) => kind switch
+{
+    QueryKind.Select => true,
+    QueryKind.ShowDatabases => true,
+    QueryKind.ShowMeasurements => true,
+    QueryKind.ShowFieldKeys => true,
+    QueryKind.ShowTagKeys => true,
+    QueryKind.ShowTagValues => true,
+    QueryKind.ShowRetentionPolicies => true,
+    QueryKind.ShowSeries => true,
+    QueryKind.ShowSeriesCardinality => true,
+    QueryKind.ShowMeasurementCardinality => true,
+    QueryKind.ShowTagValuesCardinality => true,
+    QueryKind.ShowTagKeyCardinality => true,
+    QueryKind.ShowFieldKeyCardinality => true,
+    QueryKind.ShowShards => true,
+    QueryKind.ShowShardGroups => true,
+    QueryKind.ShowStats => true,
+    QueryKind.ShowDiagnostics => true,
+    QueryKind.ShowContinuousQueries => true,
+    QueryKind.ShowQueries => true,
+    _ => false
+};
 
 static long ParseEpochDivisor(string? epoch) => epoch switch
 {
