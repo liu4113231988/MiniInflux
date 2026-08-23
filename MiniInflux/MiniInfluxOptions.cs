@@ -98,8 +98,9 @@ public sealed class MiniInfluxOptions
                 FlushColdDurationMs = ReadInt(config, 600_000, "Storage:FlushColdDurationMs"),
                 CompactionTargetBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:CompactionTargetBytes"),
                 MaxSegmentFileBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:MaxSegmentFileBytes"),
-                MinSegmentFileBytes = ReadLong(config, 0L, "Storage:MinSegmentFileBytes"),
-                MinSegmentFillRatio = ReadDouble(config, 0.5, "Storage:MinSegmentFillRatio")
+            MinSegmentFileBytes = ReadLong(config, 0L, "Storage:MinSegmentFileBytes"),
+            MinSegmentFillRatio = ReadDouble(config, 0.5, "Storage:MinSegmentFillRatio"),
+            CompactionMaxWriteBytesPerSecond = ReadLong(config, 0L, "Storage:CompactionMaxWriteBytesPerSecond")
             },
             Auth = new AuthOptions
             {
@@ -308,6 +309,10 @@ public sealed class StorageOptions
     /// per flush); lower = closer to the strict hard cap. 1 reverts to the old strict split-at-cap
     /// behavior. Files are intentionally <em>not</em> exact-size aligned.</summary>
     public double MinSegmentFillRatio { get; init; } = 0.5;
+    /// <summary>Optional I/O budget for background compaction, in bytes per second. When non-zero,
+    /// compaction output writes are throttled to roughly this rate so a large merge cannot saturate
+    /// disk and degrade foreground read/write latency. 0 (default) disables throttling.</summary>
+    public long CompactionMaxWriteBytesPerSecond { get; init; } = 0L;
 }
 
 public sealed class AuthOptions

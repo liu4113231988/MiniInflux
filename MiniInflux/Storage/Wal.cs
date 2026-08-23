@@ -110,44 +110,38 @@ public sealed class WalManager : IDisposable
             try
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
-                // Build payload directly into a pooled byte array, avoiding StringBuilder→string→byte[] double copy.
-                var payloadSize = EstimatePayloadSize(db, rp, pointList);
-                var payload = ArrayPool<byte>.Shared.Rent(payloadSize);
-                try
+                // ponytail: format the record directly into a pool-backed IBufferWriter. The old path
+                // built an ArrayBufferWriter and then copied the whole payload into a second rented
+                // array — one full-payload memcpy per write batch for nothing.
+                using var writer = new PooledBufferWriter(EstimatePayloadSize(db, rp, pointList));
+                WriteRecordPayload(writer, db, rp, pointList);
+                var payloadSpan = writer.WrittenSpan;
+
+                // 如果当前写入量较小且距离上次写入时间很短，可以考虑批量合并
+                var shouldBatch = !_fsync && payloadSpan.Length < _batchSize &&
+                                (DateTime.UtcNow - _lastWriteTime) < _maxBatchDelay;
+
+                var position = WriteRecord(payloadSpan, Crc32.Compute(payloadSpan));
+                for (var i = 0; i < pointList.Count; i++)
+                    positions.Add(position);
+
+                if (_currentFileSize >= _maxFileBytes)
+                    RotateLocked();
+
+                // 更新最后写入时间
+                _lastWriteTime = DateTime.UtcNow;
+
+                // 优化：减少fsync频率，只在检查点或文件轮转时同步
+                // 系统崩溃时可能丢失最后几个batch，但大幅提升写入性能
+                if (!_fsync || _fsyncIntervalMs <= 0)
                 {
-                    var actualSize = FormatRecordUtf8(payload, db, rp, pointList);
-                    var payloadSpan = payload.AsSpan(0, actualSize);
-                    
-                    // 如果当前写入量较小且距离上次写入时间很短，可以考虑批量合并
-                    var shouldBatch = !_fsync && payloadSpan.Length < _batchSize && 
-                                    (DateTime.UtcNow - _lastWriteTime) < _maxBatchDelay;
-                    
-                    var position = WriteRecord(payloadSpan, Crc32.Compute(payloadSpan));
-                    for (var i = 0; i < pointList.Count; i++)
-                        positions.Add(position);
-
-                    if (_currentFileSize >= _maxFileBytes)
-                        RotateLocked();
-
-                    // 更新最后写入时间
-                    _lastWriteTime = DateTime.UtcNow;
-
-                    // 优化：减少fsync频率，只在检查点或文件轮转时同步
-                    // 系统崩溃时可能丢失最后几个batch，但大幅提升写入性能
-                    if (!_fsync || _fsyncIntervalMs <= 0)
+                    // 只在禁用fsync时进行批量刷盘，或者降低fsync频率
+                    if (!_fsync && (shouldBatch || _currentFileSize % (64 * 1024) == 0))
                     {
-                        // 只在禁用fsync时进行批量刷盘，或者降低fsync频率
-                        if (!_fsync && (shouldBatch || _currentFileSize % (64 * 1024) == 0))
-                        {
-                            // 每64KB进行一次轻量flush，而不是每次写入
-                            _currentStream?.Flush(false);
-                        }
-                        _health.RecordWriteSuccess();
+                        // 每64KB进行一次轻量flush，而不是每次写入
+                        _currentStream?.Flush(false);
                     }
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(payload);
+                    _health.RecordWriteSuccess();
                 }
             }
             catch (Exception ex)
@@ -157,6 +151,16 @@ public sealed class WalManager : IDisposable
             }
         }
         return positions;
+    }
+
+    private static void WriteRecordPayload(IBufferWriter<byte> writer, string db, string rp, IReadOnlyList<Point> points)
+    {
+        WriteUtf8(writer, db);
+        WriteUtf8(writer, "\t");
+        WriteUtf8(writer, rp);
+        WriteUtf8(writer, "\t");
+        for (var i = 0; i < points.Count; i++)
+            AppendLineProtocolUtf8(writer, points[i]);
     }
 
     private WalPosition WriteRecord(ReadOnlySpan<byte> payload, uint crc)
@@ -179,21 +183,48 @@ public sealed class WalManager : IDisposable
     }
 
     /// <summary>
-    /// Format WAL record directly into a byte buffer, avoiding StringBuilder→string→byte[] double copy.
-    /// Returns the actual number of bytes written.
+    /// Pool-backed <see cref="IBufferWriter{T}"/>: rents from <see cref="ArrayPool{T}.Shared"/>,
+    /// grows by re-renting (copying only on underestimate), and returns the array on dispose.
+    /// Lets the WAL format records straight into their final buffer with no intermediate copy.
     /// </summary>
-    private static int FormatRecordUtf8(byte[] buffer, string db, string rp, IReadOnlyList<Point> points)
+    private sealed class PooledBufferWriter(int initialCapacity) : IBufferWriter<byte>, IDisposable
     {
-        var writer = new ArrayBufferWriter<byte>();
-        WriteUtf8(writer, db);
-        WriteUtf8(writer, "\t");
-        WriteUtf8(writer, rp);
-        WriteUtf8(writer, "\t");
-        for (var i = 0; i < points.Count; i++)
-            AppendLineProtocolUtf8(writer, points[i]);
-        var written = writer.WrittenCount;
-        writer.WrittenSpan.CopyTo(buffer);
-        return written;
+        private byte[] _buffer = ArrayPool<byte>.Shared.Rent(Math.Max(initialCapacity, 64));
+        private int _written;
+
+        public int WrittenCount => _written;
+        public ReadOnlySpan<byte> WrittenSpan => _buffer.AsSpan(0, _written);
+
+        public void Advance(int count)
+        {
+            if (count < 0 || _written + count > _buffer.Length)
+                throw new ArgumentOutOfRangeException(nameof(count));
+            _written += count;
+        }
+
+        public Memory<byte> GetMemory(int sizeHint = 0)
+        {
+            Ensure(sizeHint);
+            return _buffer.AsMemory(_written);
+        }
+
+        public Span<byte> GetSpan(int sizeHint = 0) => Ensure(sizeHint);
+
+        private Span<byte> Ensure(int sizeHint)
+        {
+            var required = _written + Math.Max(sizeHint, 1);
+            if (required <= _buffer.Length)
+                return _buffer.AsSpan(_written);
+
+            var newSize = Math.Max(required, _buffer.Length * 2);
+            var newBuffer = ArrayPool<byte>.Shared.Rent(newSize);
+            Buffer.BlockCopy(_buffer, 0, newBuffer, 0, _written);
+            ArrayPool<byte>.Shared.Return(_buffer);
+            _buffer = newBuffer;
+            return _buffer.AsSpan(_written);
+        }
+
+        public void Dispose() => ArrayPool<byte>.Shared.Return(_buffer);
     }
 
     private static void WriteUtf8(IBufferWriter<byte> writer, string? s)

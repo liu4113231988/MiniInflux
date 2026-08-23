@@ -245,6 +245,9 @@ dotnet run -c Release --project .\MiniInflux\MiniInflux.csproj
 - `Storage.MinFreeDiskBytes`：健康检查要求的数据卷最小剩余空间；Production 必须设置为非零值
 - `Storage.FlushColdDurationMs`：低于 `FlushThreshold` 的缓冲数据连续无写入多久后生成 segment；默认 10 分钟，期间数据已由 WAL 持久化且查询可见
 - `Storage.CompactionTargetBytes`：分层压缩每批目标大小；默认 512 MiB，用于减少小 segment 数量，并受单个 shard 实际数据量限制
+- `Wal.Fsync`：启用 WAL 定时组提交刷盘。写入确认不等待 fsync 完成：进程崩溃（kill -9）不会丢失已确认写入，但**断电/操作系统崩溃可能丢失最近一个 `Wal.FsyncIntervalMs` 窗口内已确认的写入**。这是与 InfluxDB 1.x cache/WAL 模型类似的持久性取舍；需要更强持久性时调小 `FsyncIntervalMs`，可接受更高吞吐损失时调大或设为 `0`
+- `Wal.FsyncIntervalMs`：WAL fsync 定时器周期，默认 `1000`；设为 `0` 时仅在 WAL 文件轮转与 checkpoint 时刷盘，断电丢失窗口进一步扩大
+- `Wal.MaxWalFileBytes`：单个 WAL 文件轮转阈值，默认 16 MiB；checkpoint 之前的旧 WAL 文件会被删除
 
 环境变量兼容：
 

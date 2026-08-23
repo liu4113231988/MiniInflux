@@ -68,7 +68,8 @@ public sealed class TsdbEngine : IDisposable
         long maxQueryMemoryBytes = 0,
         long maxSegmentFileBytes = 0,
         long minSegmentFileBytes = 0,
-        double segmentFillRatio = 0.5)
+        double segmentFillRatio = 0.5,
+        long compactionMaxWriteBytesPerSecond = 0)
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
         _queryGate = new SemaphoreSlim(maxConcurrentQueries > 0 ? maxConcurrentQueries : Math.Min(Environment.ProcessorCount, 8), int.MaxValue);
@@ -94,7 +95,8 @@ public sealed class TsdbEngine : IDisposable
             minFilesPerCompaction: 2, maxPassesPerRun: 12,        // 更多合并轮次
             health: _health,
             maxSegmentFileBytes: _maxSegmentFileBytes,
-            segmentFillRatio: _segmentFillRatio);
+            segmentFillRatio: _segmentFillRatio,
+            maxWriteBytesPerSecond: compactionMaxWriteBytesPerSecond);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
         if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => RunCompaction(), null, compactionIntervalMs, compactionIntervalMs);
         if (flushIntervalMs > 0) _flushTimer = new Timer(_ => PeriodicFlush(), null, flushIntervalMs, flushIntervalMs);
@@ -222,9 +224,11 @@ public sealed class TsdbEngine : IDisposable
             _lastBufferWriteTicks[key] = DateTime.UtcNow.Ticks;
             UpdateBufferReplayFloor(key, list);
             
-            // 基于大小而不仅仅是计数的flush触发器
-            if (list.Count >= _threshold || 
-                (_maxBufferBytes > 0 && list.Sum(p => EstimateBufferedPointBytes(p.Point)) >= _maxBufferBytes * 0.8))
+            // 基于大小而不仅仅是计数的flush触发器。
+            // ponytail: use the incrementally-maintained _bufferedByteCount instead of re-summing the
+            // whole buffer list on every write batch (O(N) per write when MaxBufferBytes > 0).
+            if (list.Count >= _threshold ||
+                (_maxBufferBytes > 0 && Interlocked.Read(ref _bufferedByteCount) >= _maxBufferBytes * 0.8))
             {
                 FlushLocked(db, rp, list);
             }

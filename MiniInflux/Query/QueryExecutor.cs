@@ -579,40 +579,77 @@ public sealed class QueryExecutor
     List<QuerySeries>? ShowTagKeys(TsdbEngine e, string? db, ParsedQuery q)
     {
         Req(db);
-        var keys = HasTagFilters(q) && !e.ListSeries(db!, q.Measurement).Any(series => PassesTagFilters(ParseTagsCanonical(series), q))
-            ? []
-            : e.ListTagKeys(db!, q.Measurement);
+        var keys = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var meas in ResolveFilteredMeasurements(e, db!, q))
+        {
+            var seriesList = e.ListSeries(db!, meas);
+            if (HasTagFilters(q) && !seriesList.Any(series => PassesTagFilters(ParseTagsCanonical(series), q)))
+                continue;
+            foreach (var key in e.ListTagKeys(db!, meas))
+                keys.Add(key);
+        }
         return [new() { Name = q.Measurement ?? "tagKeys", Columns = ["tagKey"], Values = keys.Select(x => new List<object?> { x }).ToList() }];
     }
 
     List<QuerySeries>? ShowTagValues(TsdbEngine e, string? db, ParsedQuery q)
     {
         Req(db);
-        var key = q.TagKey ?? "";
-        var tagValues = e.ListSeries(db!, q.Measurement)
-            .Select(ParseTagsCanonical)
-            .Where(tags => PassesTagFilters(tags, q) && tags.ContainsKey(key))
-            .Select(tags => (Key: key, Value: tags[key]))
-            .Distinct()
-            .OrderBy(value => value.Value, StringComparer.Ordinal)
-            .ToList();
+        // WITH KEY = "k" selects one key; WITH KEY =~ /regex/ selects every matching key.
+        var keys = q.TagKeyRegex != null
+            ? e.ListTagKeys(db!, q.Measurement)
+                .Where(k => Regex.IsMatch(k, q.TagKeyRegex))
+                .Order(StringComparer.Ordinal)
+                .ToList()
+            : [q.TagKey ?? ""];
+        var rows = new List<List<object?>>();
+        foreach (var key in keys)
+        {
+            var values = e.ListSeries(db!, q.Measurement)
+                .Select(ParseTagsCanonical)
+                .Where(tags => PassesTagFilters(tags, q) && tags.ContainsKey(key))
+                .Select(tags => tags[key])
+                .Distinct()
+                .OrderBy(value => value, StringComparer.Ordinal);
+            rows.AddRange(values.Select(value => new List<object?> { key, value }));
+        }
         return [new()
         {
             Name = q.Measurement ?? "tagValues",
             Columns = ["key", "value"],
-            Values = tagValues.Select(x => new List<object?> { x.Key, x.Value }).ToList()
+            Values = rows
         }];
     }
 
     List<QuerySeries>? ShowSeries(TsdbEngine e, string? db, ParsedQuery q)
     {
         Req(db);
-        return [new()
+        var rows = new List<List<object?>>();
+        foreach (var meas in ResolveFilteredMeasurements(e, db!, q))
         {
-            Name = "series",
-            Columns = ["key"],
-            Values = e.ListSeries(db!, q.Measurement).Select(x => new List<object?> { FormatSeriesKey(q.Measurement, x) }).ToList()
-        }];
+            foreach (var series in e.ListSeries(db!, meas))
+            {
+                if (HasTagFilters(q) && !PassesTagFilters(ParseTagsCanonical(series), q))
+                    continue;
+                rows.Add([FormatSeriesKey(meas, series)]);
+            }
+        }
+        return [new() { Name = "series", Columns = ["key"], Values = rows }];
+    }
+
+    /// <summary>
+    /// Resolve the measurement list for SHOW SERIES / SHOW TAG KEYS: an explicit FROM wins,
+    /// otherwise apply WITH MEASUREMENT regex/exact filtering over all measurements.
+    /// </summary>
+    IReadOnlyList<string> ResolveFilteredMeasurements(TsdbEngine e, string db, ParsedQuery q)
+    {
+        if (!string.IsNullOrEmpty(q.Measurement))
+            return [q.Measurement];
+        var measurements = e.ListMeasurements(db);
+        if (string.IsNullOrEmpty(q.MeasurementFilter))
+            return measurements;
+        return q.MeasurementFilterIsRegex
+            ? measurements.Where(m => Regex.IsMatch(m, q.MeasurementFilter)).ToList()
+            : measurements.Where(m => m.Equals(q.MeasurementFilter, StringComparison.Ordinal)).ToList();
     }
 
     List<QuerySeries>? ShowSeriesCardinality(TsdbEngine e, string? db, ParsedQuery q)
@@ -2644,6 +2681,14 @@ public sealed class QueryExecutor
             case "floor":
             case "round":
             case "sqrt":
+            case "exp":
+            case "log":
+            case "log2":
+            case "ln":
+            case "sin":
+            case "cos":
+            case "tan":
+            case "atan2":
                 foreach (var value in values)
                     result[value.TimestampNs] = item.Func switch
                     {
@@ -2651,7 +2696,16 @@ public sealed class QueryExecutor
                         "ceil" => Math.Ceiling(value.Value),
                         "floor" => Math.Floor(value.Value),
                         "round" => Math.Round(value.Value, (int)item.Param),
-                        _ => Math.Sqrt(value.Value)
+                        "sqrt" => Math.Sqrt(value.Value),
+                        "exp" => Math.Exp(value.Value),
+                        "log" => Math.Log(value.Value),
+                        "log2" => Math.Log2(value.Value),
+                        "sin" => Math.Sin(value.Value),
+                        "cos" => Math.Cos(value.Value),
+                        "tan" => Math.Tan(value.Value),
+                        // Pragmatic subset: ATAN2(field, constant) treats the second argument as x.
+                        "atan2" => Math.Atan2(value.Value, item.Param),
+                        _ => Math.Log(value.Value)
                     };
                 break;
             case "moving_average":
@@ -2723,6 +2777,14 @@ public sealed class QueryExecutor
             "floor" => nums.Count == 0 ? null : Math.Floor(nums[^1]),
             "round" => nums.Count == 0 ? null : Math.Round(nums[^1]),
             "sqrt" => nums.Count == 0 ? null : Math.Sqrt(nums[^1]),
+            "exp" => nums.Count == 0 ? null : Math.Exp(nums[^1]),
+            "log" => nums.Count == 0 ? null : Math.Log(nums[^1]),
+            "log2" => nums.Count == 0 ? null : Math.Log2(nums[^1]),
+            "ln" => nums.Count == 0 ? null : Math.Log(nums[^1]),
+            "sin" => nums.Count == 0 ? null : Math.Sin(nums[^1]),
+            "cos" => nums.Count == 0 ? null : Math.Cos(nums[^1]),
+            "tan" => nums.Count == 0 ? null : Math.Tan(nums[^1]),
+            "atan2" => nums.Count == 0 ? null : Math.Atan2(nums[^1], param),
             "cumulative_sum" => nums.Count == 0 ? null : nums.Sum(),
             "moving_average" => nums.Count == 0 ? null : nums.Average(),
             "integral" => timestamps == null ? null : CalcIntegral(timestamps, nums, effectiveUnitNs),
@@ -2924,7 +2986,7 @@ public sealed class QueryExecutor
         var items = q.Select.Where(s => s.Func != "").ToList();
         if (items.Count == 0) return null;
         if (items.Any(item => item.IsCountDistinct)) return null;
-        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt"))
+        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt" or "exp" or "log" or "log2" or "ln" or "sin" or "cos" or "tan" or "atan2"))
             return null;
         if (q.FieldFilters.Count > 0) return null;
 
@@ -3040,7 +3102,7 @@ public sealed class QueryExecutor
             return null;
         if (items.Any(item => item.IsCountDistinct))
             return null;
-        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt"))
+        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt" or "exp" or "log" or "log2" or "ln" or "sin" or "cos" or "tan" or "atan2"))
             return null;
         if (q.FieldFilters.Count > 0)
             return null;

@@ -5,7 +5,9 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 using System.Buffers;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
+using MiniInflux.Net10;
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
 using MiniInflux.Net10.Query;
@@ -107,7 +109,8 @@ var engine = new TsdbEngine(
     maxQueryMemoryBytes: options.Storage.MaxQueryMemoryBytes,
     maxSegmentFileBytes: options.Storage.MaxSegmentFileBytes,
     minSegmentFileBytes: options.Storage.MinSegmentFileBytes,
-    segmentFillRatio: options.Storage.MinSegmentFillRatio);
+    segmentFillRatio: options.Storage.MinSegmentFillRatio,
+    compactionMaxWriteBytesPerSecond: options.Storage.CompactionMaxWriteBytesPerSecond);
 
 builder.Services.AddSingleton(engine);
 var writeQueue = new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize);
@@ -170,6 +173,23 @@ if (options.Http.LogEnabled)
         }
     });
 }
+
+// ponytail: opt-in gzip response compression for JSON/text endpoints. Decided by path up front so
+// streaming chunked queries are wrapped transparently; the gzip stream writes its header lazily,
+// so empty bodies stay empty. Disposal in finally flushes the gzip trailer.
+app.Use(async (context, next) =>
+{
+    var gzip = ResponseCompressionSupport.TryWrap(context.Request, context.Response);
+    try
+    {
+        await next();
+    }
+    finally
+    {
+        if (gzip != null)
+            await gzip.DisposeAsync();
+    }
+});
 
 app.Use(async (context, next) =>
 {

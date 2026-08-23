@@ -21,6 +21,10 @@ public sealed class Compactor
     private readonly int _maxPassesPerRun;
     private readonly long _maxSegmentFileBytes;
     private readonly double _segmentFillRatio;
+    // ponytail: optional I/O budget for compaction output writes (bytes/second; 0 = unlimited).
+    private readonly long _maxWriteBytesPerSecond;
+    private long _throttleWindowStartTicks;
+    private long _throttleWindowBytes;
     private readonly object _compactionLock = new();
     private long _totalRuns;
     private long _totalTasks;
@@ -33,7 +37,8 @@ public sealed class Compactor
         SchemaRegistry schema, int maxL0Segments = 10, int maxL1Segments = 4,
         long maxL0Bytes = 512 * 1024 * 1024, long maxL1Bytes = 512 * 1024 * 1024,
         int minFilesPerCompaction = 2, int maxPassesPerRun = 8, StorageHealth? health = null,
-        long maxSegmentFileBytes = 0, double segmentFillRatio = 0.5)
+        long maxSegmentFileBytes = 0, double segmentFillRatio = 0.5,
+        long maxWriteBytesPerSecond = 0)
     {
         _manifest = manifest;
         _shardManager = shardManager;
@@ -48,6 +53,7 @@ public sealed class Compactor
         _maxPassesPerRun = Math.Max(1, maxPassesPerRun);
         _maxSegmentFileBytes = maxSegmentFileBytes > 0 ? maxSegmentFileBytes : 512L * 1024 * 1024;
         _segmentFillRatio = segmentFillRatio is > 0 and <= 1 ? segmentFillRatio : 0.5;
+        _maxWriteBytesPerSecond = Math.Max(0, maxWriteBytesPerSecond);
     }
 
     public int CompactAll()
@@ -338,7 +344,14 @@ public sealed class Compactor
         long perPoint = col.Kind == FieldKind.String
             ? 8 + 24 + (col.Values.Count > 0 ? (col.Values[0].String?.Length ?? 0) * 2L : 0)
             : 8 + 8;
-        long header = 64 + col.Measurement.Length * 2L + col.TagsCanonical.Length * 2L + col.Field.Length * 2L;
+        // ponytail: the on-disk layout stores each column TWICE — once in the data section (strings,
+        // kind, min/max ts, count, codec bytes, block length prefixes, block stats) and again in the
+        // metadata footer (strings, kind, min/max, count, codec bytes, stats) — plus shared per-file
+        // magic/version/footer/CRC bytes. The old 64-byte base ignored the metadata copy and file
+        // overhead, underestimating small columns ~1.7x, which let tail-merged output exceed
+        // MaxSegmentFileBytes. 128 base + UTF-8-length strings x2 (data + metadata) tracks reality
+        // closely for tiny columns while staying negligible for payload-dominated large ones.
+        long header = 128 + (col.Measurement.Length + col.TagsCanonical.Length + col.Field.Length) * 2L;
         return points * perPoint + header;
     }
 
@@ -347,6 +360,36 @@ public sealed class Compactor
         var path = Path.Combine(shardDir, $"l{outputLevel}-{nowMs}-{Guid.NewGuid():N}.seg");
         SegmentWriter.WriteColumns(path, chunk);
         mergedPaths.Add(path);
+
+        if (_maxWriteBytesPerSecond > 0)
+            ThrottleAfterWrite(new FileInfo(path).Length);
+    }
+
+    /// <summary>
+    /// ponytail: fixed-window I/O budget. After each merged chunk write, account its size against a
+    /// one-second window; when the window budget is exhausted, sleep out the remainder so background
+    /// compaction cannot saturate disk at the expense of foreground reads/writes.
+    /// </summary>
+    private void ThrottleAfterWrite(long bytesWritten)
+    {
+        var now = Environment.TickCount64;
+        if (_throttleWindowStartTicks == 0 || now - _throttleWindowStartTicks >= 1000)
+        {
+            _throttleWindowStartTicks = now;
+            _throttleWindowBytes = 0;
+        }
+
+        _throttleWindowBytes += bytesWritten;
+        if (_throttleWindowBytes <= _maxWriteBytesPerSecond)
+            return;
+
+        var elapsed = now - _throttleWindowStartTicks;
+        if (elapsed < 1000)
+            Thread.Sleep((int)(1000 - elapsed));
+
+        // Start a fresh window after the pause.
+        _throttleWindowStartTicks = Environment.TickCount64;
+        _throttleWindowBytes = 0;
     }
 
     private bool FinalizeCompaction(string db, string rp, int shardId, List<FileCandidate> sourceFiles, List<string> mergedPaths)

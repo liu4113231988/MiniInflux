@@ -47,6 +47,9 @@ public sealed class ParsedQuery
     public bool GroupByAllTags { get; init; }
     public FillMode Fill { get; init; } = FillMode.None;
     public string? TagKey { get; init; }
+
+    /// <summary>Regex form of WITH KEY =~ /.../ for SHOW TAG VALUES; matches multiple tag keys.</summary>
+    public string? TagKeyRegex { get; init; }
     public string? MeasurementFilter { get; init; }
     public bool MeasurementFilterIsRegex { get; init; }
     public List<TagFilter> ShowTagFilters { get; init; } = [];
@@ -114,7 +117,7 @@ public static class InfluxQlParser
         if (q.StartsWith("SHOW SERIES CARDINALITY", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowSeriesCardinality, Measurement = AfterFrom(q) };
         if (q.StartsWith("SHOW SERIES", StringComparison.OrdinalIgnoreCase))
-            return new() { Kind = QueryKind.ShowSeries, Measurement = AfterFrom(q) };
+            return ParseShowSeries(q);
         if (q.StartsWith("SHOW MEASUREMENT CARDINALITY", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowMeasurementCardinality };
         if (q.StartsWith("SHOW TAG VALUES CARDINALITY", StringComparison.OrdinalIgnoreCase))
@@ -403,32 +406,12 @@ public static class InfluxQlParser
     static ParsedQuery ParseShowMeasurements(string q)
     {
         var u = q.ToUpperInvariant();
-        string? measurementFilter = null;
-        var measurementFilterIsRegex = false;
         List<TagFilter> tagFilters = [];
         List<List<TagFilter>> orGroups = [];
         var hasOr = false;
 
-        // Parse WITH MEASUREMENT =~ /regex/
-        var withIdx = u.IndexOf(" WITH MEASUREMENT ");
-        if (withIdx >= 0)
-        {
-            var rest = q[(withIdx + 18)..].Trim();
-            var restUpper = rest.ToUpperInvariant();
-            var end = new[] { restUpper.IndexOf(" WHERE "), restUpper.IndexOf(" LIMIT "), restUpper.IndexOf(" OFFSET ") }
-                .Where(index => index >= 0).DefaultIfEmpty(rest.Length).Min();
-            rest = rest[..end].Trim();
-            if (rest.Contains("=~"))
-            {
-                var parts = rest.Split("=~", 2);
-                measurementFilter = ExtractRegex(parts[1].Trim());
-                measurementFilterIsRegex = true;
-            }
-            else
-            {
-                measurementFilter = Unq(rest.Trim().Trim('\''));
-            }
-        }
+        // Parse WITH MEASUREMENT [= name | =~ /regex/]
+        var (measurementFilter, measurementFilterIsRegex) = ParseWithMeasurementClause(q, u);
 
         // Parse WHERE clause
         var whereIdx = u.IndexOf(" WHERE ");
@@ -445,10 +428,56 @@ public static class InfluxQlParser
             ShowTagFilters = tagFilters, TagFilters = tagFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
     }
 
+    static ParsedQuery ParseShowSeries(string q)
+    {
+        var m = AfterFrom(q);
+        var u = q.ToUpperInvariant();
+        var (measurementFilter, measurementFilterIsRegex) = ParseWithMeasurementClause(q, u);
+        var tagFilters = new List<TagFilter>();
+        List<List<TagFilter>> orGroups = [];
+        var hasOr = false;
+        var whereIdx = u.IndexOf(" WHERE ");
+        if (whereIdx >= 0)
+        {
+            var whereEnd = EndClause(u, whereIdx + 7);
+            var whereClause = q[(whereIdx + 7)..whereEnd];
+            long? min, max;
+            List<FieldFilter> fieldFilters = [];
+            ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr);
+        }
+        return new() { Kind = QueryKind.ShowSeries, Measurement = m,
+            MeasurementFilter = measurementFilter, MeasurementFilterIsRegex = measurementFilterIsRegex,
+            ShowTagFilters = tagFilters, TagFilters = tagFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
+    }
+
+    /// <summary>
+    /// Parse an optional "WITH MEASUREMENT [= name | =~ /regex/]" clause shared by
+    /// SHOW MEASUREMENTS / SHOW SERIES / SHOW TAG KEYS. Returns the exact name or
+    /// regex body plus whether it was a regex.
+    /// </summary>
+    static (string? Filter, bool IsRegex) ParseWithMeasurementClause(string q, string u)
+    {
+        var withIdx = u.IndexOf(" WITH MEASUREMENT ");
+        if (withIdx < 0) return (null, false);
+        var rest = q[(withIdx + 18)..].Trim();
+        var restUpper = rest.ToUpperInvariant();
+        var end = new[] { restUpper.IndexOf(" WHERE "), restUpper.IndexOf(" LIMIT "), restUpper.IndexOf(" OFFSET ") }
+            .Where(index => index >= 0).DefaultIfEmpty(rest.Length).Min();
+        rest = rest[..end].Trim();
+        // Check the regex form before stripping "=", then normalize "= name" to the bare name.
+        rest = rest.TrimStart();
+        if (rest.StartsWith("=~", StringComparison.Ordinal))
+            return (ExtractRegex(rest[2..].Trim()), true);
+        if (rest.StartsWith('='))
+            rest = rest[1..].Trim();
+        return (Unq(rest.Trim().Trim('\'')), false);
+    }
+
     static ParsedQuery ParseShowTagKeys(string q)
     {
         var m = AfterFrom(q);
         var u = q.ToUpperInvariant();
+        var (measurementFilter, measurementFilterIsRegex) = ParseWithMeasurementClause(q, u);
         var whereIdx = u.IndexOf(" WHERE ");
         var tagFilters = new List<TagFilter>();
         List<List<TagFilter>> orGroups = [];
@@ -461,15 +490,32 @@ public static class InfluxQlParser
             List<FieldFilter> fieldFilters = [];
             ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr);
         }
-        return new() { Kind = QueryKind.ShowTagKeys, Measurement = m, ShowTagFilters = tagFilters,
-            TagFilters = tagFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
+        return new() { Kind = QueryKind.ShowTagKeys, Measurement = m,
+            MeasurementFilter = measurementFilter, MeasurementFilterIsRegex = measurementFilterIsRegex,
+            ShowTagFilters = tagFilters, TagFilters = tagFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
     }
 
     static ParsedQuery ParseShowTagValues(string q)
     {
         var m = AfterFrom(q);
-        var key = AfterKey(q);
         var u = q.ToUpperInvariant();
+
+        // WITH KEY = "k" selects one key; WITH KEY =~ /regex/ selects every matching key.
+        string? key = null;
+        string? keyRegex = null;
+        var keyIdx = u.IndexOf(" KEY ");
+        if (keyIdx >= 0)
+        {
+            var part = q[(keyIdx + 5)..].Trim();
+            if (part.StartsWith("=~", StringComparison.Ordinal))
+                keyRegex = ExtractRegex(part[2..].Trim());
+            else
+            {
+                if (part.StartsWith('=')) part = part[1..].Trim();
+                key = Unq(ReadToken(part));
+            }
+        }
+
         var tagFilters = new List<TagFilter>();
         List<List<TagFilter>> orGroups = [];
         var hasOr = false;
@@ -485,8 +531,8 @@ public static class InfluxQlParser
             ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr);
         }
 
-        return new() { Kind = QueryKind.ShowTagValues, Measurement = m, TagKey = key, ShowTagFilters = tagFilters,
-            TagFilters = tagFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
+        return new() { Kind = QueryKind.ShowTagValues, Measurement = m, TagKey = key, TagKeyRegex = keyRegex,
+            ShowTagFilters = tagFilters, TagFilters = tagFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
     }
 
     static ParsedQuery ParseSelect(string q)
