@@ -268,19 +268,28 @@ app.MapPost("/write", async (HttpRequest request, WriteQueue writeQueue, Metrics
     if (request.ContentLength > options.Write.MaxRequestBodyBytes)
         return Results.StatusCode(413);
 
-    Stream input = request.Body;
-    if (request.Headers.ContentEncoding.ToString().Contains("gzip", StringComparison.OrdinalIgnoreCase))
-        input = new GZipStream(request.Body, CompressionMode.Decompress);
-
-    using var reader = new StreamReader(input, Encoding.UTF8);
-    var body = await reader.ReadToEndAsync();
-    if (string.IsNullOrWhiteSpace(body)) return Results.NoContent();
+    // Read the body as raw UTF-8 bytes and parse directly from them: no whole-payload
+    // UTF-8 → UTF-16 transcode (the request cap is 25MB, so that string alone was 50MB LOH).
+    byte[] bodyBuffer;
+    int bodyLength;
+    try
+    {
+        (bodyBuffer, bodyLength) = await ReadRequestBodyBytesAsync(request, options.Write.MaxRequestBodyBytes, request.HttpContext.RequestAborted);
+    }
+    catch (RequestBodyTooLargeException)
+    {
+        return Results.StatusCode(413);
+    }
+    var body = bodyBuffer.AsSpan(0, bodyLength);
+    if (bodyLength == 0 || body.IndexOfAnyExcept(" \t\r\n\v\f"u8) < 0)
+        return Results.NoContent();
     if (options.Http.WriteTracing)
-        runtimeLogger.LogDebug("write trace db={Db} rp={Rp} precision={Precision} body={Body}", db, rp ?? "autogen", precision ?? "ns", body);
+        runtimeLogger.LogDebug("write trace db={Db} rp={Rp} precision={Precision} body={Body}", db, rp ?? "autogen", precision ?? "ns", Encoding.UTF8.GetString(body));
 
     try
     {
         var points = LineProtocolParser.ParseMany(body, TimestampPrecision.Parse(precision));
+        if (points.Count == 0) return Results.NoContent();
         try
         {
             await writeQueue.EnqueueAsync(db, rp ?? "autogen", points, request.HttpContext.RequestAborted);
@@ -1050,6 +1059,35 @@ static bool TryParseBool(string? value) =>
     && bool.TryParse(value, out var parsed)
     && parsed;
 
+/// <summary>
+/// Read the (optionally gzip-compressed) request body into a single byte buffer, enforcing the
+/// configured size cap on the *decompressed* bytes so gzip bombs can't expand past the limit.
+/// Returns the backing buffer plus the actual length (avoids a final ToArray copy).
+/// </summary>
+static async Task<(byte[] Buffer, int Length)> ReadRequestBodyBytesAsync(HttpRequest request, long maxBytes, CancellationToken cancellationToken)
+{
+    Stream input = request.Body;
+    if (request.Headers.ContentEncoding.ToString().Contains("gzip", StringComparison.OrdinalIgnoreCase))
+        input = new GZipStream(request.Body, CompressionMode.Decompress);
+
+    var capacity = request.ContentLength is > 0 and < 4 * 1024 * 1024 ? (int)request.ContentLength.Value : 64 * 1024;
+    var ms = new MemoryStream(capacity);
+    await using (input.ConfigureAwait(false))
+    {
+        var buffer = new byte[64 * 1024];
+        int read;
+        while ((read = await input.ReadAsync(buffer, cancellationToken)) > 0)
+        {
+            if (ms.Length + read > maxBytes)
+                throw new RequestBodyTooLargeException();
+            ms.Write(buffer, 0, read);
+        }
+    }
+
+    var backing = ms.GetBuffer();
+    return backing.Length == ms.Length ? (backing, (int)ms.Length) : (ms.ToArray(), (int)ms.Length);
+}
+
 static int? ParseChunkSize(string? value) =>
     int.TryParse(value, out var parsed) && parsed > 0 ? parsed : null;
 
@@ -1099,3 +1137,5 @@ public sealed record HealthResponse(string Message, string Status, long StorageF
 {
     public string Name { get; init; } = "miniinflux";
 }
+
+public sealed class RequestBodyTooLargeException : Exception;

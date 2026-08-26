@@ -10,7 +10,7 @@ public sealed class TsdbEngine : IDisposable
     public sealed record DescendingFieldReadResult(List<long> Timestamps, List<FieldValue> Values, int SegmentColumnsRead, string? LimitPushdownStopReason);
     public sealed record DescendingFieldsReadResult(List<long> Timestamps, List<FieldValue?[]> Rows, int SegmentColumnsRead, string? LimitPushdownStopReason);
 
-    private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey);
+    private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey, long Seq);
     private sealed class PendingPoint(Point point, SeriesKey seriesKey)
     {
         public Point Point = point;
@@ -58,6 +58,14 @@ public sealed class TsdbEngine : IDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _ensuredDbRp = new(StringComparer.Ordinal);
     private long _bufferedPointCount;
     private long _bufferedByteCount;
+    // Monotonic sequence stamped on buffered points so an in-flight async flush can identify
+    // exactly its snapshot points later, even if DROP paths removed some of them meanwhile.
+    private long _bufferSeq;
+    // Per (db|rp) in-flight background flush. While present, the write path keeps appending to
+    // the buffer instead of flushing synchronously — segment encoding/CRC/fsync no longer stall
+    // writers. Points stay in the buffer (and WAL) until the flush completes, so reads keep
+    // seeing them and crash recovery is unaffected.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Task> _flushInFlight = new(StringComparer.Ordinal);
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
     private Timer? _flushTimer;
@@ -121,7 +129,7 @@ public sealed class TsdbEngine : IDisposable
             {
                 _schema.ValidateAndRegister(replayPoint.Db, replayPoint.Point.Measurement, [replayPoint.Point]);
                 var seriesKey = SeriesKey.From(replayPoint.Point);
-                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey));
+                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey, Interlocked.Increment(ref _bufferSeq)));
             }
             catch (FieldConflictException) { result.SchemaConflictsSkipped++; }
 
@@ -240,7 +248,11 @@ public sealed class TsdbEngine : IDisposable
             if (list.Count >= _threshold ||
                 (_maxBufferBytes > 0 && Interlocked.Read(ref _bufferedByteCount) >= _maxBufferBytes * 0.8))
             {
-                FlushLocked(db, rp, list);
+                // Double-buffered async flush: snapshot the buffer and let a background task do
+                // the encode/CRC/fsync work, so writers no longer stall for the whole segment
+                // write. If a flush is already draining this key we simply keep appending; the
+                // maxBufferPoints limit provides backpressure if disk can't keep up.
+                TryScheduleAsyncFlush(db, rp, key, list);
             }
         }
         finally { lk.ExitWriteLock(); }
@@ -1289,9 +1301,321 @@ public sealed class TsdbEngine : IDisposable
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, List<FieldFilter>? fieldFilters = null,
         CancellationToken cancellationToken = default)
     {
-        // ponytail: materialize for correct last-write-wins; use a recency-aware k-way merge if query memory becomes limiting.
-        foreach (var point in ReadAllPoints(db, rp, meas, min, max, requestedFields, allowedTagsCanonical, fieldFilters, cancellationToken))
-            yield return point;
+        // Streaming k-way merge across the write buffer and segment column iterators, replacing
+        // the old ReadAllPoints materialization. Peak memory is the buffer snapshot plus the
+        // decoded columns of segments overlapping the consumed time window — not the whole
+        // result set. Segment sources are seeded from metadata time bounds and only read their
+        // columns when the merge actually reaches them, so consumers that stop early (chunked
+        // responses, LIMIT) never touch later segments. Last-write-wins: sources pop in recency
+        // order (oldest segment level first, write buffer last) and fields merge in pop order.
+        var streamContext = new StreamMergeContext();
+        var heap = new PriorityQueue<PointCursor, CursorKey>(CursorKeyComparer.Instance);
+
+        var buffered = SnapshotBufferedForStream(db, rp, meas, min, max, requestedFields, allowedTagsCanonical);
+        streamContext.EstimatedBytes += buffered.Count * 128L;
+        CheckStreamMemoryBudget(streamContext.EstimatedBytes);
+        var segments = _shards.ListSegments(db, rp, min, max);
+
+        // Priority encodes recency: ListSegments yields oldest (most compacted) first; the buffer
+        // holds the newest writes and always wins.
+        for (var i = 0; i < segments.Count; i++)
+        {
+            var bound = GetSegmentStreamLowerBound(db, rp, segments[i].SegPath, meas, min, max, requestedFields, allowedTagsCanonical, fieldFilters);
+            if (bound == null) continue;
+            heap.Enqueue(
+                new SegmentPointCursor(this, db, segments[i].SegPath, meas, min, max, requestedFields, allowedTagsCanonical, streamContext, cancellationToken),
+                new CursorKey(bound.Value, "", "", i, IsSeed: true));
+        }
+        if (buffered.Count > 0)
+        {
+            var bufferCursor = new BufferPointCursor(buffered);
+            if (bufferCursor.Advance())
+                heap.Enqueue(bufferCursor, new CursorKey(bufferCursor.Ts, bufferCursor.Measurement, bufferCursor.TagsCanonical, segments.Count, IsSeed: false));
+        }
+
+        var tagCache = new Dictionary<string, KeyValuePair<string, string>[]>(StringComparer.Ordinal);
+        while (heap.Count > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            heap.TryPeek(out _, out var key);
+
+            // Seed markers carry a metadata-derived lower bound; resolve them lazily so a segment
+            // is only read when the merge reaches its time range.
+            if (key.IsSeed)
+            {
+                var seed = heap.Dequeue();
+                if (seed.Advance())
+                    heap.Enqueue(seed, new CursorKey(seed.Ts, seed.Measurement, seed.TagsCanonical, key.Priority, IsSeed: false));
+                continue;
+            }
+
+            var groupTs = key.Ts;
+            var groupMeas = key.Meas;
+            var groupTags = key.Tags;
+            var fields = new Dictionary<string, FieldValue>(StringComparer.Ordinal);
+            while (heap.TryPeek(out var cursor, out var other)
+                   && other.Ts == groupTs && other.Meas == groupMeas && other.Tags == groupTags && !other.IsSeed)
+            {
+                heap.Dequeue();
+                foreach (var kv in cursor.Fields)
+                    fields[kv.Key] = kv.Value;
+                if (cursor.Advance())
+                    heap.Enqueue(cursor, new CursorKey(cursor.Ts, cursor.Measurement, cursor.TagsCanonical, other.Priority, IsSeed: false));
+            }
+
+            yield return new Point
+            {
+                Measurement = groupMeas,
+                Tags = ParseTagsCached(groupTags, tagCache),
+                Fields = fields,
+                TimestampNs = groupTs,
+                TagsCanonical = groupTags
+            };
+        }
+    }
+
+    private sealed class StreamMergeContext
+    {
+        public long EstimatedBytes;
+    }
+
+    private readonly record struct CursorKey(long Ts, string Meas, string Tags, int Priority, bool IsSeed);
+
+    private sealed class CursorKeyComparer : IComparer<CursorKey>
+    {
+        public static readonly CursorKeyComparer Instance = new();
+
+        public int Compare(CursorKey x, CursorKey y)
+        {
+            var c = x.Ts.CompareTo(y.Ts);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(x.Meas, y.Meas);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(x.Tags, y.Tags);
+            if (c != 0) return c;
+            return x.Priority.CompareTo(y.Priority);
+        }
+    }
+
+    /// <summary>
+    /// One input of the k-way merge: yields points of a single source ordered by
+    /// (timestamp, measurement, tagsCanonical) with fields pre-merged within the source.
+    /// </summary>
+    private abstract class PointCursor
+    {
+        public string Measurement = "";
+        public string TagsCanonical = "";
+        public long Ts;
+        public readonly Dictionary<string, FieldValue> Fields = new(StringComparer.Ordinal);
+
+        public abstract bool Advance();
+    }
+
+    private sealed class BufferPointCursor(List<(Point Point, SeriesKey SeriesKey)> points) : PointCursor
+    {
+        private int _index;
+
+        public override bool Advance()
+        {
+            if (_index >= points.Count) return false;
+            var (first, seriesKey) = points[_index];
+            var ts = first.TimestampNs;
+            Fields.Clear();
+            while (_index < points.Count)
+            {
+                var (p, sk) = points[_index];
+                if (p.TimestampNs != ts || sk.Measurement != seriesKey.Measurement || sk.TagsCanonical != seriesKey.TagsCanonical)
+                    break;
+                // Append order within the buffer is recency order: later writes win.
+                foreach (var kv in p.Fields)
+                    Fields[kv.Key] = kv.Value;
+                _index++;
+            }
+            Measurement = seriesKey.Measurement;
+            TagsCanonical = seriesKey.TagsCanonical;
+            Ts = ts;
+            return true;
+        }
+    }
+
+    private sealed class SegmentPointCursor(
+        TsdbEngine engine,
+        string db,
+        string segPath,
+        string? meas,
+        long? min,
+        long? max,
+        HashSet<string>? requestedFields,
+        HashSet<string>? allowedTagsCanonical,
+        StreamMergeContext context,
+        CancellationToken cancellationToken) : PointCursor
+    {
+        private List<SegmentColumn>? _columns;
+        private (string Meas, string Tags)[]? _series;
+        private int[]? _columnSeriesOrdinals;
+        private PriorityQueue<(int Col, int Row), (long Ts, int SeriesOrd, int Col)>? _heap;
+
+        public override bool Advance()
+        {
+            if (!EnsureLoaded()) return false;
+            if (!_heap!.TryPeek(out _, out var groupKey)) return false;
+
+            var (ts, seriesOrd, _) = groupKey;
+            Fields.Clear();
+            while (_heap.TryPeek(out var entry, out var key) && key.Ts == ts && key.SeriesOrd == seriesOrd)
+            {
+                _heap.Dequeue();
+                var column = _columns![entry.Col];
+                Fields[column.Field] = column.Values[entry.Row];
+                PushNext(entry.Col, entry.Row + 1);
+            }
+
+            var series = _series![seriesOrd];
+            Measurement = series.Meas;
+            TagsCanonical = series.Tags;
+            Ts = ts;
+            return true;
+        }
+
+        private bool EnsureLoaded()
+        {
+            if (_columns != null) return _columns.Count > 0;
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                _columns = engine.ReadSegmentColumns(db, segPath, requestedFields, meas, min, max, allowedTagsCanonical);
+            }
+            catch (InvalidDataException) { _columns = []; return false; }
+            catch (FileNotFoundException) { _columns = []; return false; }
+
+            long points = 0;
+            foreach (var column in _columns) points += column.Timestamps.Count;
+            context.EstimatedBytes += points * 24;
+            engine.CheckStreamMemoryBudget(context.EstimatedBytes);
+
+            var seriesSet = new SortedSet<(string Meas, string Tags)>(SeriesOrdinalComparer.Instance);
+            foreach (var column in _columns)
+                seriesSet.Add((column.Measurement, column.TagsCanonical));
+            _series = [.. seriesSet];
+            var ordinals = new Dictionary<(string, string), int>();
+            for (var i = 0; i < _series.Length; i++)
+                ordinals[_series[i]] = i;
+
+            _columnSeriesOrdinals = new int[_columns.Count];
+            _heap = new PriorityQueue<(int, int), (long, int, int)>();
+            for (var i = 0; i < _columns.Count; i++)
+            {
+                var column = _columns[i];
+                _columnSeriesOrdinals[i] = ordinals[(column.Measurement, column.TagsCanonical)];
+                PushNext(i, 0);
+            }
+            return true;
+        }
+
+        private void PushNext(int colIndex, int row)
+        {
+            var column = _columns![colIndex];
+            var timestamps = column.Timestamps;
+            while (row < timestamps.Count)
+            {
+                var ts = timestamps[row];
+                if (min.HasValue && ts < min.Value) { row++; continue; }
+                if (max.HasValue && ts > max.Value) return; // ascending: the rest are out of range
+                _heap!.Enqueue((colIndex, row), (ts, _columnSeriesOrdinals![colIndex], colIndex));
+                return;
+            }
+        }
+    }
+
+    private sealed class SeriesOrdinalComparer : IComparer<(string Meas, string Tags)>
+    {
+        public static readonly SeriesOrdinalComparer Instance = new();
+
+        public int Compare((string Meas, string Tags) x, (string Meas, string Tags) y)
+        {
+            var c = string.CompareOrdinal(x.Meas, y.Meas);
+            return c != 0 ? c : string.CompareOrdinal(x.Tags, y.Tags);
+        }
+    }
+
+    private void CheckStreamMemoryBudget(long estimatedBytes)
+    {
+        if (_maxQueryMemoryBytes > 0 && estimatedBytes > _maxQueryMemoryBytes)
+            throw new InvalidOperationException(
+                $"query memory limit exceeded: {estimatedBytes} > {_maxQueryMemoryBytes} (reduce the time range, add a LIMIT, or raise Storage:MaxQueryMemoryBytes)");
+    }
+
+    private List<(Point Point, SeriesKey SeriesKey)> SnapshotBufferedForStream(string db, string rp,
+        string? meas, long? min, long? max, HashSet<string>? requestedFields, HashSet<string>? allowedTagsCanonical)
+    {
+        var buffered = new List<(Point Point, SeriesKey SeriesKey)>();
+        var key = K(db, rp);
+        var lk = GetLock(key);
+        lk.EnterReadLock();
+        try
+        {
+            if (_buf.TryGetValue(key, out var list))
+            {
+                foreach (var bp in BufferedCandidates(key, list, meas, allowedTagsCanonical))
+                {
+                    if (!Match(bp.Point, meas, min, max)) continue;
+                    var point = requestedFields == null
+                        ? bp.Point
+                        : new Point
+                        {
+                            Measurement = bp.Point.Measurement,
+                            Tags = bp.Point.Tags,
+                            Fields = SelectFields(bp.Point.Fields, requestedFields),
+                            TimestampNs = bp.Point.TimestampNs,
+                            TagsCanonical = bp.Point.TagsCanonical
+                        };
+                    buffered.Add((point, bp.SeriesKey));
+                }
+            }
+        }
+        finally { lk.ExitReadLock(); }
+
+        buffered.Sort(static (a, b) =>
+        {
+            var c = a.Point.TimestampNs.CompareTo(b.Point.TimestampNs);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(a.SeriesKey.Measurement, b.SeriesKey.Measurement);
+            return c != 0 ? c : string.CompareOrdinal(a.SeriesKey.TagsCanonical, b.SeriesKey.TagsCanonical);
+        });
+        return buffered;
+    }
+
+    /// <summary>
+    /// Lower bound on the first point a segment can contribute to the stream, or null when the
+    /// segment is irrelevant. Used to seed the merge heap without reading the segment's columns.
+    /// </summary>
+    private long? GetSegmentStreamLowerBound(string db, string rp, string segPath,
+        string? meas, long? min, long? max, HashSet<string>? requestedFields,
+        HashSet<string>? allowedTagsCanonical, List<FieldFilter>? fieldFilters)
+    {
+        IReadOnlyList<SegmentColumnMeta> metas;
+        try { metas = ReadSegmentMetadataCached(segPath, db, rp).Metas; }
+        catch (InvalidDataException) { return null; }
+        catch (FileNotFoundException) { return null; }
+
+        var any = false;
+        var bound = long.MaxValue;
+        foreach (var m in metas)
+        {
+            if (meas != null && m.Measurement != meas) continue;
+            if (allowedTagsCanonical != null && !allowedTagsCanonical.Contains(m.TagsCanonical)) continue;
+            if (requestedFields != null && !requestedFields.Contains(m.Field)) continue;
+            if (min.HasValue && m.MaxTime < min.Value) continue;
+            if (max.HasValue && m.MinTime > max.Value) continue;
+            any = true;
+            var b = min.HasValue ? Math.Max(m.MinTime, min.Value) : m.MinTime;
+            if (b < bound) bound = b;
+        }
+        if (!any) return null;
+        if (fieldFilters != null && fieldFilters.Count > 0
+            && !CouldSegmentMatchFieldFilters(metas, meas, allowedTagsCanonical, fieldFilters))
+            return null;
+        return bound;
     }
 
     public IReadOnlyList<string> ListMeasurements(string db)
@@ -2077,7 +2401,30 @@ return Interlocked.Read(ref _bufferedByteCount);
 
         var flushCount = l.Count;
         long flushBytes = 0;
-        
+        if (_maxBufferBytes > 0)
+            foreach (var buffered in l)
+                flushBytes += EstimateBufferedPointBytes(buffered.Point);
+
+        FlushPointsToSegments(db, rp, l);
+
+        _bufferedPointCount -= flushCount;
+        if (_maxBufferBytes > 0)
+            _bufferedByteCount -= flushBytes;
+        l.Clear();
+        var key = K(db, rp);
+        _lastBufferWriteTicks.TryRemove(key, out _);
+        _bufBySeries.TryRemove(key, out _);
+        UpdateBufferReplayFloor(key, l);
+        if (updateCheckpoint)
+            UpdateWalCheckpoint();
+    }
+
+    /// <summary>
+    /// Group points by shard (with a cached shard-range lookup) and write the segment files.
+    /// Shared by the synchronous FlushLocked path and the background async flush.
+    /// </summary>
+    private void FlushPointsToSegments(string db, string rp, IReadOnlyList<BufferedPoint> pointsToFlush)
+    {
         // 优化的shard分组，使用预分配列表减少内存分配
         // Cursor cache: nearly all points in a flush fall into the same (current) shard, so
         // resolve the shard once and only re-query the manifest when a point falls outside the
@@ -2085,10 +2432,8 @@ return Interlocked.Read(ref _bufferedByteCount);
         // list clone + Directory.CreateDirectory syscall.
         var byShard = new Dictionary<int, List<(Point Point, SeriesKey SeriesKey)>>();
         var shardRanges = new Dictionary<int, (long Start, long End)>();
-        foreach (var buffered in l)
+        foreach (var buffered in pointsToFlush)
         {
-            if (_maxBufferBytes > 0)
-                flushBytes += EstimateBufferedPointBytes(buffered.Point);
             var timestampNs = buffered.Point.TimestampNs;
             var shardId = -1;
             foreach (var (id, range) in shardRanges)
@@ -2104,7 +2449,7 @@ return Interlocked.Read(ref _bufferedByteCount);
             if (!byShard.TryGetValue(shardId, out var points))
             {
                 // 预分配足够大的容量减少列表扩容
-                points = new List<(Point, SeriesKey)>(Math.Max(1000, l.Count / 10));
+                points = new List<(Point, SeriesKey)>(Math.Max(1000, pointsToFlush.Count / 10));
                 byShard[shardId] = points;
             }
             points.Add((buffered.Point, buffered.SeriesKey));
@@ -2128,17 +2473,115 @@ return Interlocked.Read(ref _bufferedByteCount);
             foreach (var (shardId, points) in byShard)
                 WriteShardSegments(db, rp, shardId, points);
         }
-        
-        _bufferedPointCount -= flushCount;
-        if (_maxBufferBytes > 0)
-            _bufferedByteCount -= flushBytes;
-        l.Clear();
-        var key = K(db, rp);
-        _lastBufferWriteTicks.TryRemove(key, out _);
-        _bufBySeries.TryRemove(key, out _);
-        UpdateBufferReplayFloor(key, l);
-        if (updateCheckpoint)
+    }
+
+    /// <summary>
+    /// Schedule a background flush of the current buffer contents. Caller must hold the per-key
+    /// write lock. The buffer itself is left in place: points remain visible to reads and the WAL
+    /// replay floor keeps covering them until the flush completes and removes them by sequence.
+    /// </summary>
+    private void TryScheduleAsyncFlush(string db, string rp, string key, List<BufferedPoint> list)
+    {
+        if (list.Count == 0 || _flushInFlight.ContainsKey(key)) return;
+
+        // Same MinSegmentFileBytes deferral as FlushLocked: don't spawn background work for a
+        // tiny buffer; the points merge into a larger segment as more data accumulates.
+        if (_minSegmentFileBytes > 0 && list.Count < _maxBufferPoints)
+        {
+            long est = 0;
+            foreach (var buffered in list) est += EstimateBufferedPointBytes(buffered.Point);
+            if (est < _minSegmentFileBytes) return;
+        }
+
+        // Small flushes complete in microseconds: doing them inline keeps write-after-flush
+        // visibility semantics (callers can rely on the data being in segments once the write
+        // returns) and avoids task scheduling overhead. Only sizable flushes — the ones that
+        // produce write stalls — go to the background.
+        if (list.Count < AsyncFlushMinPoints)
+        {
+            FlushLocked(db, rp, list);
+            return;
+        }
+
+        var snapshot = list.ToArray();
+        var maxSeq = snapshot[^1].Seq; // seq is assigned in append order, so the last one is max
+        _flushInFlight[key] = Task.Run(() => FlushSnapshotAsync(db, rp, key, snapshot, maxSeq));
+    }
+
+    private const int AsyncFlushMinPoints = 4096;
+
+    private void FlushSnapshotAsync(string db, string rp, string key, BufferedPoint[] snapshot, long maxSeq)
+    {
+        try
+        {
+            FlushPointsToSegments(db, rp, snapshot);
+
+            var lk = GetLock(key);
+            lk.EnterWriteLock();
+            try
+            {
+                if (_buf.TryGetValue(key, out var list))
+                {
+                    // Remove exactly the snapshot points by sequence. DROP SERIES/MEASUREMENT may
+                    // have already removed some of them from the middle of the list while the
+                    // flush was in flight, so an index/prefix removal would be wrong.
+                    var trackBytes = _maxBufferBytes > 0;
+                    long removedBytes = 0;
+                    var write = 0;
+                    for (var i = 0; i < list.Count; i++)
+                    {
+                        var bp = list[i];
+                        if (bp.Seq <= maxSeq)
+                        {
+                            if (trackBytes) removedBytes += EstimateBufferedPointBytes(bp.Point);
+                            continue;
+                        }
+                        list[write++] = bp;
+                    }
+                    var removed = list.Count - write;
+                    list.RemoveRange(write, removed);
+                    _bufferedPointCount -= removed;
+                    if (trackBytes) _bufferedByteCount -= removedBytes;
+
+                    if (list.Count == 0)
+                    {
+                        _lastBufferWriteTicks.TryRemove(key, out _);
+                        _bufBySeries.TryRemove(key, out _);
+                    }
+                    else
+                    {
+                        RebuildBufferSeriesIndex(key, list);
+                    }
+                    UpdateBufferReplayFloor(key, list, forceRecalculate: true);
+                }
+            }
+            finally { lk.ExitWriteLock(); }
             UpdateWalCheckpoint();
+        }
+        catch (Exception ex)
+        {
+            // The snapshot points are still in the buffer and the WAL, so nothing is lost: the
+            // next write re-triggers a flush. Don't block writes on a transient flush failure.
+            _health.RecordFailure("async_flush", ex, blocksWrites: false);
+        }
+        finally
+        {
+            _flushInFlight.TryRemove(key, out _);
+        }
+    }
+
+    /// <summary>
+    /// Wait for in-flight background flushes. When <paramref name="db"/> is given, only waits for
+    /// flushes of that database's keys. Callers must NOT hold any per-key lock while waiting.
+    /// </summary>
+    private void WaitForPendingFlushes(string? db = null)
+    {
+        foreach (var (key, task) in _flushInFlight.ToArray())
+        {
+            if (db != null && !key.StartsWith(db + "|", StringComparison.Ordinal)) continue;
+            try { task.Wait(); }
+            catch { /* failure already recorded by FlushSnapshotAsync */ }
+        }
     }
 
     // ponytail: write one shard's pending points to .seg file(s), honoring the configured max segment
@@ -2215,6 +2658,7 @@ return Interlocked.Read(ref _bufferedByteCount);
 
     private void FlushDatabase(string db)
     {
+        WaitForPendingFlushes(db);
         var prefix = db + "|";
         foreach (var kv in _buf.Where(kv => kv.Key.StartsWith(prefix)).ToList())
         {
@@ -2229,6 +2673,7 @@ return Interlocked.Read(ref _bufferedByteCount);
 
     public void FlushAll()
     {
+        WaitForPendingFlushes();
         foreach (var kv in _buf.ToArray())
         {
             var p = kv.Key.Split('|');
@@ -2392,7 +2837,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         for (var i = 0; i < points.Count; i++)
         {
             var pending = points[i];
-            var buffered = new BufferedPoint(pending.Point, positions[i], pending.SeriesKey);
+            var buffered = new BufferedPoint(pending.Point, positions[i], pending.SeriesKey, Interlocked.Increment(ref _bufferSeq));
             list.Add(buffered);
             if (!bySeries.TryGetValue(pending.SeriesKey, out var seriesPoints))
             {
@@ -2539,6 +2984,9 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
                 try
                 {
                     if (kv.Value.Count == 0) continue;
+                    // A background flush is already draining this buffer; re-flushing now would
+                    // write the same points twice.
+                    if (_flushInFlight.ContainsKey(kv.Key)) continue;
                     if (kv.Value.Count < _threshold
                         && (_flushColdTicks <= 0 || !_lastBufferWriteTicks.TryGetValue(kv.Key, out var lastWrite) || lastWrite > coldBefore))
                         continue;
