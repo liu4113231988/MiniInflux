@@ -15,10 +15,10 @@ public static class SegmentWriter
     /// Write segment atomically: write to .tmp, fsync, rename to .seg.
     /// Format v4: [magic:4][version:1][columnCount:4][columns...][metadata...][metadataOffset:8][metadataLength:4][metadataFooterMagic:4][crc32:4]
     /// </summary>
-    public static void WriteSegment(string path, IEnumerable<Point> points)
+    public static List<SegmentColumnMeta> WriteSegment(string path, IEnumerable<Point> points)
         => WriteSegment(path, points.Select(point => (point, SeriesKey.From(point))));
 
-    public static void WriteSegment(string path, IEnumerable<(Point Point, SeriesKey SeriesKey)> points)
+    public static List<SegmentColumnMeta> WriteSegment(string path, IEnumerable<(Point Point, SeriesKey SeriesKey)> points)
         => WriteColumns(path, BuildColumns(points));
 
     internal static List<SegmentColumn> BuildColumns(IEnumerable<(Point Point, SeriesKey SeriesKey)> points)
@@ -91,11 +91,16 @@ public static class SegmentWriter
         }
     }
 
-    public static void WriteColumns(string path, IReadOnlyList<SegmentColumn> columns)
+    /// <summary>
+    /// Write the columns and return the column metadata that was just persisted. Callers can
+    /// register it directly instead of re-opening the file to parse the footer back.
+    /// </summary>
+    public static List<SegmentColumnMeta> WriteColumns(string path, IReadOnlyList<SegmentColumn> columns)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var tmpPath = path + ".tmp";
 
+        var metas = new List<SegmentColumnMeta>(columns.Count);
         using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.Read))
         using (var ms = new MemoryStream())
         {
@@ -104,7 +109,6 @@ public static class SegmentWriter
                 bw.Write(Magic);
                 bw.Write(FormatVersion);
                 bw.Write(columns.Count);
-                var metas = new List<SegmentColumnMeta>(columns.Count);
                 foreach (var column in columns)
                 {
                     var kind = column.Kind;
@@ -142,9 +146,12 @@ public static class SegmentWriter
                 bw.Write(metadataLength);
                 bw.Write(MetadataFooterMagic);
             }
-            var data = ms.ToArray();
-            fs.Write(data);
-            var crc = Crc32.Compute(data);
+            // Write the MemoryStream's backing buffer directly: ToArray() would copy the whole
+            // segment a second time (a large LOH allocation for big flushes).
+            var buffer = ms.GetBuffer();
+            var length = checked((int)ms.Length);
+            fs.Write(buffer, 0, length);
+            var crc = Crc32.Compute(buffer.AsSpan(0, length));
             var crcBytes = new byte[4];
             BitConverter.TryWriteBytes(crcBytes, crc);
             fs.Write(crcBytes);
@@ -152,6 +159,7 @@ public static class SegmentWriter
         }
         if (File.Exists(path)) File.Delete(path);
         File.Move(tmpPath, path);
+        return metas;
     }
 
     private static (double Min, double Max, double Sum, int Count) ComputeStats(FieldKind kind, IReadOnlyList<FieldValue> vals)

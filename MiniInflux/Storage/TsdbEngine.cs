@@ -53,6 +53,9 @@ public sealed class TsdbEngine : IDisposable
     private readonly long _maxBufferPoints;
     private readonly long _maxBufferBytes;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, HashSet<SeriesKey>> _seriesKeys = new(StringComparer.Ordinal);
+    // Databases/rps whose manifest entries and directories were already ensured this session.
+    // Skips the per-write-batch manifest lock + Directory.CreateDirectory syscall.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _ensuredDbRp = new(StringComparer.Ordinal);
     private long _bufferedPointCount;
     private long _bufferedByteCount;
     private Timer? _rpExpiryTimer;
@@ -194,7 +197,14 @@ public sealed class TsdbEngine : IDisposable
     {
         if (!_health.WriteAvailable)
             throw new IOException("write path is unavailable after a WAL persistence failure");
-        CreateDatabase(db); _manifest.EnsureRp(db, rp);
+        // EnsureDatabase/EnsureRp/CreateDirectory are idempotent; do them once per (db,rp) per
+        // session instead of on every write batch.
+        if (_ensuredDbRp.TryAdd(K(db, rp), 0))
+        {
+            CreateDatabase(db);
+            _manifest.EnsureRp(db, rp);
+            Directory.CreateDirectory(Path.Combine(_root, "db", db, rp));
+        }
         
         // 提前过滤掉重复点，减少不必要的处理
         var pending = DeduplicateWritePoints(pts);
@@ -342,6 +352,12 @@ public sealed class TsdbEngine : IDisposable
         Directory.CreateDirectory(Path.Combine(_root, "db", db, rpName));
     }
 
+    /// <summary>
+    /// Forget the cached "database/rp ensured" marker, e.g. after DROP RETENTION POLICY, so the
+    /// next write re-creates the manifest entry and directory.
+    /// </summary>
+    public void InvalidateEnsuredDbRp(string db, string rp) => _ensuredDbRp.TryRemove(K(db, rp), out _);
+
     public IReadOnlyList<string> ListDatabases() => _manifest.ListDatabases();
 
     public string GetDefaultRpName(string db) => _manifest.GetDefaultRp(db).Name;
@@ -376,8 +392,9 @@ public sealed class TsdbEngine : IDisposable
             return id;
         }
 
-        // The points handed to us are the engine's live buffer/segment objects. Never store them
-        // directly, because merging writes into Fields would mutate the write buffer itself.
+        // The points handed to us may be the engine's live buffer objects. We store them directly
+        // (zero-copy) and only clone lazily when a merge would actually mutate Fields, which is
+        // rare for well-formed data; the final result is read-only downstream.
         static Point Clone(Point p) => new()
         {
             Measurement = p.Measurement,
@@ -421,18 +438,40 @@ public sealed class TsdbEngine : IDisposable
                     $"query memory limit exceeded: {estimatedBytes} > {maxMemoryBytes} (reduce the time range, add a LIMIT, or raise Storage:MaxQueryMemoryBytes)");
         }
 
-        void Merge(Point p)
+        // Tracks map entries that still reference the original point so a merge can
+        // clone-on-write before touching Fields.
+        var uncloned = new HashSet<Point>(ReferenceEqualityComparer.Instance);
+        // storeClone: segment points come from Rebuild with freshly allocated Fields dictionaries,
+        // so they can be stored zero-copy; buffered points are live engine objects and must always
+        // be copied, otherwise caller-side mutation of a returned point would corrupt the buffer.
+        void Merge(Point p, bool storeClone)
         {
             var key = (p.Measurement, IdentityOf(p), p.TimestampNs);
             if (map.TryGetValue(key, out var existing))
             {
+                if (uncloned.Remove(existing))
+                {
+                    existing = Clone(existing);
+                    map[key] = existing;
+                }
                 // Last writer wins, matching InfluxDB field-merge semantics.
                 foreach (var kv in p.Fields) existing.Fields[kv.Key] = kv.Value;
             }
             else
             {
-                map[key] = Clone(p);
-                estimatedBytes += EstimatePointBytes(p);
+                if (storeClone)
+                {
+                    map[key] = Clone(p);
+                }
+                else
+                {
+                    map[key] = p;
+                    uncloned.Add(p);
+                }
+                // Sampled size accounting: estimating every point walks all its tags/fields and
+                // dominated merge time on wide rows; every 32nd insert charges 32x instead.
+                if ((map.Count & 31) == 1)
+                    estimatedBytes += EstimatePointBytes(p) * 32;
                 CheckMemory();
             }
         }
@@ -457,7 +496,7 @@ public sealed class TsdbEngine : IDisposable
             foreach (var p in batch)
             {
                 if (limit.HasValue && map.Count >= limit.Value) break;
-                Merge(p);
+                Merge(p, storeClone: false);
             }
         }
 
@@ -467,7 +506,7 @@ public sealed class TsdbEngine : IDisposable
             // once the limit is reached; only *new* keys are gated by the limit.
             if (limit.HasValue && map.Count >= limit.Value
                 && !map.ContainsKey((p.Measurement, IdentityOf(p), p.TimestampNs))) continue;
-            Merge(p);
+            Merge(p, storeClone: true);
         }
 
         // Points are already mostly time-ordered within each segment; a single stable sort is the
@@ -596,7 +635,11 @@ public sealed class TsdbEngine : IDisposable
                     if (fieldFilters != null && fieldFilters.Count > 0 && !CouldSegmentMatchFieldFilters(metas, meas, allowedTagsCanonical, fieldFilters))
                         return;
                 }
-                catch { /* fall through to full read */ }
+                catch (Exception ex) when (ex is InvalidDataException or IOException)
+                {
+                    // Metadata unreadable (corrupt/mid-compaction file): fall through to the full
+                    // read, which has its own error handling.
+                }
             }
 
             // ponytail: Rebuild is lazy. Drain it but stop at `budget` matching points so a giant
@@ -672,7 +715,18 @@ public sealed class TsdbEngine : IDisposable
                 }
                 else
                 {
-                    result[point.TimestampNs] = point;
+                    // Store a copy: segment columns are merged into Fields downstream (outside
+                    // this read lock), so a live buffer point must never escape into the result.
+                    result[point.TimestampNs] = requestedFields != null
+                        ? point // already a fresh projection
+                        : new Point
+                        {
+                            Measurement = point.Measurement,
+                            Tags = point.Tags,
+                            Fields = new Dictionary<string, FieldValue>(point.Fields, StringComparer.Ordinal),
+                            TimestampNs = point.TimestampNs,
+                            TagsCanonical = point.TagsCanonical
+                        };
                 }
 
                 if (limit.HasValue && result.Count >= limit.Value)
@@ -1163,11 +1217,16 @@ public sealed class TsdbEngine : IDisposable
         {
             var p = buffered.Point;
             if (!Match(p, measurement, min, max)) continue;
-            var point = requestedFields == null ? p : new Point
+            // Always copy Fields: callers merge segment values into the returned point's Fields
+            // outside the read lock, so handing out the live buffer point would corrupt the write
+            // buffer. (Previously only the requestedFields projection copied.)
+            var point = new Point
             {
                 Measurement = p.Measurement,
                 Tags = p.Tags,
-                Fields = SelectFields(p.Fields, requestedFields),
+                Fields = requestedFields == null
+                    ? new Dictionary<string, FieldValue>(p.Fields, StringComparer.Ordinal)
+                    : SelectFields(p.Fields, requestedFields),
                 TimestampNs = p.TimestampNs,
                 TagsCanonical = p.TagsCanonical
             };
@@ -1538,6 +1597,8 @@ return Interlocked.Read(ref _bufferedByteCount);
         if (Directory.Exists(dbDir)) try { Directory.Delete(dbDir, true); } catch { }
         InvalidateSegmentMetadataIndex();
         _manifest.DropDatabase(db); _manifest.SaveIfDirty(); _tombstones.DropDatabase(db);
+        foreach (var ensured in _ensuredDbRp.Keys.Where(k => k.StartsWith(db + "|", StringComparison.Ordinal)).ToList())
+            _ensuredDbRp.TryRemove(ensured, out _);
         _globalLock.EnterWriteLock();
         try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); _locks.TryRemove(k, out var lk); lk?.Dispose(); _bufferReplayFloors.TryRemove(k, out _); _lastBufferWriteTicks.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
         finally { _globalLock.ExitWriteLock(); }
@@ -1884,9 +1945,18 @@ return Interlocked.Read(ref _bufferedByteCount);
     internal void RegisterSegmentMetadata(string db, string rp, string path)
     {
         var read = SegmentReader.ReadMetadataWithInfo(path);
+        RegisterSegmentMetadata(db, rp, path, read.Metadata, read.UsedFooter);
+    }
+
+    /// <summary>
+    /// Register metadata that the writer just produced in memory, avoiding re-opening the freshly
+    /// written segment to parse its footer back from disk.
+    /// </summary>
+    internal void RegisterSegmentMetadata(string db, string rp, string path, List<SegmentColumnMeta> metas, bool usedFooter = true)
+    {
         var info = new FileInfo(path);
-        _segmentMetadataCache[path] = (info.Length, info.LastWriteTimeUtc, read.Metadata, read.UsedFooter);
-        IndexSegmentMetadata(db, rp, path, read.Metadata, read.UsedFooter);
+        _segmentMetadataCache[path] = (info.Length, info.LastWriteTimeUtc, metas, usedFooter);
+        IndexSegmentMetadata(db, rp, path, metas, usedFooter);
     }
 
     /// <pre>
@@ -2009,12 +2079,28 @@ return Interlocked.Read(ref _bufferedByteCount);
         long flushBytes = 0;
         
         // 优化的shard分组，使用预分配列表减少内存分配
+        // Cursor cache: nearly all points in a flush fall into the same (current) shard, so
+        // resolve the shard once and only re-query the manifest when a point falls outside the
+        // cached shard's time range. Previously every point triggered a manifest lock + shard
+        // list clone + Directory.CreateDirectory syscall.
         var byShard = new Dictionary<int, List<(Point Point, SeriesKey SeriesKey)>>();
+        var shardRanges = new Dictionary<int, (long Start, long End)>();
         foreach (var buffered in l)
         {
             if (_maxBufferBytes > 0)
                 flushBytes += EstimateBufferedPointBytes(buffered.Point);
-            var (shardId, _) = _shards.GetOrCreateShard(db, rp, buffered.Point.TimestampNs);
+            var timestampNs = buffered.Point.TimestampNs;
+            var shardId = -1;
+            foreach (var (id, range) in shardRanges)
+            {
+                if (timestampNs >= range.Start && timestampNs < range.End) { shardId = id; break; }
+            }
+            if (shardId < 0)
+            {
+                long start, end;
+                (shardId, _, start, end) = _shards.GetOrCreateShardWithRange(db, rp, timestampNs);
+                shardRanges[shardId] = (start, end);
+            }
             if (!byShard.TryGetValue(shardId, out var points))
             {
                 // 预分配足够大的容量减少列表扩容
@@ -2070,9 +2156,9 @@ return Interlocked.Read(ref _bufferedByteCount);
         if (_maxSegmentFileBytes <= 0 || points.Count == 1)
         {
             var segPath = Path.Combine(shardDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{Guid.NewGuid():N}.seg");
-            SegmentWriter.WriteSegment(segPath, points);
+            var metas = SegmentWriter.WriteSegment(segPath, points);
             _shards.RegisterSegment(db, rp, shardId, segPath);
-            RegisterSegmentMetadata(db, rp, segPath);
+            RegisterSegmentMetadata(db, rp, segPath, metas);
             return;
         }
 
@@ -2122,9 +2208,9 @@ return Interlocked.Read(ref _bufferedByteCount);
     private void FlushChunk(string shardDir, string db, string rp, int shardId, List<(Point, SeriesKey)> chunk, long nowMs)
     {
         var segPath = Path.Combine(shardDir, $"{nowMs}-{Guid.NewGuid():N}.seg");
-        SegmentWriter.WriteSegment(segPath, chunk);
+        var metas = SegmentWriter.WriteSegment(segPath, chunk);
         _shards.RegisterSegment(db, rp, shardId, segPath);
-        RegisterSegmentMetadata(db, rp, segPath);
+        RegisterSegmentMetadata(db, rp, segPath, metas);
     }
 
     private void FlushDatabase(string db)
@@ -2300,6 +2386,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         }
 
         list.EnsureCapacity(list.Count + points.Count);
+        if (!_seriesKeys.TryGetValue(db, out var keys)) { keys = []; _seriesKeys[db] = keys; }
         var seenSeries = new HashSet<SeriesKey>();
         var indexPoints = new List<(string Measurement, string TagsCanonical, Dictionary<string, string> Tags)>();
         for (var i = 0; i < points.Count; i++)
@@ -2314,15 +2401,14 @@ return Interlocked.Read(ref _bufferedByteCount);
             }
             seriesPoints.Add(buffered);
 
-            if (seenSeries.Add(pending.SeriesKey))
+            // Only feed genuinely new series into the manifest indexes; re-indexing every series
+            // of every batch costs a global manifest lock + O(series x tags) work per batch.
+            if (seenSeries.Add(pending.SeriesKey) && keys.Add(pending.SeriesKey))
                 indexPoints.Add((pending.Point.Measurement, pending.SeriesKey.TagsCanonical, pending.Point.Tags));
         }
 
-        if (!_seriesKeys.TryGetValue(db, out var keys)) { keys = []; _seriesKeys[db] = keys; }
-        foreach (var series in seenSeries)
-            keys.Add(series);
-
-        _manifest.UpdateIndexes(db, indexPoints);
+        if (indexPoints.Count > 0)
+            _manifest.UpdateIndexes(db, indexPoints);
 
         _bufferedPointCount += points.Count;
         if (_maxBufferBytes > 0)

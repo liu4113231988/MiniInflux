@@ -105,17 +105,17 @@ public sealed class WalManager : IDisposable
         if (pointList.Count == 0) return [];
 
         var positions = new List<WalPosition>(pointList.Count);
+        // Format the record *outside* the lock into a pool-backed IBufferWriter: serialization is
+        // the bulk of the work and needs no mutual exclusion, so the global WAL lock now only
+        // covers the actual file write (and CRC), shrinking the critical section substantially.
+        using var writer = new PooledBufferWriter(EstimatePayloadSize(db, rp, pointList));
+        WriteRecordPayload(writer, db, rp, pointList);
+        var payloadSpan = writer.WrittenSpan;
         lock (_lock)
         {
             try
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
-                // ponytail: format the record directly into a pool-backed IBufferWriter. The old path
-                // built an ArrayBufferWriter and then copied the whole payload into a second rented
-                // array — one full-payload memcpy per write batch for nothing.
-                using var writer = new PooledBufferWriter(EstimatePayloadSize(db, rp, pointList));
-                WriteRecordPayload(writer, db, rp, pointList);
-                var payloadSpan = writer.WrittenSpan;
 
                 // 如果当前写入量较小且距离上次写入时间很短，可以考虑批量合并
                 var shouldBatch = !_fsync && payloadSpan.Length < _batchSize &&
@@ -256,8 +256,17 @@ public sealed class WalManager : IDisposable
             AppendFieldValueUtf8(writer, field.Value);
         }
         WriteUtf8(writer, " ");
-        WriteUtf8(writer, p.TimestampNs.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        WriteInt64(writer, p.TimestampNs);
         WriteUtf8(writer, "\n");
+    }
+
+    private static void WriteInt64(IBufferWriter<byte> writer, long value)
+    {
+        // Utf8Formatter writes the invariant decimal representation straight into the payload
+        // span — no intermediate string allocation per point.
+        var span = writer.GetSpan(20);
+        System.Buffers.Text.Utf8Formatter.TryFormat(value, span, out var written);
+        writer.Advance(written);
     }
 
     private static void AppendFieldValueUtf8(IBufferWriter<byte> writer, FieldValue v)
@@ -265,12 +274,18 @@ public sealed class WalManager : IDisposable
         switch (v.Kind)
         {
             case FieldKind.Integer:
-                WriteUtf8(writer, v.Integer.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                WriteInt64(writer, v.Integer);
                 WriteUtf8(writer, "i");
                 break;
             case FieldKind.Float:
-                WriteUtf8(writer, v.Float.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            {
+                // 'G' for double is shortest-round-trippable on .NET (same text ToString()
+                // produces), so WAL replay parses back the identical value.
+                var span = writer.GetSpan(32);
+                System.Buffers.Text.Utf8Formatter.TryFormat(v.Float, span, out var written);
+                writer.Advance(written);
                 break;
+            }
             case FieldKind.Boolean:
                 WriteUtf8(writer, v.Boolean ? "true" : "false");
                 break;

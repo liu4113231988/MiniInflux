@@ -375,14 +375,14 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
 
 // Read-only query console for the admin UI. Only SELECT / SHOW statements are
 // permitted; mutation statements (DELETE/DROP/CREATE/...) are rejected before execution.
-app.MapPost("/admin/api/query", (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics, string? db, string? q) =>
+app.MapPost("/admin/api/query", async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics, string? db, string? q) =>
 {
     if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
 
     if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
     {
-        var form = request.ReadFormAsync().Result;
+        var form = await request.ReadFormAsync();
         q = form["q"];
         db ??= form["db"];
     }

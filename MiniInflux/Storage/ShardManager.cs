@@ -41,6 +41,16 @@ public sealed class ShardManager
     /// </summary>
     public (int ShardId, string ShardDir) GetOrCreateShard(string db, string rp, long timestampNs)
     {
+        var (shardId, shardDir, _, _) = GetOrCreateShardWithRange(db, rp, timestampNs);
+        return (shardId, shardDir);
+    }
+
+    /// <summary>
+    /// Get or create a shard, also returning its time range so callers routing many points can
+    /// cache the last-resolved shard instead of re-scanning the manifest per point.
+    /// </summary>
+    public (int ShardId, string ShardDir, long StartTimeNs, long EndTimeNs) GetOrCreateShardWithRange(string db, string rp, long timestampNs)
+    {
         // Look for existing shard that covers this timestamp
         var shards = _manifest.GetShards(db, rp);
         foreach (var s in shards)
@@ -49,7 +59,7 @@ public sealed class ShardManager
             {
                 var dir = ShardDir(db, rp, s.Id);
                 Directory.CreateDirectory(dir);
-                return (s.Id, dir);
+                return (s.Id, dir, s.StartTimeNs, s.EndTimeNs);
             }
         }
 
@@ -69,7 +79,7 @@ public sealed class ShardManager
 
         var shardDir = ShardDir(db, rp, id);
         Directory.CreateDirectory(shardDir);
-        return (id, shardDir);
+        return (id, shardDir, shardStart, shardEnd);
     }
 
     /// <summary>

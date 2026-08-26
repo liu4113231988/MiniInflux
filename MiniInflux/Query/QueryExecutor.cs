@@ -98,6 +98,22 @@ public sealed class QueryExecutor
     public Task<QueryResponse> ExecuteAsync(TsdbEngine e, string? db, string q, CancellationToken cancellationToken = default)
         => Task.FromResult(ExecuteWithReport(e, db, q, cancellationToken).Response);
 
+    // A single request often routes through two layers that each parse the same query text (e.g.
+    // the buffered-raw fast path, then the general executor). Parsing is pure CPU and allocation,
+    // so memoize the last parse per thread — same-request reuse without cross-request sharing of
+    // the mutable ParsedQuery.
+    [ThreadStatic] private static (string Text, ParsedQuery Parsed) t_lastParse;
+
+    private static ParsedQuery ParseMemoized(string q)
+    {
+        var last = t_lastParse;
+        if (last.Parsed != null && string.Equals(last.Text, q, StringComparison.Ordinal))
+            return last.Parsed;
+        var parsed = InfluxQlParser.Parse(q);
+        t_lastParse = (q, parsed);
+        return parsed;
+    }
+
     public QueryJsonExecutionOutcome? TryExecuteBufferedRawDescendingJson(TsdbEngine e, string? db, string query, string? epoch = null, CancellationToken cancellationToken = default)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -105,7 +121,7 @@ public sealed class QueryExecutor
         ParsedQuery q;
         try
         {
-            q = InfluxQlParser.Parse(query);
+            q = ParseMemoized(query);
         }
         catch
         {
@@ -237,7 +253,7 @@ public sealed class QueryExecutor
         var report = new QueryExecutionReport();
         var safeChunkSize = Math.Max(1, chunkSize);
         ParsedQuery? parsed = null;
-        try { parsed = InfluxQlParser.Parse(q); } catch { }
+        try { parsed = ParseMemoized(q); } catch { }
 
         if (parsed != null && CanStreamRawSelect(parsed))
         {
@@ -270,7 +286,7 @@ public sealed class QueryExecutor
         {
             var token = linkedCts.Token;
 
-            var parsed = InfluxQlParser.Parse(q);
+            var parsed = ParseMemoized(q);
             QueryResponse response;
             if (CanStreamRawSelectResponse(e, db, parsed))
             {
@@ -689,6 +705,7 @@ public sealed class QueryExecutor
     {
         Req(q.Database);
         e.Meta.DropRetentionPolicy(q.Database!, q.RpName!);
+        e.InvalidateEnsuredDbRp(q.Database!, q.RpName!);
         return null;
     }
 
