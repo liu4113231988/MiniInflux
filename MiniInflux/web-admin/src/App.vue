@@ -6,6 +6,7 @@ const tabs = [
   { key: 'databases', label: '数据库' },
   { key: 'query', label: '查询' },
   { key: 'queries', label: 'CQ' },
+  { key: 'tokens', label: '令牌' },
   { key: 'ops', label: '运维' }
 ]
 
@@ -28,7 +29,14 @@ const databases = ref([])
 const queries = ref([])
 const backupPath = ref('./backup/admin-snapshot')
 const restorePath = ref('./backup/admin-snapshot')
-
+const tokens = ref([])
+const newTokenName = ref('')
+const createdToken = ref(null)
+const newDbName = ref('')
+const newRp = ref({ db: '', name: '', duration: '7d', isDefault: false })
+const newCq = ref({ db: '', name: '', text: '' })
+const shardsInfo = ref([])
+const cacheStats = ref(null)
 const queryDb = ref('')
 const queryText = ref('')
 const queryLimit = ref(1000)
@@ -169,9 +177,92 @@ async function loadQueries() {
   queries.value = await api('/admin/api/continuous-queries')
 }
 
+async function loadTokens() {
+  tokens.value = await api('/admin/api/tokens')
+}
+
+async function createToken() {
+  if (!newTokenName.value.trim()) { error.value = '请输入令牌名称（A-Za-z0-9 _ -，1..64）'; return }
+  busy.value = true; error.value = ''; notice.value = ''
+  try {
+    const rec = await api('/admin/api/tokens', { method: 'POST', body: JSON.stringify({ name: newTokenName.value.trim() }) })
+    createdToken.value = rec
+    newTokenName.value = ''
+    await loadTokens()
+    notice.value = `令牌 ${rec.name} 已创建，请立即复制 token（仅显示一次）`
+  } catch (ex) { error.value = ex.message } finally { busy.value = false }
+}
+
+async function revokeToken(id, name) {
+  if (!confirm(`确认吊销令牌 ${name} ？`)) return
+  busy.value = true; error.value = ''; notice.value = ''
+  try {
+    await api(`/admin/api/tokens/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    await loadTokens()
+    notice.value = `令牌 ${name} 已吊销`
+  } catch (ex) { error.value = ex.message } finally { busy.value = false }
+}
+
+function copyText(text) {
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => notice.value = '已复制').catch(() => {})
+  else {
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); notice.value = '已复制'
+  }
+}
+
+async function execAdminQuery(q) {
+  return api('/admin/api/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ q }).toString()
+  })
+}
+
+async function createDatabase() {
+  if (!newDbName.value.trim()) { error.value = '请输入数据库名'; return }
+  busy.value = true; error.value=''; notice.value=''
+  try {
+    await execAdminQuery(`CREATE DATABASE "${newDbName.value.trim()}"`)
+    newDbName.value = ''
+    await Promise.all([loadOverview(), loadDatabases()])
+    notice.value = '数据库已创建'
+  } catch (ex) { error.value = ex.message } finally { busy.value = false }
+}
+
+async function dropDatabase(name) {
+  if (!confirm(`确认删除数据库 ${name}？数据将不可恢复`)) return
+  busy.value = true; error.value=''; notice.value=''
+  try {
+    await execAdminQuery(`DROP DATABASE "${name}"`)
+    await Promise.all([loadOverview(), loadDatabases()])
+    notice.value = `数据库 ${name} 已删除`
+  } catch (ex) { error.value = ex.message } finally { busy.value = false }
+}
+
+async function loadShards() {
+  const res = await execAdminQuery('SHOW SHARDS')
+  const rows = res?.results?.[0]?.series?.[0]?.values || []
+  const cols = res?.results?.[0]?.series?.[0]?.columns || []
+  shardsInfo.value = rows.map(r => Object.fromEntries(cols.map((c,i) => [c, r[i]])))
+}
+
+async function createRp() {
+  if (!newRp.value.db || !newRp.value.name) { error.value = '请选择数据库并输入 RP 名称'; return }
+  const dur = newRp.value.duration?.trim() || '7d'
+  const def = newRp.value.isDefault ? ' DEFAULT' : ''
+  const q = `CREATE RETENTION POLICY "${newRp.value.name}" ON "${newRp.value.db}" DURATION ${dur} REPLICATION 1${def}`
+  busy.value = true; error.value=''; notice.value=''
+  try {
+    await execAdminQuery(q)
+    newRp.value.name = ''; newRp.value.duration='7d'; newRp.value.isDefault=false
+    await loadDatabases()
+    notice.value = 'Retention Policy 已创建'
+  } catch (ex) { error.value = ex.message } finally { busy.value = false }
+}
+
 async function loadProtectedData() {
   await loadOverview()
-  await Promise.all([loadDatabases(), loadQueries()])
+  await Promise.all([loadDatabases(), loadQueries(), loadTokens().catch(() => tokens.value = [])])
 }
 
 const querySeriesList = computed(() => {
@@ -463,6 +554,27 @@ onMounted(async () => {
       </section>
 
       <section v-else-if="activeTab === 'databases'" class="page">
+        <article class="panel">
+          <div class="section-title">数据库管理</div>
+          <div class="query-form" style="grid-template-columns: 1fr auto">
+            <input v-model.trim="newDbName" placeholder="新数据库名（A-Za-z0-9 _ -）" @keyup.enter="createDatabase" />
+            <button class="primary" :disabled="busy" @click="createDatabase">创建数据库</button>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="section-title">Retention Policy 管理</div>
+          <div class="subtle">CREATE RETENTION POLICY 语法，Duration 支持 1h/7d/30d/INF(0)</div>
+          <div class="query-form" style="grid-template-columns: 200px 1fr 140px auto auto">
+            <select v-model="newRp.db" class="query-db">
+              <option value="">选择数据库</option>
+              <option v-for="db in databases" :key="db.name" :value="db.name">{{ db.name }}</option>
+            </select>
+            <input v-model.trim="newRp.name" placeholder="RP 名称" />
+            <input v-model.trim="newRp.duration" placeholder="Duration 7d" />
+            <label class="checkbox"><input type="checkbox" v-model="newRp.isDefault" /> <span>DEFAULT</span></label>
+            <button class="primary" :disabled="busy" @click="createRp">创建 RP</button>
+          </div>
+        </article>
         <div v-if="databases.length === 0" class="empty">暂无数据库</div>
         <article v-for="db in databases" :key="db.name" class="panel">
           <div class="row between">
@@ -476,6 +588,7 @@ onMounted(async () => {
               <span class="pill">{{ db.shardCount }} shards</span>
               <span class="pill">{{ db.segmentCount }} segments</span>
               <span class="pill">{{ formatBytes(db.sizeBytes) }}</span>
+              <button class="danger" style="min-height:30px; padding:6px 10px" :disabled="busy" @click="dropDatabase(db.name)">删除</button>
             </div>
           </div>
           <div class="table-wrap">
@@ -494,6 +607,19 @@ onMounted(async () => {
 
       <section v-else-if="activeTab === 'queries'" class="page">
         <article class="panel">
+          <div class="section-title">创建 Continuous Query</div>
+          <div class="subtle">示例：SELECT mean(value) INTO "db"."autogen"."cpu_mean" FROM "db"."autogen"."cpu" GROUP BY time(1m)</div>
+          <div class="query-form" style="grid-template-columns: 160px 180px 1fr auto; margin-top:10px">
+            <select v-model="newCq.db" class="query-db">
+              <option value="">选择数据库</option>
+              <option v-for="db in databases" :key="db.name" :value="db.name">{{ db.name }}</option>
+            </select>
+            <input v-model.trim="newCq.name" placeholder="CQ 名称" />
+            <input v-model.trim="newCq.text" placeholder='完整 SELECT ... INTO ... GROUP BY time(...)' />
+            <button class="primary" :disabled="busy" @click="createCq">创建</button>
+          </div>
+        </article>
+        <article class="panel">
           <div class="row between">
             <div class="section-title">Continuous Queries</div>
             <button class="primary" :disabled="busy" @click="runAction('/admin/api/maintenance/cq/run', null, '已触发 CQ 调度')">执行一轮</button>
@@ -501,20 +627,50 @@ onMounted(async () => {
           <div v-if="queries.length === 0" class="empty compact-empty">暂无 Continuous Query</div>
           <div v-else class="table-wrap">
             <table class="table">
-              <thead><tr><th>DB</th><th>Name</th><th>Every(ns)</th><th>For(ns)</th><th>Recompute</th><th>Last Bucket</th></tr></thead>
+              <thead><tr><th>DB</th><th>Name</th><th>Every(ns)</th><th>For(ns)</th><th>Recompute</th><th>Last Bucket</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="cq in queries" :key="`${cq.database}/${cq.name}`">
                   <td>{{ cq.database }}</td><td>{{ cq.name }}</td><td>{{ cq.everyNs }}</td><td>{{ cq.forNs }}</td>
                   <td>{{ cq.recomputeRecentBuckets }}</td><td>{{ cq.lastCompletedBucketStartNs ?? '-' }}</td>
+                  <td><button class="danger" style="min-height:30px" :disabled="busy" @click="dropCq(cq.database, cq.name)">删除</button></td>
                 </tr>
               </tbody>
             </table>
           </div>
           <div class="query-list">
             <article v-for="cq in queries" :key="`text-${cq.database}/${cq.name}`" class="query-card">
-              <div class="query-head">{{ cq.database }} / {{ cq.name }}</div><pre>{{ cq.queryText }}</pre>
+              <div class="query-head">{{ cq.database }} / {{ cq.name }} <button class="danger" style="float:right; min-height:28px; padding:4px 8px" @click="dropCq(cq.database, cq.name)">删除</button></div><pre>{{ cq.queryText }}</pre>
             </article>
           </div>
+        </article>
+      </section>
+
+      <section v-else-if="activeTab === 'tokens'" class="page">
+        <article class="panel">
+          <div class="section-title">令牌管理（等权 Bearer Token，与 Basic 并存）</div>
+          <div class="subtle">创建后 token 仅显示一次，请立即复制；列表仅展示前缀。用于 <code>Authorization: Bearer &lt;token&gt;</code> 或 <code>Token &lt;token&gt;</code>。</div>
+          <div v-if="createdToken" class="banner success" style="margin-top:12px; word-break:break-all">
+            <div><strong>新令牌：{{ createdToken.name }}</strong> <span class="subtle">({{ createdToken.prefix }}...)</span></div>
+            <div style="margin:8px 0; font-family:monospace; background:#f8fafc; padding:8px; border-radius:6px; border:1px solid #e2e8f0">{{ createdToken.token }}</div>
+            <button @click="copyText(createdToken.token)">复制 Token</button>
+            <button style="margin-left:8px" @click="createdToken=null">关闭</button>
+          </div>
+          <div class="query-form" style="grid-template-columns: 1fr auto; margin-top:14px">
+            <input v-model.trim="newTokenName" placeholder="新令牌名称（A-Za-z0-9 _ -，1..64）" @keyup.enter="createToken" />
+            <button class="primary" :disabled="busy" @click="createToken">创建令牌</button>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>名称</th><th>前缀</th><th>ID</th><th>创建时间(ns)</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr v-for="t in tokens" :key="t.id">
+                  <td>{{ t.name }}</td><td style="font-family:monospace">{{ t.prefix }}</td><td style="font-family:monospace; font-size:11px">{{ t.id.slice(0,8) }}…</td><td>{{ t.createdAtNs }}</td>
+                  <td><button class="danger" :disabled="busy" @click="revokeToken(t.id, t.name)">吊销</button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="tokens.length===0" class="empty compact-empty">暂无令牌</div>
         </article>
       </section>
 
@@ -532,6 +688,29 @@ onMounted(async () => {
             <input v-model.trim="restorePath" placeholder="备份目录" />
             <button class="danger" :disabled="busy" @click="runAction('/admin/api/restore', { path: restorePath }, '恢复已准备，需重启生效')">准备恢复</button>
           </div></article>
+        </div>
+        <div class="grid two" style="margin-top:16px">
+          <article class="panel">
+            <div class="row between"><div class="section-title">Shard 诊断</div><button :disabled="busy" @click="loadShards()">刷新</button></div>
+            <div v-if="shardsInfo.length===0" class="empty compact-empty">点击刷新加载 SHOW SHARDS</div>
+            <div v-else class="table-wrap">
+              <table class="table">
+                <thead><tr><th v-for="k in Object.keys(shardsInfo[0]||{})" :key="k">{{ k }}</th></tr></thead>
+                <tbody><tr v-for="(r,i) in shardsInfo" :key="i"><td v-for="k in Object.keys(r)" :key="k">{{ r[k] }}</td></tr></tbody>
+              </table>
+            </div>
+          </article>
+          <article class="panel">
+            <div class="row between"><div class="section-title">缓存与统计</div><button :disabled="busy" @click="loadCacheStats()">刷新</button></div>
+            <div v-if="!cacheStats" class="empty compact-empty">点击刷新加载 cache-stats</div>
+            <div v-else>
+              <dl class="detail-list">
+                <div><dt>Metadata Cache Hits</dt><dd>{{ cacheStats.hits }}</dd></div>
+                <div><dt>Misses</dt><dd>{{ cacheStats.misses }}</dd></div>
+                <div><dt>Cached</dt><dd>{{ cacheStats.cachedCount }}</dd></div>
+              </dl>
+            </div>
+          </article>
         </div>
       </section>
     </main>
