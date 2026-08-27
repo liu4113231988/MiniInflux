@@ -47,9 +47,28 @@ public static class ResponseCompressionSupport
         return new GZipStream(response.Body, CompressionLevel.Fastest, leaveOpen: true);
     }
 
-    public static bool AcceptsGzip(HttpRequest request) =>
-        request.Headers.AcceptEncoding.ToString()
-            .Contains("gzip", StringComparison.OrdinalIgnoreCase);
+    public static bool AcceptsGzip(HttpRequest request)
+    {
+        // Do not treat `gzip;q=0` as accepted: clients use it to explicitly forbid gzip.
+        // A simple substring check also matched unrelated parameters such as `x-gzip`.
+        foreach (var entry in request.Headers.AcceptEncoding.ToString().Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var parts = entry.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0 || !string.Equals(parts[0], "gzip", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            foreach (var parameter in parts.Skip(1))
+            {
+                if (parameter.StartsWith("q=", StringComparison.OrdinalIgnoreCase)
+                    && double.TryParse(parameter[2..], System.Globalization.NumberStyles.AllowDecimalPoint,
+                        System.Globalization.CultureInfo.InvariantCulture, out var quality)
+                    && quality <= 0)
+                    return false;
+            }
+            return true;
+        }
+        return false;
+    }
 
     public static bool IsCompressiblePath(PathString path)
     {

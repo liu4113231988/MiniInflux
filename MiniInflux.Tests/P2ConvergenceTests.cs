@@ -157,6 +157,14 @@ public class P2ConvergenceTests : IDisposable
     }
 
     [Fact]
+    public void Gzip_DoesNotWrap_WhenClientExplicitlyDisablesIt()
+    {
+        var (context, response) = NewContext("/query", "br, gzip;q=0");
+        using var stream = ResponseCompressionSupport.TryWrap(context.Request, response);
+        Assert.Null(stream);
+    }
+
+    [Fact]
     public void Gzip_DoesNotWrap_NonCompressiblePath()
     {
         var (context, response) = NewContext("/write", "gzip");

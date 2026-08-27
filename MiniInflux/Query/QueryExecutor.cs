@@ -2634,10 +2634,9 @@ public sealed class QueryExecutor
         if (q.HasOrFilters) return null;
         // last() path
         var isLastFunc = q.Select.Count > 0 && q.Select.All(s => s.Func == "last");
-        var isFirstFunc = q.Select.Count > 0 && q.Select.All(s => s.Func == "first");
-        if (isLastFunc || isFirstFunc)
+        if (isLastFunc)
         {
-            var cached = TryServeLastFunctionViaCache(e, sourceDb, sourceRp, q, seriesFilter, report, cancellationToken, isFirst: isFirstFunc);
+            var cached = TryServeLastFunctionViaCache(e, sourceDb, sourceRp, q, seriesFilter, report, cancellationToken);
             if (cached != null) report.UsedLastValueCache = true;
             return cached;
         }
@@ -2652,7 +2651,7 @@ public sealed class QueryExecutor
         return null;
     }
 
-    List<QuerySeries>? TryServeLastFunctionViaCache(TsdbEngine e, string db, string rp, ParsedQuery q, HashSet<string>? seriesFilter, QueryExecutionReport report, CancellationToken ct, bool isFirst)
+    List<QuerySeries>? TryServeLastFunctionViaCache(TsdbEngine e, string db, string rp, ParsedQuery q, HashSet<string>? seriesFilter, QueryExecutionReport report, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         var measurement = q.Measurement!;
@@ -2680,8 +2679,10 @@ public sealed class QueryExecutor
             // time range filter check — if cached not in range, older last within range needed => fallback
             if (q.MinTimeNs.HasValue && pt.TimestampNs < q.MinTimeNs.Value) return null;
             if (q.MaxTimeNs.HasValue && pt.TimestampNs > q.MaxTimeNs.Value) return null;
-            // field presence check — if any requested field missing from this series last point, that series cannot answer that field,
-            // but other series may; we keep point but per-field filtering later will handle. Still need tombstone check:
+            // LAST(field) selects the latest point that *has that field*. If the newest cached
+            // point lacks a requested field, an older point may be the answer, so use the normal
+            // scan path instead of returning an incomplete cache result.
+            if (q.Select.Any(s => !pt.Fields.ContainsKey(s.Field))) return null;
             if (e.Tombstones.HasTombstones(db) && e.Tombstones.FilterDeleted(db, [pt]).Count == 0) return null; // tombstoned
             cachedPoints.Add(pt);
         }

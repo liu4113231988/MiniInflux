@@ -125,4 +125,34 @@ public sealed class LastValueCacheTests : IDisposable
         Assert.True(outcome.Report.UsedLastValueCache);
         Assert.Equal(10.0, Convert.ToDouble(Assert.Single(outcome.Response.Results[0].Series!).Values[0][1]));
     }
+
+    [Fact]
+    public async Task FirstQuery_DoesNotUseLastValueCache_AndReturnsEarliestPoint()
+    {
+        using var engine = new TsdbEngine(_dir, flushThreshold: 100000, flushIntervalMs: 0, compactionIntervalMs: 0, rpCheckIntervalMs: 0);
+        engine.Recover();
+        await engine.WriteAsync("db", "autogen", [P("cpu", "a", 1, 100), P("cpu", "a", 2, 200)]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "db", "SELECT first(value) FROM cpu WHERE host='a'");
+
+        Assert.False(outcome.Report.UsedLastValueCache);
+        Assert.Equal(1.0, Convert.ToDouble(Assert.Single(outcome.Response.Results[0].Series!).Values[0][1]));
+    }
+
+    [Fact]
+    public async Task LastQuery_WhenNewestPointLacksRequestedField_FallsBackToEarlierValue()
+    {
+        using var engine = new TsdbEngine(_dir, flushThreshold: 100000, flushIntervalMs: 0, compactionIntervalMs: 0, rpCheckIntervalMs: 0);
+        engine.Recover();
+        await engine.WriteAsync("db", "autogen",
+        [
+            P("cpu", "a", 1, 100),
+            new Point { Measurement = "cpu", Tags = new Dictionary<string, string> { ["host"] = "a" }, Fields = new Dictionary<string, FieldValue> { ["other"] = FieldValue.FromDouble(2) }, TimestampNs = 200, TagsCanonical = "host=a" }
+        ]);
+
+        var outcome = new QueryExecutor().ExecuteWithReport(engine, "db", "SELECT last(value) FROM cpu WHERE host='a'");
+
+        Assert.False(outcome.Report.UsedLastValueCache);
+        Assert.Equal(1.0, Convert.ToDouble(Assert.Single(outcome.Response.Results[0].Series!).Values[0][1]));
+    }
 }
