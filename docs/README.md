@@ -8,8 +8,9 @@ MiniInflux.Net10 is a small single-node time-series database built with .NET 10 
 
 ### Highlights
 
-- HTTP endpoints: `GET /ping`, `GET /health`, `GET /debug/stats`, `GET /debug/benchmark`, `GET /metrics`, `POST /write`, `GET|POST /query`
+- HTTP endpoints: `GET /ping`, `GET /health`, `GET /debug/stats`, `GET /debug/benchmark`, `GET /metrics`, `POST /write`, `POST /api/v2/write`, `GET|POST /query`, `POST /api/v3/query_influxql`
 - InfluxQL subset: `CREATE DATABASE`, `SHOW ...`, `SELECT`, `GROUP BY time(...)`, `fill(...)`, `SELECT ... INTO ...`, `DELETE`, `DROP SERIES`, `CREATE|SHOW|DROP CONTINUOUS QUERY`
+- Parameterized queries: `$name` placeholders in WHERE predicates bound per request on `/query` and `/api/v3/query_influxql` (no SQL text concatenation, parse-tree cached)
 - Storage path: write queue, WAL recovery, segment compaction, schema registry, manifest/index metadata
 - Operations: admin UI at `/admin`, CLI commands for `benchmark`, `inspect`, `validate`, `repair`, `compact`, `backup`, `restore`
 - AOT-friendly: `PublishAot`, trimmed publish, source-generated JSON metadata
@@ -41,6 +42,25 @@ curl -G http://localhost:8086/query \
   --data-urlencode "q=SELECT mean(value),max(temp) FROM cpu GROUP BY time(1m)"
 ```
 
+Run a parameterized query (v1):
+
+```bash
+curl -G http://localhost:8086/query \
+  -u admin:replace-with-a-strong-password \
+  --data-urlencode "db=metrics" \
+  --data-urlencode "q=SELECT value FROM cpu WHERE host = \$host AND value >= \$min" \
+  --data-urlencode 'params={"host":"s1","min":0.5}'
+```
+
+Or via the v3 endpoint:
+
+```bash
+curl -XPOST http://localhost:8086/api/v3/query_influxql \
+  -u admin:replace-with-a-strong-password \
+  -H "Content-Type: application/json" \
+  -d '{"db":"metrics","q":"SELECT value FROM cpu WHERE host = $host AND value >= $min","params":{"host":"s1","min":0.5}}'
+```
+
 ### Configuration Notes
 
 - `Data.Dir` controls the data directory and is preferred over legacy `MiniInflux:DataPath`
@@ -64,7 +84,9 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
 
 - `GET /ping`
 - `POST /write?db=metrics&precision=ns|u|ms|s|m|h`
+- `POST /api/v2/write?bucket=metrics&org=&precision=...`（v2 兼容写入，`bucket` 支持 `db/rp` 形式，接受 `Authorization: Token xxx`）
 - `GET|POST /query?db=metrics&q=...`
+- `POST /api/v3/query_influxql`（JSON 请求体 `{db, q, params?, format?, epoch?}`）
 - Line Protocol 写入
   - 首次向不存在的 `db` 写入时会自动创建数据库和默认 RP `autogen`
 - InfluxQL 子集：
@@ -99,6 +121,7 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
   - `MaxRequestBodyBytes`、`MaxBufferPoints`、`MaxBufferBytes`
 - 权限与认证
   - HTTP Basic 认证；query 参数认证默认关闭，仅兼容模式启用
+  - `Authorization: Bearer/Token` 命名 token（`POST/GET /admin/api/tokens`、`DELETE /admin/api/tokens/{id}`，等权于超级管理员）
   - 配置文件中的单一超级管理员账号
   - 不支持运行时创建用户、改密或细粒度授权
 - WAL + Segment 存储
@@ -362,6 +385,31 @@ curl -G http://localhost:8086/query \
 
 - 如果 `metrics` 还不存在，上面的第一次 `/write?db=metrics` 会自动创建数据库和默认 RP `autogen`。
 - 也仍然支持显式执行 `CREATE DATABASE metrics`，便于与 InfluxDB 1.x 的常见运维流程保持一致。
+
+## 参数化查询
+
+`/query` 与 `/api/v3/query_influxql` 支持在 WHERE 谓词中使用 `$name` 占位符，请求时通过 `params` 绑定实际值：
+
+```bash
+# v1 /query：params 为 JSON 对象（query string 或 form）
+curl -G http://localhost:8086/query \
+  --data-urlencode "db=metrics" \
+  --data-urlencode "q=SELECT value FROM cpu WHERE host = \$host AND value >= \$min" \
+  --data-urlencode 'params={"host":"s1","min":0.5}'
+
+# v3 端点：params 放在 JSON 请求体内
+curl -XPOST http://localhost:8086/api/v3/query_influxql \
+  -H "Content-Type: application/json" \
+  -d '{"db":"metrics","q":"SELECT value FROM cpu WHERE host = $host AND value >= $min","params":{"host":"s1","min":0.5}}'
+```
+
+绑定规则与限制：
+
+- 值在解析树级别绑定，永不拼回查询文本，因此不存在注入面；`' OR 1=1 --` 这类值只会被当作普通字面量过滤
+- 字符串 / 布尔 / null 值绑定 tag 谓词，数值绑定 field 谓词；`=~` / `!~` 仅接受字符串（正则）；范围操作符要求数值
+- `time` 的占位符接受 RFC3339 时间字符串或数值时间戳，并与查询内字面量时间范围取交集
+- 缺少参数返回错误 `missing parameter: $name`；OR 谓词与非 SELECT 语句中的占位符不支持
+- 相同查询文本的解析结果跨请求缓存复用，不同参数值只做绑定，不重复解析
 
 ## Continuous Query
 
