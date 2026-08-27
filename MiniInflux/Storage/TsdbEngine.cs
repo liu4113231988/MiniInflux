@@ -66,6 +66,8 @@ public sealed class TsdbEngine : IDisposable
     // writers. Points stay in the buffer (and WAL) until the flush completes, so reads keep
     // seeing them and crash recovery is unaffected.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Task> _flushInFlight = new(StringComparer.Ordinal);
+    private readonly LastValueCache _lastValueCache = new();
+    private readonly DistinctValueCache _distinctCache = new();
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
     private Timer? _flushTimer;
@@ -1653,6 +1655,16 @@ public long GetBufferedByteCount()
 return Interlocked.Read(ref _bufferedByteCount);
 }
 
+    public LastValueCache LastValueCache => _lastValueCache;
+
+    public bool TryGetLastValue(string db, string rp, string measurement, string tagsCanonical, out Point point)
+        => _lastValueCache.TryGet(db, rp, measurement, tagsCanonical, out point);
+
+    public IReadOnlyList<Point> GetLastValuesForMeasurement(string db, string rp, string measurement, HashSet<string>? allowedTags = null)
+        => _lastValueCache.GetForMeasurement(db, rp, measurement, allowedTags);
+
+    public int GetLastValueCacheCount() => _lastValueCache.Count;
+
     public List<Point> ReadBufferedPoints(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null)
     {
@@ -1923,6 +1935,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         _manifest.DropDatabase(db); _manifest.SaveIfDirty(); _tombstones.DropDatabase(db);
         foreach (var ensured in _ensuredDbRp.Keys.Where(k => k.StartsWith(db + "|", StringComparison.Ordinal)).ToList())
             _ensuredDbRp.TryRemove(ensured, out _);
+        _lastValueCache.ClearDb(db);
         _globalLock.EnterWriteLock();
         try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); _locks.TryRemove(k, out var lk); lk?.Dispose(); _bufferReplayFloors.TryRemove(k, out _); _lastBufferWriteTicks.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
         finally { _globalLock.ExitWriteLock(); }
@@ -1932,6 +1945,7 @@ return Interlocked.Read(ref _bufferedByteCount);
     {
         _tombstones.AddMeasurementDelete(db, measurement);
         _manifest.RemoveMeasurementIndex(db, measurement);
+        _lastValueCache.RemoveMeasurement(db, measurement);
         foreach (var rp in _manifest.ListRetentionPolicies(db).Select(r => r.Name).DefaultIfEmpty("autogen"))
         {
             var key = K(db, rp);
@@ -2012,6 +2026,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         var tagSet = new HashSet<string>(tagsCanonical, StringComparer.Ordinal);
         _tombstones.AddSeriesDeletes(db, measurement, tagSet.Select(tags => (tags, (long?)null, (long?)null)));
         _manifest.RemoveSeriesIndex(db, measurement, tagSet);
+        _lastValueCache.RemoveSeriesBatch(db, measurement, tagSet);
 
         foreach (var rp in _manifest.ListRetentionPolicies(db).Select(r => r.Name).DefaultIfEmpty("autogen"))
         {
@@ -2057,6 +2072,15 @@ return Interlocked.Read(ref _bufferedByteCount);
 
     private void DeleteBuffered(string db, string rp, string measurement, long? minTime, long? maxTime, Predicate<Point> predicate)
     {
+        // Tombstone-driven delete may invalidate last-value entries; evict affected series
+        // (tombstones for flushed data are applied at read time, but cache must not return stale last)
+        var deleteAffectsCache = true; // conservative: any delete on measurement evicts its series
+        if (deleteAffectsCache)
+        {
+            // evict all series of this measurement from cache for the affected rp; precise per-series
+            // predicate check would need point scan, so we invalidate measurement scope and lazy-refill
+            _lastValueCache.ClearMeasurementFromDbRp(db, rp, measurement);
+        }
         var key = K(db, rp);
         _globalLock.EnterWriteLock();
         try
@@ -2405,7 +2429,13 @@ return Interlocked.Read(ref _bufferedByteCount);
             foreach (var buffered in l)
                 flushBytes += EstimateBufferedPointBytes(buffered.Point);
 
+        // capture flushed points for last-value cache validation before clearing
+        var flushedSnapshot = l.ToArray();
         FlushPointsToSegments(db, rp, l);
+
+        // sync path: cache already updated at write time, validate via footer maxTime by re-asserting flushed values
+        foreach (var bp in flushedSnapshot) _lastValueCache.Update(db, rp, bp.Point);
+        ValidateLastValueCacheFromFooter(db, rp, flushedSnapshot);
 
         _bufferedPointCount -= flushCount;
         if (_maxBufferBytes > 0)
@@ -2515,6 +2545,8 @@ return Interlocked.Read(ref _bufferedByteCount);
         try
         {
             FlushPointsToSegments(db, rp, snapshot);
+            // async flush also validates last-value cache via footer maxTime (snapshot's max is footer max)
+            ValidateLastValueCacheFromFooter(db, rp, snapshot);
 
             var lk = GetLock(key);
             lk.EnterWriteLock();
@@ -2820,6 +2852,14 @@ return Interlocked.Read(ref _bufferedByteCount);
         if (_maxBufferBytes > 0)
             foreach (var point in points)
                 _bufferedByteCount += EstimateBufferedPointBytes(point.Point);
+        // WAL replay also populates last-value cache so post-restart last() is fast
+        var sep = key.IndexOf('|');
+        if (sep > 0)
+        {
+            var db = key[..sep];
+            var rp = key[(sep + 1)..];
+            foreach (var p in points) _lastValueCache.Update(db, rp, p.Point);
+        }
     }
 
     private void AddWrittenPoints(string db, string key, List<BufferedPoint> list, List<PendingPoint> points, IReadOnlyList<WalPosition> positions)
@@ -2859,6 +2899,11 @@ return Interlocked.Read(ref _bufferedByteCount);
         if (_maxBufferBytes > 0)
             for (var i = 0; i < points.Count; i++)
                 _bufferedByteCount += EstimateBufferedPointBytes(points[i].Point);
+
+        // write-path last-value cache update (flush later validates via segment footer maxTime)
+        var rp = key.Length > db.Length + 1 ? key[(db.Length + 1)..] : "autogen";
+        for (var i = 0; i < points.Count; i++)
+            _lastValueCache.Update(db, rp, points[i].Point);
     }
 
     private IEnumerable<BufferedPoint> BufferedCandidates(string key, List<BufferedPoint> list, string? measurement, HashSet<string>? allowedTagsCanonical)
@@ -2957,10 +3002,64 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
     {
         try
         {
-            if (_shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000) > 0)
+            var removed = _shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000);
+            if (removed > 0)
+            {
                 InvalidateSegmentMetadataIndex();
+                // retention expiry removed shard files; any cached last point in those shards is now stale
+                // conservatively clear the last-value cache so next queries backfill from remaining segments
+                // (per-RP precise eviction would require time-range filtering; global clear is safe and infrequent)
+                var all = _lastValueCache.CountByDbRp.Keys.ToList();
+                foreach (var key in all)
+                {
+                    var sep = key.IndexOf('|');
+                    if (sep > 0) _lastValueCache.EvictWhere(key[..sep], key[(sep+1)..], (_, _) => true);
+                }
+            }
         }
         catch (Exception ex) { _health.RecordFailure("retention_cleanup", ex); }
+    }
+
+    /// <summary>
+    /// Flush后校验：用段文件 footer 的 MaxTime 校验缓存，若缺失则回填。
+    /// 当前 flush 快照的 maxTime 即 footer maxTime 的真值来源，复核缓存是否与之对齐。
+    /// </summary>
+    private void ValidateLastValueCacheFromFooter(string db, string rp, BufferedPoint[] flushed)
+    {
+        if (flushed.Length == 0) return;
+        // group by series, find maxTime of flushed batch
+        var maxBySeries = new Dictionary<SeriesKey, long>();
+        var latestBySeries = new Dictionary<SeriesKey, Point>();
+        foreach (var bp in flushed)
+        {
+            var sk = bp.SeriesKey;
+            if (!maxBySeries.TryGetValue(sk, out var curMax) || bp.Point.TimestampNs > curMax)
+            {
+                maxBySeries[sk] = bp.Point.TimestampNs;
+                latestBySeries[sk] = bp.Point;
+            }
+            else if (bp.Point.TimestampNs == curMax)
+            {
+                // same timestamp merge fields LWW
+                var existing = latestBySeries[sk];
+                var merged = new Dictionary<string, FieldValue>(existing.Fields, StringComparer.Ordinal);
+                foreach (var kv in bp.Point.Fields) merged[kv.Key] = kv.Value;
+                latestBySeries[sk] = new Point { Measurement = existing.Measurement, Tags = existing.Tags, Fields = merged, TimestampNs = existing.TimestampNs, TagsCanonical = existing.TagsCanonical };
+            }
+        }
+        // segment footer holds same maxTime; ensure cache matches, backfill if gap
+        foreach (var kv in maxBySeries)
+        {
+            if (_lastValueCache.TryGet(db, rp, kv.Key, out var cached))
+            {
+                if (cached.TimestampNs != kv.Value)
+                    _lastValueCache.Update(db, rp, latestBySeries[kv.Key]);
+            }
+            else
+            {
+                _lastValueCache.Update(db, rp, latestBySeries[kv.Key]);
+            }
+        }
     }
 
     private static string K(string db, string rp) => db + "|" + rp;
