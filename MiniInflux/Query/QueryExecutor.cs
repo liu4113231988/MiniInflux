@@ -47,6 +47,7 @@ public sealed class QueryExecutionReport
     public bool UsedSeriesIndexPushdown { get; set; }
     public bool UsedStreamingRawSelect { get; set; }
     public bool UsedStreamingAggregate { get; set; }
+    public bool UsedLastValueCache { get; set; }
     public int SegmentMetadataFooterHits { get; set; }
     public int SegmentMetadataFullReads { get; set; }
     public int SegmentColumnsRead { get; set; }
@@ -95,13 +96,14 @@ public sealed class QueryExecutor
         _maxQueryMemoryBytes = maxQueryMemoryBytes;
     }
 
-    public Task<QueryResponse> ExecuteAsync(TsdbEngine e, string? db, string q, CancellationToken cancellationToken = default)
-        => Task.FromResult(ExecuteWithReport(e, db, q, cancellationToken).Response);
+    public Task<QueryResponse> ExecuteAsync(TsdbEngine e, string? db, string q, CancellationToken cancellationToken = default, IReadOnlyDictionary<string, System.Text.Json.JsonElement>? queryParams = null)
+        => Task.FromResult(ExecuteWithReport(e, db, q, cancellationToken, queryParams).Response);
 
     // A single request often routes through two layers that each parse the same query text (e.g.
     // the buffered-raw fast path, then the general executor). Parsing is pure CPU and allocation,
     // so memoize the last parse per thread — same-request reuse without cross-request sharing of
-    // the mutable ParsedQuery.
+    // the mutable ParsedQuery. Parameterized templates are cached under their template text and
+    // cloned per request by the binder, so the cached instance is never mutated.
     [ThreadStatic] private static (string Text, ParsedQuery Parsed) t_lastParse;
 
     private static ParsedQuery ParseMemoized(string q)
@@ -109,19 +111,27 @@ public sealed class QueryExecutor
         var last = t_lastParse;
         if (last.Parsed != null && string.Equals(last.Text, q, StringComparison.Ordinal))
             return last.Parsed;
-        var parsed = InfluxQlParser.Parse(q);
+        var parsed = MiniInflux.Net10.Protocol.QueryParamBinder.ParseCached(q);
         t_lastParse = (q, parsed);
         return parsed;
     }
 
-    public QueryJsonExecutionOutcome? TryExecuteBufferedRawDescendingJson(TsdbEngine e, string? db, string query, string? epoch = null, CancellationToken cancellationToken = default)
+    private static ParsedQuery ParseAndBind(string q, IReadOnlyDictionary<string, System.Text.Json.JsonElement>? queryParams)
+    {
+        var parsed = ParseMemoized(q);
+        return MiniInflux.Net10.Protocol.QueryParamBinder.HasUnboundParams(parsed)
+            ? MiniInflux.Net10.Protocol.QueryParamBinder.ApplyParams(parsed, queryParams)
+            : parsed;
+    }
+
+    public QueryJsonExecutionOutcome? TryExecuteBufferedRawDescendingJson(TsdbEngine e, string? db, string query, string? epoch = null, CancellationToken cancellationToken = default, IReadOnlyDictionary<string, System.Text.Json.JsonElement>? queryParams = null)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var report = new QueryExecutionReport();
         ParsedQuery q;
         try
         {
-            q = ParseMemoized(query);
+            q = ParseAndBind(query, queryParams);
         }
         catch
         {
@@ -248,12 +258,12 @@ public sealed class QueryExecutor
         }
     }
 
-    public QueryChunkedExecutionOutcome ExecuteChunkedWithReport(TsdbEngine e, string? db, string q, int chunkSize, CancellationToken cancellationToken = default)
+    public QueryChunkedExecutionOutcome ExecuteChunkedWithReport(TsdbEngine e, string? db, string q, int chunkSize, CancellationToken cancellationToken = default, IReadOnlyDictionary<string, System.Text.Json.JsonElement>? queryParams = null)
     {
         var report = new QueryExecutionReport();
         var safeChunkSize = Math.Max(1, chunkSize);
         ParsedQuery? parsed = null;
-        try { parsed = ParseMemoized(q); } catch { }
+        try { parsed = ParseAndBind(q, queryParams); } catch { }
 
         if (parsed != null && CanStreamRawSelect(parsed))
         {
@@ -267,13 +277,13 @@ public sealed class QueryExecutor
 
         return new QueryChunkedExecutionOutcome
         {
-            Responses = ExecuteBufferedChunks(e, db, q, safeChunkSize, report, cancellationToken),
+            Responses = ExecuteBufferedChunks(e, db, q, safeChunkSize, report, cancellationToken, queryParams),
             Report = report,
             UsedStreamingRawSelect = false
         };
     }
 
-    public QueryExecutionOutcome ExecuteWithReport(TsdbEngine e, string? db, string q, CancellationToken cancellationToken = default)
+    public QueryExecutionOutcome ExecuteWithReport(TsdbEngine e, string? db, string q, CancellationToken cancellationToken = default, IReadOnlyDictionary<string, System.Text.Json.JsonElement>? queryParams = null)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var report = new QueryExecutionReport();
@@ -286,7 +296,7 @@ public sealed class QueryExecutor
         {
             var token = linkedCts.Token;
 
-            var parsed = ParseMemoized(q);
+            var parsed = ParseAndBind(q, queryParams);
             QueryResponse response;
             if (CanStreamRawSelectResponse(e, db, parsed))
             {
@@ -354,9 +364,9 @@ public sealed class QueryExecutor
         }
     }
 
-    IEnumerable<QueryResponse> ExecuteBufferedChunks(TsdbEngine e, string? db, string q, int chunkSize, QueryExecutionReport report, CancellationToken cancellationToken)
+    IEnumerable<QueryResponse> ExecuteBufferedChunks(TsdbEngine e, string? db, string q, int chunkSize, QueryExecutionReport report, CancellationToken cancellationToken, IReadOnlyDictionary<string, System.Text.Json.JsonElement>? queryParams = null)
     {
-        var outcome = ExecuteWithReport(e, db, q, cancellationToken);
+        var outcome = ExecuteWithReport(e, db, q, cancellationToken, queryParams);
         CopyReport(outcome.Report, report);
         foreach (var chunk in ChunkResponse(outcome.Response, chunkSize))
             yield return chunk;
@@ -1001,6 +1011,22 @@ public sealed class QueryExecutor
         else
         {
             var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
+            var lvcResult = TryServeFromLastValueCache(e, sourceDb, sourceRp, q, seriesFilter, report, cancellationToken);
+            if (lvcResult != null)
+            {
+                var lvcBytes = EstimateQuerySeriesBytes(lvcResult);
+                report.EstimatedResultBytes = lvcBytes;
+                report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, report.EstimatedInputBytes + lvcBytes);
+                EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+                if (!string.IsNullOrWhiteSpace(q.IntoTarget))
+                {
+                    var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, lvcResult);
+                    report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, lvcBytes + selectIntoBytes);
+                    EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+                    ExecuteSelectInto(e, sourceDb, q, lvcResult);
+                }
+                return lvcResult;
+            }
             if (!q.GroupByNs.HasValue && q.Select.Any(s => s.Func != ""))
             {
                 var pushedDown = q.GroupByTags.Count == 0
@@ -2594,6 +2620,228 @@ public sealed class QueryExecutor
                 series = e.ListSeries(db, measurement).ToList();
             e.DropSeries(db, measurement, series);
         }
+    }
+
+    // P1 Last Value Cache fast path — write-path updated, footer-validated, AOT-friendly dictionary lookup (<10ms)
+    List<QuerySeries>? TryServeFromLastValueCache(TsdbEngine e, string sourceDb, string sourceRp, ParsedQuery q, HashSet<string>? seriesFilter, QueryExecutionReport report, CancellationToken cancellationToken)
+    {
+        // Only measurement-scoped queries, no subquery, no time GROUP BY
+        if (string.IsNullOrWhiteSpace(q.Measurement) || q.Subquery != null || q.GroupByNs.HasValue) return null;
+        if (q.IntoTarget != null) return null; // SELECT INTO must write, not cache-read
+        // Time filter excluding cached latest requires scan for older point — fall back if cached ts outside range
+        // Field filters would need value inspection — fall back
+        if (q.FieldFilters.Count > 0) return null;
+        if (q.HasOrFilters) return null;
+        // last() path
+        var isLastFunc = q.Select.Count > 0 && q.Select.All(s => s.Func == "last");
+        var isFirstFunc = q.Select.Count > 0 && q.Select.All(s => s.Func == "first");
+        if (isLastFunc || isFirstFunc)
+        {
+            var cached = TryServeLastFunctionViaCache(e, sourceDb, sourceRp, q, seriesFilter, report, cancellationToken, isFirst: isFirstFunc);
+            if (cached != null) report.UsedLastValueCache = true;
+            return cached;
+        }
+        // raw "current value" path: SELECT * or SELECT field1,field2 ORDER BY time DESC LIMIT 1
+        var isRawCurrent = q.Select.All(s => string.IsNullOrEmpty(s.Func)) && !q.GroupByNs.HasValue && q.Desc && q.Limit.HasValue && q.Limit.Value == 1 && (q.Offset ?? 0) == 0;
+        if (isRawCurrent)
+        {
+            var raw = TryServeRawLastViaCache(e, sourceDb, sourceRp, q, seriesFilter, report);
+            if (raw != null) report.UsedLastValueCache = true;
+            return raw;
+        }
+        return null;
+    }
+
+    List<QuerySeries>? TryServeLastFunctionViaCache(TsdbEngine e, string db, string rp, ParsedQuery q, HashSet<string>? seriesFilter, QueryExecutionReport report, CancellationToken ct, bool isFirst)
+    {
+        ct.ThrowIfCancellationRequested();
+        var measurement = q.Measurement!;
+        // resolve allowed series canonicals
+        HashSet<string> allowed;
+        if (seriesFilter != null) allowed = new HashSet<string>(seriesFilter, StringComparer.Ordinal);
+        else
+        {
+            var all = e.ListSeries(db, measurement);
+            if (all.Count == 0) return [new() { Name = ResolveResultMeasurementName(q), Columns = ["time", .. q.Select.Select(s => s.Alias)], Values = [] }];
+            allowed = new HashSet<string>(all, StringComparer.Ordinal);
+        }
+        if (allowed.Count == 0) return [new() { Name = ResolveResultMeasurementName(q), Columns = ["time", .. q.Select.Select(s => s.Alias)], Values = [] }];
+        // fetch cached points, check completeness and time bounds
+        var cachedPoints = new List<Point>(allowed.Count);
+        foreach (var tags in allowed)
+        {
+            if (!e.TryGetLastValue(db, rp, measurement, tags, out var pt))
+            {
+                // cache miss — try to backfill from segments (single last point) then retry cache
+                var backfilled = BackfillLastValueCacheEntry(e, db, rp, measurement, tags, ct);
+                if (backfilled == null) return null; // cannot serve from cache
+                pt = backfilled;
+            }
+            // time range filter check — if cached not in range, older last within range needed => fallback
+            if (q.MinTimeNs.HasValue && pt.TimestampNs < q.MinTimeNs.Value) return null;
+            if (q.MaxTimeNs.HasValue && pt.TimestampNs > q.MaxTimeNs.Value) return null;
+            // field presence check — if any requested field missing from this series last point, that series cannot answer that field,
+            // but other series may; we keep point but per-field filtering later will handle. Still need tombstone check:
+            if (e.Tombstones.HasTombstones(db) && e.Tombstones.FilterDeleted(db, [pt]).Count == 0) return null; // tombstoned
+            cachedPoints.Add(pt);
+        }
+        // verify requested fields exist in at least one cached point, else last(field) would be null correctly but we can still answer (empty)
+        // grouping
+        var resultMeasurement = ResolveResultMeasurementName(q);
+        // No GROUP BY tag: global last
+        if (q.GroupByTags.Count == 0 && !q.GroupByAllTags)
+        {
+            // Reuse existing function logic over the small cachedPoints set (<10ms)
+            var rows = BuildFunctionRows(cachedPoints, q.Select.Where(s => s.Func != "").ToList(), ct);
+            rows = OrderRowsByTime(rows, q.Desc);
+            rows = rows.Skip(q.Offset ?? 0).Take(Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows)).ToList();
+            EnsureWithinLimit(rows.Count);
+            var cols = new List<string> { "time" };
+            cols.AddRange(q.Select.Select(s => s.Alias));
+            return [new QuerySeries { Name = resultMeasurement, Columns = cols, Values = rows }];
+        }
+        // GROUP BY tag(s) or GROUP BY * => per-group last
+        var grouped = GroupPointsByTag(cachedPoints, q.GroupByTags, q.GroupByAllTags);
+        var result = new List<QuerySeries>(grouped.Count);
+        foreach (var kv in grouped)
+        {
+            var groupPoints = kv.Value;
+            var rows = BuildFunctionRows(groupPoints, q.Select.Where(s => s.Func != "").ToList(), ct);
+            rows = OrderRowsByTime(rows, q.Desc);
+            rows = rows.Skip(q.Offset ?? 0).Take(Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows)).ToList();
+            if (rows.Count == 0) continue;
+            var cols = new List<string> { "time" };
+            cols.AddRange(q.Select.Select(s => s.Alias));
+            result.Add(new QuerySeries { Name = resultMeasurement, Tags = kv.Key, Columns = cols, Values = rows });
+        }
+        // order groups by tag for determinism
+        result.Sort((a, b) => string.Compare(string.Join(",", (a.Tags ?? new()).OrderBy(k => k.Key).Select(k => k.Key + "=" + k.Value)), string.Join(",", (b.Tags ?? new()).OrderBy(k => k.Key).Select(k => k.Key + "=" + k.Value)), StringComparison.Ordinal));
+        return result;
+    }
+
+    List<QuerySeries>? TryServeRawLastViaCache(TsdbEngine e, string db, string rp, ParsedQuery q, HashSet<string>? seriesFilter, QueryExecutionReport report)
+    {
+        var measurement = q.Measurement!;
+        HashSet<string> allowed;
+        if (seriesFilter != null) allowed = new HashSet<string>(seriesFilter, StringComparer.Ordinal);
+        else
+        {
+            var all = e.ListSeries(db, measurement);
+            if (all.Count == 0) return [new() { Name = ResolveResultMeasurementName(q), Columns = ["time"], Values = [] }];
+            allowed = new HashSet<string>(all, StringComparer.Ordinal);
+        }
+        if (allowed.Count == 0) return [new() { Name = ResolveResultMeasurementName(q), Columns = ["time"], Values = [] }];
+        var cachedPoints = new List<Point>(allowed.Count);
+        foreach (var tags in allowed)
+        {
+            if (!e.TryGetLastValue(db, rp, measurement, tags, out var pt))
+            {
+                var backfilled = BackfillLastValueCacheEntry(e, db, rp, measurement, tags, CancellationToken.None);
+                if (backfilled == null) return null;
+                pt = backfilled;
+            }
+            if (q.MinTimeNs.HasValue && pt.TimestampNs < q.MinTimeNs.Value) return null;
+            if (q.MaxTimeNs.HasValue && pt.TimestampNs > q.MaxTimeNs.Value) return null;
+            if (e.Tombstones.HasTombstones(db) && e.Tombstones.FilterDeleted(db, [pt]).Count == 0) return null;
+            cachedPoints.Add(pt);
+        }
+        var resultMeasurement = ResolveResultMeasurementName(q);
+        var requestedFields = (q.Select.Count == 1 && q.Select[0].Field == "*") ? null : new HashSet<string>(q.Select.Select(s => s.Field), StringComparer.Ordinal);
+        // Determine fields to expose in raw result
+        List<string> fields;
+        if (requestedFields == null)
+            fields = cachedPoints.SelectMany(p => p.Fields.Keys).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
+        else
+            fields = requestedFields.Order(StringComparer.Ordinal).ToList();
+        // GROUP BY handling for raw current value
+        if (q.GroupByTags.Count == 0 && !q.GroupByAllTags)
+        {
+            // global raw last — single most recent point among cached
+            var latest = cachedPoints.OrderByDescending(p => p.TimestampNs).FirstOrDefault();
+            if (latest == null) return [new() { Name = resultMeasurement, Columns = ["time"], Values = [] }];
+            // if multiple series share same max timestamp we pick latest by tag ordering to be deterministic
+            var cols = new List<string> { "time" };
+            // include tag keys in raw columns per InfluxQL raw descending path — we expose tags in series Tags, not columns for simplicity, but also include as column if query expects
+            // For SELECT * raw, columns are time + field keys; tags are in QuerySeries.Tags
+            cols.AddRange(fields);
+            var tagsDict = latest.Tags;
+            var row = new List<object?> { Time(latest.TimestampNs) };
+            foreach (var f in fields) row.Add(latest.Fields.TryGetValue(f, out var fv) ? fv.ToObject() : null);
+            return [new QuerySeries { Name = resultMeasurement, Tags = tagsDict.Count > 0 ? new Dictionary<string,string>(tagsDict, StringComparer.Ordinal) : null, Columns = cols, Values = [row] }];
+        }
+        var grouped = GroupPointsByTag(cachedPoints, q.GroupByTags, q.GroupByAllTags);
+        var result = new List<QuerySeries>(grouped.Count);
+        foreach (var kv in grouped)
+        {
+            var latest = kv.Value.OrderByDescending(p => p.TimestampNs).First();
+            var cols = new List<string> { "time" };
+            cols.AddRange(fields);
+            var row = new List<object?> { Time(latest.TimestampNs) };
+            foreach (var f in fields) row.Add(latest.Fields.TryGetValue(f, out var fv) ? fv.ToObject() : null);
+            result.Add(new QuerySeries { Name = resultMeasurement, Tags = kv.Key.Count > 0 ? kv.Key : null, Columns = cols, Values = [row] });
+        }
+        result.Sort((a, b) => string.Compare(string.Join(",", (a.Tags ?? new()).OrderBy(k => k.Key).Select(k => k.Key + "=" + k.Value)), string.Join(",", (b.Tags ?? new()).OrderBy(k => k.Key).Select(k => k.Key + "=" + k.Value)), StringComparison.Ordinal));
+        return result;
+    }
+
+    static Dictionary<Dictionary<string,string>, List<Point>> GroupPointsByTag(List<Point> points, List<string> groupByTags, bool groupByAllTags)
+    {
+        var groups = new Dictionary<string, (Dictionary<string,string> Tags, List<Point> Points)>(StringComparer.Ordinal);
+        foreach (var p in points)
+        {
+            Dictionary<string,string> keyTags;
+            string key;
+            if (groupByAllTags)
+            {
+                keyTags = new Dictionary<string,string>(p.Tags, StringComparer.Ordinal);
+                key = p.TagsCanonical ?? "";
+            }
+            else
+            {
+                keyTags = new Dictionary<string,string>(StringComparer.Ordinal);
+                foreach (var g in groupByTags)
+                    if (p.Tags.TryGetValue(g, out var v)) keyTags[g] = v;
+                key = string.Join(",", keyTags.OrderBy(k => k.Key, StringComparer.Ordinal).Select(k => k.Key + "=" + k.Value));
+            }
+            if (!groups.TryGetValue(key, out var entry))
+            {
+                entry = (keyTags, new List<Point>());
+                groups[key] = entry;
+            }
+            entry.Points.Add(p);
+        }
+        var res = new Dictionary<Dictionary<string,string>, List<Point>>(DictionaryComparer.Instance);
+        foreach (var kv in groups) res[kv.Value.Tags] = kv.Value.Points;
+        return res;
+    }
+
+    sealed class DictionaryComparer : IEqualityComparer<Dictionary<string,string>>
+    {
+        public static readonly DictionaryComparer Instance = new();
+        public bool Equals(Dictionary<string,string>? x, Dictionary<string,string>? y) => x == y || (x != null && y != null && x.Count == y.Count && x.OrderBy(k => k.Key).SequenceEqual(y.OrderBy(k => k.Key)));
+        public int GetHashCode(Dictionary<string,string> obj) { var h = 17; foreach (var kv in obj.OrderBy(k => k.Key)) { h = h * 31 + kv.Key.GetHashCode(); h = h * 31 + kv.Value.GetHashCode(); } return h; }
+    }
+
+    Point? BackfillLastValueCacheEntry(TsdbEngine e, string db, string rp, string measurement, string tagsCanonical, CancellationToken ct)
+    {
+        // footer-assisted backfill: read the single most recent point for this series from segments/buffer
+        // Use existing TryReadSeriesDescending limit 1 (buffer+segments, validated via footer maxTime)
+        var read = e.TryReadSeriesDescending(db, rp, measurement, tagsCanonical, null, null, null, 1, ct);
+        if (read != null && read.Points.Count > 0)
+        {
+            var pt = read.Points[0];
+            e.LastValueCache.Update(db, rp, pt);
+            return pt;
+        }
+        // also try buffered alone
+        var buf = e.TryReadBufferedSeriesDescending(db, rp, measurement, tagsCanonical, null, null, null, 1, ct);
+        if (buf != null && buf.Points.Count > 0)
+        {
+            var pt = buf.Points[0];
+            e.LastValueCache.Update(db, rp, pt);
+            return pt;
+        }
+        return null;
     }
 
     List<QuerySeries> SelectFunctions(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken, string resultMeasurement)

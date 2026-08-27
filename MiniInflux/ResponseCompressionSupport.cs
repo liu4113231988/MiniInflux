@@ -18,7 +18,8 @@ public static class ResponseCompressionSupport
         "/metrics",
         "/debug/stats",
         "/debug/benchmark",
-        "/admin/api"
+        "/admin/api",
+        "/api/v3/query_influxql"
     ];
 
     /// <summary>

@@ -76,6 +76,8 @@ if (tlsConfigurationMissing)
     options.Tls.Enabled = false;
 
 var authenticationGuard = new AuthenticationGuard(options.Auth);
+var tokenStore = new TokenStore(options.DataPath);
+authenticationGuard.SetTokenStore(tokenStore);
 
 if (options.Tls.Enabled)
 {
@@ -121,6 +123,8 @@ builder.Services.AddSingleton(new QueryExecutor(
     options.Storage.MaxQueryDurationMs,
     options.Storage.MaxQueryMemoryBytes));
 builder.Services.AddSingleton(options);
+builder.Services.AddSingleton(tokenStore);
+builder.Services.AddSingleton(authenticationGuard);
 builder.Services.AddSingleton(new MetricsCollector(engine, writeQueue));
 builder.Services.AddSingleton(new AccessLogWriter(options.Http.AccessLogPath));
 builder.Services.AddSingleton<ContinuousQueryRunner>();
@@ -176,18 +180,35 @@ if (options.Http.LogEnabled)
 
 // ponytail: opt-in gzip response compression for JSON/text endpoints. Decided by path up front so
 // streaming chunked queries are wrapped transparently; the gzip stream writes its header lazily,
-// so empty bodies stay empty. Disposal in finally flushes the gzip trailer.
+// so empty bodies stay empty. The response body is routed through the gzip stream and restored
+// before disposal so the trailer flushes into the raw body. Disposal in finally flushes the
+// gzip trailer.
 app.Use(async (context, next) =>
 {
     var gzip = ResponseCompressionSupport.TryWrap(context.Request, context.Response);
+    if (gzip is null)
+    {
+        await next();
+        return;
+    }
+
+    // Endpoints like Results.Bytes set Content-Length for the *uncompressed* payload after this
+    // middleware runs; the compressed length is unknown, so clear it right before headers flush.
+    context.Response.OnStarting(() =>
+    {
+        context.Response.Headers.ContentLength = null;
+        return Task.CompletedTask;
+    });
+    var originalBody = context.Response.Body;
+    context.Response.Body = gzip;
     try
     {
         await next();
     }
     finally
     {
-        if (gzip != null)
-            await gzip.DisposeAsync();
+        context.Response.Body = originalBody;
+        await gzip.DisposeAsync();
     }
 });
 
@@ -260,74 +281,23 @@ app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
     return Results.Text(text, "text/plain; version=0.0.4; charset=utf-8");
 });
 
-app.MapPost("/write", async (HttpRequest request, WriteQueue writeQueue, MetricsCollector metrics, string db, string? rp, string? precision) =>
+app.MapPost("/write", (HttpRequest request, WriteQueue writeQueue, MetricsCollector metrics, string? db, string? rp, string? precision) =>
 {
-    if (string.IsNullOrWhiteSpace(db)) return Results.BadRequest(new ErrorResponse("missing required parameter db"));
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
-        return authResult;
-    if (request.ContentLength > options.Write.MaxRequestBodyBytes)
-        return Results.StatusCode(413);
+    if (string.IsNullOrWhiteSpace(db))
+        return Task.FromResult<IResult>(Results.BadRequest(new ErrorResponse("missing required parameter db")));
+    return WritePointsAsync(request, db, rp, precision, writeQueue, metrics);
+});
 
-    // Read the body as raw UTF-8 bytes and parse directly from them: no whole-payload
-    // UTF-8 → UTF-16 transcode (the request cap is 25MB, so that string alone was 50MB LOH).
-    byte[] bodyBuffer;
-    int bodyLength;
-    try
-    {
-        (bodyBuffer, bodyLength) = await ReadRequestBodyBytesAsync(request, options.Write.MaxRequestBodyBytes, request.HttpContext.RequestAborted);
-    }
-    catch (RequestBodyTooLargeException)
-    {
-        return Results.StatusCode(413);
-    }
-    var body = bodyBuffer.AsSpan(0, bodyLength);
-    if (bodyLength == 0 || body.IndexOfAnyExcept(" \t\r\n\v\f"u8) < 0)
-        return Results.NoContent();
-    if (options.Http.WriteTracing)
-        runtimeLogger.LogDebug("write trace db={Db} rp={Rp} precision={Precision} body={Body}", db, rp ?? "autogen", precision ?? "ns", Encoding.UTF8.GetString(body));
-
-    try
-    {
-        var points = LineProtocolParser.ParseMany(body, TimestampPrecision.Parse(precision));
-        if (points.Count == 0) return Results.NoContent();
-        try
-        {
-            await writeQueue.EnqueueAsync(db, rp ?? "autogen", points, request.HttpContext.RequestAborted);
-            metrics.RecordWrite(points.Count);
-            runtimeLogger.LogDebug("write accepted db={Db} rp={Rp} points={PointCount}", db, rp ?? "autogen", points.Count);
-            return Results.NoContent();
-        }
-        catch (FieldConflictException ex)
-        {
-            runtimeLogger.LogWarning(ex, "write rejected by field conflict db={Db} rp={Rp}", db, rp ?? "autogen");
-            return Results.BadRequest(new ErrorResponse(ex.Message));
-        }
-        catch (CardinalityLimitExceededException)
-        {
-            runtimeLogger.LogWarning("write rejected by cardinality limit db={Db} rp={Rp}", db, rp ?? "autogen");
-            return Results.StatusCode(429);
-        }
-        catch (MemoryLimitExceededException)
-        {
-            runtimeLogger.LogWarning("write rejected by memory limit db={Db} rp={Rp}", db, rp ?? "autogen");
-            return Results.StatusCode(429);
-        }
-        catch (WriteQueueFullException)
-        {
-            runtimeLogger.LogWarning("write rejected by queue pressure db={Db} rp={Rp}", db, rp ?? "autogen");
-            return Results.StatusCode(429);
-        }
-        catch (IOException ex)
-        {
-            runtimeLogger.LogError(ex, "write rejected because storage is unavailable db={Db} rp={Rp}", db, rp ?? "autogen");
-            return Results.StatusCode(503);
-        }
-    }
-    catch (Exception ex)
-    {
-        runtimeLogger.LogWarning(ex, "write parse failure db={Db} rp={Rp}", db, rp ?? "autogen");
-        return Results.BadRequest(new ErrorResponse(ex.Message));
-    }
+// InfluxDB 2.x compatible write endpoint: Telegraf and the v2/v3 client libraries target this
+// route by default. `bucket` maps to the database (or `db/rp`); `org` is accepted and ignored
+// for compatibility. Error bodies use the v2 `{"code","message"}` shape so stock v2 clients
+// surface the message correctly; status codes mirror InfluxDB v2 (400/413/429/503).
+app.MapPost("/api/v2/write", (HttpRequest request, WriteQueue writeQueue, MetricsCollector metrics, string? bucket, string? org, string? precision) =>
+{
+    _ = org; // accepted and ignored per InfluxDB 2.x spec (required param but no org model)
+    if (!V2WriteSupport.TryResolveBucket(bucket, out var db, out var rp, out var error))
+        return Task.FromResult<IResult>(Results.Json(new V2ErrorResponse("invalid", error), AppJsonContext.Default.V2ErrorResponse, statusCode: 400));
+    return WritePointsAsync(request, db, rp, precision, writeQueue, metrics, isV2: true);
 });
 
 app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics, string? db, string? q) =>
@@ -354,18 +324,31 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
 
+    // P3 参数化查询：v1 `?params={"host":"a"}`（或 form 字段）中的 `$name` 占位符由
+    // 执行器在解析树级别绑定——值不回拼 SQL 文本（无注入面），模板解析可跨参数值复用
+    Dictionary<string, JsonElement>? queryParams = null;
+    {
+        var paramsJson = request.Query["params"].ToString();
+        if (string.IsNullOrWhiteSpace(paramsJson) && request.HasFormContentType)
+        {
+            try { paramsJson = (await request.ReadFormAsync())["params"].ToString(); } catch { }
+        }
+        if (!string.IsNullOrWhiteSpace(paramsJson) && QueryParamBinder.TryParseParamsJson(paramsJson, out var parsedParams))
+            queryParams = parsedParams;
+    }
+
     if (options.Data.QueryLogEnabled)
         runtimeLogger.LogInformation("query db={Db} text={Query}", db ?? "-", q);
 
     if (chunked)
     {
-        var chunkOutcome = executor.ExecuteChunkedWithReport(tsdbEngine, db, q, chunkSize ?? 5000, request.HttpContext.RequestAborted);
+        var chunkOutcome = executor.ExecuteChunkedWithReport(tsdbEngine, db, q, chunkSize ?? 5000, request.HttpContext.RequestAborted, queryParams);
         return ChunkedResult(chunkOutcome, metrics, runtimeLogger, db);
     }
 
     if (!debug)
     {
-        var rawJsonOutcome = executor.TryExecuteBufferedRawDescendingJson(tsdbEngine, db, q, epoch, request.HttpContext.RequestAborted);
+        var rawJsonOutcome = executor.TryExecuteBufferedRawDescendingJson(tsdbEngine, db, q, epoch, request.HttpContext.RequestAborted, queryParams);
         if (rawJsonOutcome != null)
         {
             metrics.RecordQuery(rawJsonOutcome.Report);
@@ -374,11 +357,70 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
         }
     }
 
-    var outcome = executor.ExecuteWithReport(tsdbEngine, db, q, request.HttpContext.RequestAborted);
+    var outcome = executor.ExecuteWithReport(tsdbEngine, db, q, request.HttpContext.RequestAborted, queryParams);
     metrics.RecordQuery(outcome.Report);
     LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
     if (debug)
         return Results.Json(new QueryDebugResponse { Response = outcome.Response, Report = outcome.Report }, AppJsonContext.Default.QueryDebugResponse);
+    return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
+});
+
+// P2 v3 查询端点：POST /api/v3/query_influxql JSON {db, q, params?, format?, epoch?}。
+// `db`/`q` 必填（对齐 InfluxDB 3 规范）；params 走解析树级绑定；默认 format=json 返回
+// v3 的 v1 风格 {"results":[...]} 信封，执行错误（非超时/取消）以 400 + {"error"} 返回
+app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+    V3QueryRequest? body = null;
+    if (request.ContentLength > 0 && request.ContentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true)
+    {
+        try { body = await ReadJsonAsync(request, AppJsonContext.Default.V3QueryRequest); } catch { }
+    }
+    var db = body?.Db ?? body?.Database ?? request.Query["db"].ToString();
+    if (string.IsNullOrWhiteSpace(db)) db = request.Query["database"].ToString();
+    var q = body?.Q ?? body?.Query ?? request.Query["q"].ToString();
+    if (string.IsNullOrWhiteSpace(q)) q = request.Query["query"].ToString();
+    if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
+    {
+        var form = await request.ReadFormAsync();
+        q = form["q"].ToString();
+        if (string.IsNullOrWhiteSpace(q)) q = form["query"].ToString();
+        if (string.IsNullOrWhiteSpace(db)) db = form["db"].ToString();
+        if (string.IsNullOrWhiteSpace(db)) db = form["database"].ToString();
+    }
+    if (string.IsNullOrWhiteSpace(q))
+        return Results.BadRequest(new ErrorResponse("missing required parameter q"));
+    if (string.IsNullOrWhiteSpace(db))
+        return Results.BadRequest(new ErrorResponse("missing required parameter db"));
+
+    var format = body?.Format ?? request.Query["format"].ToString();
+    if (string.IsNullOrWhiteSpace(format)) format = "json";
+    if (!string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+        return Results.BadRequest(new ErrorResponse($"unsupported format: {format} (supported: json)"));
+
+    var epoch = body?.Epoch ?? request.Query["epoch"].ToString();
+    Dictionary<string, JsonElement>? queryParams = null;
+    if (body?.Params is { Count: > 0 })
+        queryParams = body.Params;
+    else
+    {
+        var paramsJson = request.Query["params"].ToString();
+        if (string.IsNullOrWhiteSpace(paramsJson) && request.HasFormContentType)
+        {
+            try { paramsJson = (await request.ReadFormAsync())["params"].ToString(); } catch { }
+        }
+        if (!string.IsNullOrWhiteSpace(paramsJson) && QueryParamBinder.TryParseParamsJson(paramsJson, out var parsedParams))
+            queryParams = parsedParams;
+    }
+
+    if (options.Data.QueryLogEnabled)
+        runtimeLogger.LogInformation("v3 query db={Db} text={Query}", db, q);
+    var outcome = executor.ExecuteWithReport(tsdbEngine, db, q, request.HttpContext.RequestAborted, queryParams);
+    metrics.RecordQuery(outcome.Report);
+    LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
+    if (outcome.Report.Error is not null && !outcome.Report.TimedOut && !outcome.Report.Canceled)
+        return Results.Json(new ErrorResponse(outcome.Report.Error), AppJsonContext.Default.ErrorResponse, statusCode: 400);
     return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
 });
 
@@ -674,6 +716,43 @@ adminApi.MapPost("/maintenance/cq/run", async (HttpRequest request, ContinuousQu
     }, AppJsonContext.Default.MaintenanceResult);
 });
 
+// P2 Token 认证体系（等权 token）：创建 / 列出 / 吊销，与 Basic 并存
+adminApi.MapGet("/tokens", (HttpRequest request) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+    var list = tokenStore.List().Select(t => new TokenResponse(t.Id, t.Name, null, t.Prefix, t.CreatedAtNs)).ToList();
+    return Results.Json(list, AppJsonContext.Default.ListTokenResponse);
+});
+
+adminApi.MapPost("/tokens", async (HttpRequest request) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+    var body = await ReadJsonAsync(request, AppJsonContext.Default.CreateTokenRequest);
+    if (body == null || string.IsNullOrWhiteSpace(body.Name))
+        return Results.BadRequest(new ErrorResponse("missing required field 'name'"));
+    try
+    {
+        var (rec, raw) = tokenStore.Create(body.Name);
+        runtimeLogger.LogInformation("token created id={Id} name={Name} prefix={Prefix}", rec.Id, rec.Name, rec.Prefix);
+        return Results.Json(new TokenResponse(rec.Id, rec.Name, raw, rec.Prefix, rec.CreatedAtNs), AppJsonContext.Default.TokenResponse, statusCode: 201);
+    }
+    catch (ArgumentException ex) { return Results.BadRequest(new ErrorResponse(ex.Message)); }
+    catch (InvalidOperationException ex) { return Results.Json(new ErrorResponse(ex.Message), AppJsonContext.Default.ErrorResponse, statusCode: 409); }
+});
+
+adminApi.MapDelete("/tokens/{id}", (HttpRequest request, string id) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+    if (string.IsNullOrWhiteSpace(id)) return Results.BadRequest(new ErrorResponse("missing token id"));
+    var ok = tokenStore.Revoke(id);
+    if (!ok) return Results.NotFound(new ErrorResponse("token not found"));
+    runtimeLogger.LogInformation("token revoked id={Id}", id);
+    return Results.Json(new AdminMessage("token revoked"), AppJsonContext.Default.AdminMessage);
+});
+
 app.MapGet("/admin", () => EmbeddedFile(staticAssets, "admin/index.html", "text/html; charset=utf-8"));
 
 app.MapGet("/admin/assets/{**assetPath}", (string? assetPath, HttpResponse response) =>
@@ -730,7 +809,7 @@ app.Lifetime.ApplicationStopped.Register(() =>
 
 app.Run();
 
-static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, AuthenticationGuard authenticationGuard, ILogger logger, out IResult result)
+static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, AuthenticationGuard authenticationGuard, ILogger logger, out IResult result, bool v2ErrorFormat = false)
 {
     if (AuthorizationSupport.IsAuthorized(request, options.Auth, authenticationGuard, out var attempt))
     {
@@ -744,11 +823,16 @@ static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, Aut
     if (failedAttempt.IsRateLimited)
     {
         ApplyRetryAfterHeader(request.HttpContext.Response, failedAttempt);
-        result = Results.Json(new ErrorResponse(BuildRateLimitMessage(failedAttempt)), AppJsonContext.Default.ErrorResponse, statusCode: 429);
+        var message = BuildRateLimitMessage(failedAttempt);
+        result = v2ErrorFormat
+            ? Results.Json(new V2ErrorResponse("too many requests", message), AppJsonContext.Default.V2ErrorResponse, statusCode: 429)
+            : Results.Json(new ErrorResponse(message), AppJsonContext.Default.ErrorResponse, statusCode: 429);
         return false;
     }
 
-    result = Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
+    result = v2ErrorFormat
+        ? Results.Json(new V2ErrorResponse("unauthorized", "unauthorized"), AppJsonContext.Default.V2ErrorResponse, statusCode: 401)
+        : Results.Json(new ErrorResponse("unauthorized"), AppJsonContext.Default.ErrorResponse, statusCode: 401);
     return false;
 }
 
@@ -1060,6 +1144,97 @@ static bool TryParseBool(string? value) =>
     && parsed;
 
 /// <summary>
+/// Shared line-protocol write pipeline for the v1 (/write) and v2 (/api/v2/write) endpoints:
+/// auth, body-size enforcement, UTF-8 parsing, enqueue, and the InfluxDB-compatible error
+/// mapping (400 parse/conflict, 429 limits/pressure, 413 too large, 503 storage unavailable).
+/// When <paramref name="isV2"/> is true, error bodies use the v2 `{"code","message"}` shape.
+/// </summary>
+async Task<IResult> WritePointsAsync(HttpRequest request, string db, string? rp, string? precision, WriteQueue writeQueue, MetricsCollector metrics, bool isV2 = false)
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, v2ErrorFormat: isV2))
+        return authResult;
+    if (request.ContentLength > options.Write.MaxRequestBodyBytes)
+        return isV2
+            ? Results.Json(new V2ErrorResponse("too large", "request body too large"), AppJsonContext.Default.V2ErrorResponse, statusCode: 413)
+            : Results.StatusCode(413);
+
+    // Read the body as raw UTF-8 bytes and parse directly from them: no whole-payload
+    // UTF-8 → UTF-16 transcode (the request cap is 25MB, so that string alone was 50MB LOH).
+    byte[] bodyBuffer;
+    int bodyLength;
+    try
+    {
+        (bodyBuffer, bodyLength) = await ReadRequestBodyBytesAsync(request, options.Write.MaxRequestBodyBytes, request.HttpContext.RequestAborted);
+    }
+    catch (RequestBodyTooLargeException)
+    {
+        return isV2
+            ? Results.Json(new V2ErrorResponse("too large", "request body too large"), AppJsonContext.Default.V2ErrorResponse, statusCode: 413)
+            : Results.StatusCode(413);
+    }
+    var body = bodyBuffer.AsSpan(0, bodyLength);
+    if (bodyLength == 0 || body.IndexOfAnyExcept(" \t\r\n\v\f"u8) < 0)
+        return Results.NoContent();
+    if (options.Http.WriteTracing)
+        runtimeLogger.LogDebug("write trace db={Db} rp={Rp} precision={Precision} body={Body}", db, rp ?? "autogen", precision ?? "ns", Encoding.UTF8.GetString(body));
+
+    try
+    {
+        var points = LineProtocolParser.ParseMany(body, TimestampPrecision.Parse(precision));
+        if (points.Count == 0) return Results.NoContent();
+        try
+        {
+            await writeQueue.EnqueueAsync(db, rp ?? "autogen", points, request.HttpContext.RequestAborted);
+            metrics.RecordWrite(points.Count);
+            runtimeLogger.LogDebug("write accepted db={Db} rp={Rp} points={PointCount}", db, rp ?? "autogen", points.Count);
+            return Results.NoContent();
+        }
+        catch (FieldConflictException ex)
+        {
+            runtimeLogger.LogWarning(ex, "write rejected by field conflict db={Db} rp={Rp}", db, rp ?? "autogen");
+            return isV2
+                ? Results.Json(new V2ErrorResponse("invalid", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 400)
+                : Results.BadRequest(new ErrorResponse(ex.Message));
+        }
+        catch (CardinalityLimitExceededException ex)
+        {
+            runtimeLogger.LogWarning("write rejected by cardinality limit db={Db} rp={Rp}", db, rp ?? "autogen");
+            return isV2
+                ? Results.Json(new V2ErrorResponse("too many requests", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 429)
+                : Results.StatusCode(429);
+        }
+        catch (MemoryLimitExceededException ex)
+        {
+            runtimeLogger.LogWarning("write rejected by memory limit db={Db} rp={Rp}", db, rp ?? "autogen");
+            return isV2
+                ? Results.Json(new V2ErrorResponse("too many requests", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 429)
+                : Results.StatusCode(429);
+        }
+        catch (WriteQueueFullException ex)
+        {
+            runtimeLogger.LogWarning("write rejected by queue pressure db={Db} rp={Rp}", db, rp ?? "autogen");
+            return isV2
+                ? Results.Json(new V2ErrorResponse("too many requests", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 429)
+                : Results.StatusCode(429);
+        }
+        catch (IOException ex)
+        {
+            runtimeLogger.LogError(ex, "write rejected because storage is unavailable db={Db} rp={Rp}", db, rp ?? "autogen");
+            return isV2
+                ? Results.Json(new V2ErrorResponse("unavailable", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 503)
+                : Results.StatusCode(503);
+        }
+    }
+    catch (Exception ex)
+    {
+        runtimeLogger.LogWarning(ex, "write parse failure db={Db} rp={Rp}", db, rp ?? "autogen");
+        return isV2
+            ? Results.Json(new V2ErrorResponse("invalid", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 400)
+            : Results.BadRequest(new ErrorResponse(ex.Message));
+    }
+}
+
+/// <summary>
 /// Read the (optionally gzip-compressed) request body into a single byte buffer, enforcing the
 /// configured size cap on the *decompressed* bytes so gzip bombs can't expand past the limit.
 /// Returns the backing buffer plus the actual length (avoids a final ToArray copy).
@@ -1131,7 +1306,23 @@ static IResult EmbeddedFile(Dictionary<string, string> staticAssets, string path
 }
 
 public sealed record ErrorResponse([property: System.Text.Json.Serialization.JsonPropertyName("error")] string Error);
+public sealed record V2ErrorResponse([property: System.Text.Json.Serialization.JsonPropertyName("code")] string Code, [property: System.Text.Json.Serialization.JsonPropertyName("message")] string Message);
 public sealed record AdminMessage([property: System.Text.Json.Serialization.JsonPropertyName("message")] string Message);
+public sealed record CreateTokenRequest([property: System.Text.Json.Serialization.JsonPropertyName("name")] string Name);
+public sealed record TokenResponse(
+    [property: System.Text.Json.Serialization.JsonPropertyName("id")] string Id,
+    [property: System.Text.Json.Serialization.JsonPropertyName("name")] string Name,
+    [property: System.Text.Json.Serialization.JsonPropertyName("token")] string? Token,
+    [property: System.Text.Json.Serialization.JsonPropertyName("prefix")] string Prefix,
+    [property: System.Text.Json.Serialization.JsonPropertyName("createdAtNs")] long CreatedAtNs);
+public sealed record V3QueryRequest(
+    [property: System.Text.Json.Serialization.JsonPropertyName("db")] string? Db,
+    [property: System.Text.Json.Serialization.JsonPropertyName("database")] string? Database,
+    [property: System.Text.Json.Serialization.JsonPropertyName("q")] string? Q,
+    [property: System.Text.Json.Serialization.JsonPropertyName("query")] string? Query,
+    [property: System.Text.Json.Serialization.JsonPropertyName("params")] Dictionary<string, System.Text.Json.JsonElement>? Params,
+    [property: System.Text.Json.Serialization.JsonPropertyName("epoch")] string? Epoch,
+    [property: System.Text.Json.Serialization.JsonPropertyName("format")] string? Format);
 public sealed record BenchmarkSnapshot(int DatabaseCount, long BufferedPoints, long BufferedBytes, double MetadataScanMs);
 public sealed record HealthResponse(string Message, string Status, long StorageFailures, string? LastFailureComponent, DateTimeOffset? LastFailureUtc)
 {
