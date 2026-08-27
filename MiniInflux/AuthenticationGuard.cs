@@ -32,6 +32,7 @@ public sealed class AuthenticationGuard
     private readonly ConcurrentDictionary<string, ClientFailureState> _clientFailures = new(StringComparer.Ordinal);
     private readonly TimeSpan _failureWindow;
     private readonly TimeSpan _lockoutDuration;
+    private MiniInflux.Net10.Storage.TokenStore? _tokenStore;
 
     public AuthenticationGuard(AuthOptions options, TimeProvider? timeProvider = null)
     {
@@ -40,6 +41,9 @@ public sealed class AuthenticationGuard
         _failureWindow = TimeSpan.FromMilliseconds(Math.Max(1000, options.FailureWindowMs));
         _lockoutDuration = TimeSpan.FromMilliseconds(Math.Max(0, options.LockoutMs));
     }
+
+    /// <summary>P2 等权 token 注入，用于 Bearer/Token 校验与 Basic 并存.</summary>
+    public void SetTokenStore(MiniInflux.Net10.Storage.TokenStore tokenStore) => _tokenStore = tokenStore;
 
     public AuthenticationAttempt Evaluate(HttpRequest request)
     {
@@ -77,7 +81,10 @@ public sealed class AuthenticationGuard
             if (state.FailureCount > 0 && now - state.WindowStartedUtc >= _failureWindow)
                 state.Reset();
 
-            if (CredentialsMatch(userName, password))
+            var credentialsOk = source == "token"
+                ? TokenMatches(password ?? "")
+                : CredentialsMatch(userName, password);
+            if (credentialsOk)
             {
                 state.Reset();
                 return new AuthenticationAttempt
@@ -146,6 +153,28 @@ public sealed class AuthenticationGuard
             && CryptographicOperations.FixedTimeEquals(expectedPassword, actualPassword);
     }
 
+    /// <summary>
+    /// InfluxDB 2.x/3.x clients send `Authorization: Token xxx` (or `Bearer xxx`) instead of
+    /// Basic auth. P2 等权 token 与超管密码并存：先查 TokenStore（多命名 token），再回退到密码/组合形式。
+    /// </summary>
+    private bool TokenMatches(string token)
+    {
+        if (string.IsNullOrEmpty(token))
+            return false;
+
+        // P2: named equal-weight tokens
+        if (_tokenStore != null && _tokenStore.Validate(token) != null)
+            return true;
+
+        var expected = Encoding.UTF8.GetBytes(_options.Password);
+        var actual = Encoding.UTF8.GetBytes(token);
+        if (expected.Length == actual.Length && CryptographicOperations.FixedTimeEquals(expected, actual))
+            return true;
+
+        var combined = Encoding.UTF8.GetBytes($"{_options.Username}:{_options.Password}");
+        return combined.Length == actual.Length && CryptographicOperations.FixedTimeEquals(combined, actual);
+    }
+
     private bool RateLimitEnabled =>
         _options.MaxFailedAttempts > 0
         && _failureWindow > TimeSpan.Zero
@@ -174,6 +203,16 @@ public sealed class AuthenticationGuard
             }
 
             return (null, null, "basic");
+        }
+
+        // InfluxDB 2.x clients use `Authorization: Token xxx`; 3.x uses `Bearer xxx`.
+        foreach (var scheme in new[] { "Token ", "Bearer " })
+        {
+            if (authorization.StartsWith(scheme, StringComparison.OrdinalIgnoreCase))
+            {
+                var token = authorization[scheme.Length..].Trim();
+                return (null, token, "token");
+            }
         }
 
         return (null, null, "none");

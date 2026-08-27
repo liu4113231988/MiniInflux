@@ -95,6 +95,30 @@ public sealed class AuthenticationGuardTests
         Assert.Equal(AuthenticationAttemptStatus.MissingCredentials, guard.Evaluate(context.Request).Status);
     }
 
+    [Fact]
+    public void AuthenticationGuard_AcceptsTokenAndBearerSchemes()
+    {
+        var guard = new AuthenticationGuard(new AuthOptions { Username = "admin", Password = "secret" });
+
+        Assert.Equal(AuthenticationAttemptStatus.Success,
+            guard.Evaluate(CreateTokenRequest("127.0.0.1", "Token", "secret")).Status);
+        Assert.Equal(AuthenticationAttemptStatus.Success,
+            guard.Evaluate(CreateTokenRequest("127.0.0.1", "Bearer", "secret")).Status);
+        // Combined "username:password" form is also accepted.
+        Assert.Equal(AuthenticationAttemptStatus.Success,
+            guard.Evaluate(CreateTokenRequest("127.0.0.1", "Token", "admin:secret")).Status);
+        Assert.Equal(AuthenticationAttemptStatus.InvalidCredentials,
+            guard.Evaluate(CreateTokenRequest("127.0.0.1", "Token", "wrong")).Status);
+    }
+
+    private static HttpRequest CreateTokenRequest(string ip, string scheme, string token)
+    {
+        var context = new DefaultHttpContext();
+        context.Connection.RemoteIpAddress = IPAddress.Parse(ip);
+        context.Request.Headers.Authorization = $"{scheme} {token}";
+        return context.Request;
+    }
+
     private static HttpRequest CreateRequest(string ip, string? user = null, string? password = null)
     {
         var context = new DefaultHttpContext();
