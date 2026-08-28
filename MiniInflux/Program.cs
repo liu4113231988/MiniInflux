@@ -461,6 +461,40 @@ app.MapPost("/admin/api/query", async (HttpRequest request, QueryExecutor execut
     return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
 });
 
+// Management commands used by the admin UI. This is deliberately separate from
+// /admin/api/query so the interactive query console stays read-only.
+app.MapPost("/admin/api/command", async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics, string? db, string? q) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+        return authResult;
+
+    if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
+    {
+        var form = await request.ReadFormAsync();
+        q = form["q"];
+        db ??= form["db"];
+    }
+    if (string.IsNullOrWhiteSpace(q))
+        return Results.BadRequest(new ErrorResponse("missing required parameter q"));
+
+    ParsedQuery parsed;
+    try
+    {
+        parsed = InfluxQlParser.Parse(q);
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ErrorResponse($"parse error: {ex.Message}"));
+    }
+    if (!AdminCommandSupport.IsAllowed(parsed.Kind))
+        return Results.BadRequest(new ErrorResponse($"statement type '{parsed.Kind}' is not allowed by the admin management API"));
+
+    var outcome = executor.ExecuteWithReport(tsdbEngine, db, q, request.HttpContext.RequestAborted);
+    metrics.RecordQuery(outcome.Report);
+    LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
+    return QueryResponseResult(outcome.Response, 0);
+});
+
 app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string path) =>
 {
         if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))

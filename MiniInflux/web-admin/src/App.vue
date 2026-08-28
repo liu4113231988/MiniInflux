@@ -39,9 +39,13 @@ const shardsInfo = ref([])
 const cacheStats = ref(null)
 const queryDb = ref('')
 const queryText = ref('')
-const queryLimit = ref(1000)
 const queryResult = ref(null)
 const queryError = ref('')
+const queryPage = ref(1)
+const queryPageSize = ref(100)
+const queryPagingEnabled = ref(false)
+const queryHasNextPage = ref(false)
+const queryBaseStatement = ref('')
 
 const signedIn = computed(() =>
   !session.value.requiresAuthentication
@@ -218,11 +222,19 @@ async function execAdminQuery(q) {
   })
 }
 
+async function execAdminCommand(q) {
+  return api('/admin/api/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ q }).toString()
+  })
+}
+
 async function createDatabase() {
   if (!newDbName.value.trim()) { error.value = '请输入数据库名'; return }
   busy.value = true; error.value=''; notice.value=''
   try {
-    await execAdminQuery(`CREATE DATABASE "${newDbName.value.trim()}"`)
+    await execAdminCommand(`CREATE DATABASE "${newDbName.value.trim()}"`)
     newDbName.value = ''
     await Promise.all([loadOverview(), loadDatabases()])
     notice.value = '数据库已创建'
@@ -233,7 +245,7 @@ async function dropDatabase(name) {
   if (!confirm(`确认删除数据库 ${name}？数据将不可恢复`)) return
   busy.value = true; error.value=''; notice.value=''
   try {
-    await execAdminQuery(`DROP DATABASE "${name}"`)
+    await execAdminCommand(`DROP DATABASE "${name}"`)
     await Promise.all([loadOverview(), loadDatabases()])
     notice.value = `数据库 ${name} 已删除`
   } catch (ex) { error.value = ex.message } finally { busy.value = false }
@@ -246,6 +258,13 @@ async function loadShards() {
   shardsInfo.value = rows.map(r => Object.fromEntries(cols.map((c,i) => [c, r[i]])))
 }
 
+async function loadCacheStats() {
+  busy.value = true; error.value = ''
+  try {
+    cacheStats.value = await api('/admin/api/maintenance/cache-stats')
+  } catch (ex) { error.value = ex.message } finally { busy.value = false }
+}
+
 async function createRp() {
   if (!newRp.value.db || !newRp.value.name) { error.value = '请选择数据库并输入 RP 名称'; return }
   const dur = newRp.value.duration?.trim() || '7d'
@@ -253,10 +272,34 @@ async function createRp() {
   const q = `CREATE RETENTION POLICY "${newRp.value.name}" ON "${newRp.value.db}" DURATION ${dur} REPLICATION 1${def}`
   busy.value = true; error.value=''; notice.value=''
   try {
-    await execAdminQuery(q)
+    await execAdminCommand(q)
     newRp.value.name = ''; newRp.value.duration='7d'; newRp.value.isDefault=false
     await loadDatabases()
     notice.value = 'Retention Policy 已创建'
+  } catch (ex) { error.value = ex.message } finally { busy.value = false }
+}
+
+async function createCq() {
+  if (!newCq.value.db || !newCq.value.name.trim() || !newCq.value.text.trim()) {
+    error.value = '请选择数据库，并输入 CQ 名称和完整查询'
+    return
+  }
+  busy.value = true; error.value = ''; notice.value = ''
+  try {
+    await execAdminCommand(`CREATE CONTINUOUS QUERY "${newCq.value.name.trim()}" ON "${newCq.value.db}" BEGIN ${newCq.value.text.trim()} END`)
+    newCq.value.name = ''; newCq.value.text = ''
+    await loadQueries()
+    notice.value = 'Continuous Query 已创建'
+  } catch (ex) { error.value = ex.message } finally { busy.value = false }
+}
+
+async function dropCq(database, name) {
+  if (!confirm(`确认删除 Continuous Query ${name}？`)) return
+  busy.value = true; error.value = ''; notice.value = ''
+  try {
+    await execAdminCommand(`DROP CONTINUOUS QUERY "${name}" ON "${database}"`)
+    await loadQueries()
+    notice.value = `Continuous Query ${name} 已删除`
   } catch (ex) { error.value = ex.message } finally { busy.value = false }
 }
 
@@ -275,19 +318,18 @@ const querySeriesList = computed(() => {
   return series
 })
 
-async function runQuery() {
-  queryError.value = ''
-  queryResult.value = null
-  if (!queryText.value.trim()) {
-    queryError.value = '请输入查询语句'
-    return
-  }
+const queryPageRows = computed(() => Array.isArray(querySeriesList.value)
+  ? querySeriesList.value.reduce((total, series) => total + (series.values?.length || 0), 0)
+  : 0)
+
+async function loadQueryPage(page) {
   busy.value = true
+  queryError.value = ''
   try {
-    let statement = queryText.value.trim().replace(/;+\s*$/, '')
-    if (/^select\b/i.test(statement) && !/\blimit\b/i.test(statement) && queryLimit.value > 0) {
-      statement = `${statement} LIMIT ${Math.max(1, Math.min(100000, Number(queryLimit.value) || 1000))}`
-    }
+    const pageSize = Math.max(1, Math.min(500, Number(queryPageSize.value) || 100))
+    const statement = queryPagingEnabled.value
+      ? `${queryBaseStatement.value} LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`
+      : queryBaseStatement.value
     queryResult.value = await api('/admin/api/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -296,11 +338,34 @@ async function runQuery() {
         ...(queryDb.value ? { db: queryDb.value } : {})
       }).toString()
     })
+    queryPage.value = page
+    // InfluxQL applies LIMIT/OFFSET during execution. A full page means another page may exist;
+    // selecting it issues a fresh server query instead of retaining the prior pages in the browser.
+    queryHasNextPage.value = queryPagingEnabled.value && queryPageRows.value >= pageSize
   } catch (ex) {
     queryError.value = ex.message
   } finally {
     busy.value = false
   }
+}
+
+async function runQuery() {
+  queryResult.value = null
+  queryPage.value = 1
+  queryHasNextPage.value = false
+  if (!queryText.value.trim()) {
+    queryError.value = '请输入查询语句'
+    return
+  }
+  queryBaseStatement.value = queryText.value.trim().replace(/;+\s*$/, '')
+  queryPagingEnabled.value = /^select\b/i.test(queryBaseStatement.value)
+    && !/\b(?:limit|offset)\b/i.test(queryBaseStatement.value)
+  await loadQueryPage(1)
+}
+
+async function changeQueryPage(page) {
+  if (!queryPagingEnabled.value || page < 1 || busy.value) return
+  await loadQueryPage(page)
 }
 
 function exportQueryCsv() {
@@ -526,7 +591,6 @@ onMounted(async () => {
               placeholder="例如：SELECT * FROM cpu WHERE time > now() - 1h"
               @keyup.ctrl.enter="runQuery"
             />
-            <input v-model.number="queryLimit" type="number" min="1" max="100000" class="query-limit" title="SELECT 默认 LIMIT" />
             <button class="primary" :disabled="busy" @click="runQuery">执行</button>
             <button :disabled="!queryResult || busy" @click="exportQueryCsv">导出 CSV</button>
           </div>
@@ -534,6 +598,21 @@ onMounted(async () => {
           <div v-else-if="!queryResult" class="empty compact-empty">暂无结果，请输入查询语句后点击「执行」。</div>
           <div v-else>
             <div v-if="Array.isArray(querySeriesList)" class="result-scroll">
+              <div v-if="queryPagingEnabled && queryPageRows > 0" class="pagination" aria-label="查询结果分页">
+                <span>第 {{ queryPage }} 页，本页 {{ queryPageRows }} 行</span>
+                <label>每页
+                  <select v-model.number="queryPageSize" @change="runQuery">
+                    <option :value="50">50</option>
+                    <option :value="100">100</option>
+                    <option :value="250">250</option>
+                    <option :value="500">500</option>
+                  </select>
+                  行
+                </label>
+                <button :disabled="busy || queryPage <= 1" @click="changeQueryPage(queryPage - 1)">上一页</button>
+                <button :disabled="busy || !queryHasNextPage" @click="changeQueryPage(queryPage + 1)">下一页</button>
+              </div>
+              <div v-else-if="!queryPagingEnabled" class="subtle">该语句包含 LIMIT 或 OFFSET，按语句指定的服务端分页执行。</div>
               <template v-for="(s, si) in querySeriesList" :key="si">
                 <div class="result-series-head">{{ s.name || 'result' }}<span v-if="s.tags"> {{ JSON.stringify(s.tags) }}</span></div>
                 <div class="table-wrap">
@@ -547,6 +626,7 @@ onMounted(async () => {
                   </table>
                 </div>
               </template>
+              <div v-if="queryPageRows === 0" class="empty compact-empty">查询未返回数据行。</div>
             </div>
             <div v-else class="banner error">{{ querySeriesList.error }}</div>
           </div>
@@ -784,12 +864,15 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-
 .action-stack { margin-top: 14px; }
 .empty { padding: 32px; border: 1px dashed #cbd5e1; border-radius: 8px; text-align: center; color: #64748b; background: rgba(255,255,255,.55); }
 .compact-empty { margin-top: 16px; padding: 24px; }
-.query-form { display: grid; grid-template-columns: 200px minmax(0, 1fr) 120px auto auto; gap: 10px; align-items: stretch; margin-top: 14px; }
+.query-form { display: grid; grid-template-columns: 200px minmax(0, 1fr) auto auto; gap: 10px; align-items: stretch; margin-top: 14px; }
 .query-form .query-input { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .query-form .query-limit { width: auto; }
 .result-scroll { margin-top: 18px; display: flex; flex-direction: column; gap: 18px; }
 .result-series-head { font-size: 13px; font-weight: 700; color: #334155; margin-bottom: 6px; }
 .result-series-head span { color: #94a3b8; font-weight: 500; }
+.pagination { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: #475569; font-size: 13px; }
+.pagination label { display: inline-flex; align-items: center; gap: 5px; }
+.pagination select { min-height: 32px; padding: 4px 26px 4px 8px; }
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }
   .sidebar { gap: 16px; }
