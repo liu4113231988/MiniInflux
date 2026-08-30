@@ -124,32 +124,47 @@ public sealed class TsdbEngine : IDisposable
     {
         var result = new RecoveryResult();
 
-        // Phase 1: Replay WAL records into buffer with schema validation
+        // Phase 1: Replay WAL records into buffer with schema validation.
+        // Records are grouped per (db, rp) first so each group acquires the global + per-key locks
+        // once instead of once per point — a large WAL previously made startup O(points x locks).
+        // Append order within a group is preserved, which is all the buffer's seq/dedup logic needs.
+        var walGroups = new Dictionary<(string Db, string Rp), List<WalReplayPoint>>();
         foreach (var replayPoint in _wal.ReplayWithPositions())
         {
             result.WalRecordsReplayed++;
             CreateDatabase(replayPoint.Db);
+            var groupKey = (replayPoint.Db, replayPoint.Rp);
+            if (!walGroups.TryGetValue(groupKey, out var group)) walGroups[groupKey] = group = [];
+            group.Add(replayPoint);
+        }
 
-            // Validate schema for replayed points (skip conflicting records instead of aborting startup)
-            var validPoints = new List<BufferedPoint>();
-            try
+        foreach (var ((db, rp), records) in walGroups)
+        {
+            var validPoints = new List<BufferedPoint>(records.Count);
+            foreach (var replayPoint in records)
             {
-                _schema.ValidateAndRegister(replayPoint.Db, replayPoint.Point.Measurement, [replayPoint.Point]);
-                var seriesKey = SeriesKey.From(replayPoint.Point);
-                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey, Interlocked.Increment(ref _bufferSeq)));
+                // Validate schema for replayed points (skip conflicting records instead of aborting startup)
+                try
+                {
+                    _schema.ValidateAndRegister(db, replayPoint.Point.Measurement, [replayPoint.Point]);
+                    var seriesKey = SeriesKey.From(replayPoint.Point);
+                    validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey, Interlocked.Increment(ref _bufferSeq)));
+                }
+                catch (FieldConflictException) { result.SchemaConflictsSkipped++; }
             }
-            catch (FieldConflictException) { result.SchemaConflictsSkipped++; }
+
+            if (validPoints.Count == 0) continue;
 
             _globalLock.EnterWriteLock();
             try
             {
-                var key = K(replayPoint.Db, replayPoint.Rp);
+                var key = K(db, rp);
                 var lk = GetLock(key, alreadyHoldingGlobalWrite: true);
                 lk.EnterWriteLock();
                 try
                 {
                     if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
-                    AddBufferedPoints(key, list, validPoints); TrackSeriesKeys(replayPoint.Db, validPoints);
+                    AddBufferedPoints(key, list, validPoints); TrackSeriesKeys(db, validPoints);
                     _lastBufferWriteTicks[key] = DateTime.UtcNow.Ticks;
                     UpdateBufferReplayFloor(key, list);
                 }
