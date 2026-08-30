@@ -13,6 +13,12 @@ public static class BackupManager
 
         var staging = destination + ".staging";
         ReplaceDirectory(staging, source);
+        // manifest.json is copied last: an earlier snapshot could reference segment files that were
+        // only registered (flush/compaction) after the bulk copy enumerated the source tree.
+        CopyManifest(source, staging);
+        // A manifest that was updated concurrently may reference segments the bulk copy missed;
+        // the shard-file fixup runs after the manifest copy so every referenced segment is present.
+        CopyMissingShardFiles(source, staging);
         var metadata = BuildMetadata(staging, source);
         File.WriteAllText(Path.Combine(staging, MetadataFileName), JsonSerializer.Serialize(metadata, AppJsonContext.Default.BackupMetadata));
 
@@ -91,10 +97,43 @@ public static class BackupManager
         CopyDirectory(source, destination);
     }
 
+    private static void CopyManifest(string source, string staging)
+    {
+        var manifestSrc = Path.Combine(source, "meta", "manifest.json");
+        if (!File.Exists(manifestSrc)) return;
+        var manifestDst = Path.Combine(staging, "meta", "manifest.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(manifestDst)!);
+        // Atomic tmp+rename on the source means a read sees one full version; copy via bytes so a
+        // concurrent rename cannot interrupt File.Copy's open+create pair.
+        File.WriteAllBytes(manifestDst, File.ReadAllBytes(manifestSrc));
+    }
+
+    /// <summary>
+    /// Copy any segment file present in the source but missing from staging. Runs after the manifest
+    /// copy: whatever the final manifest references exists in the source (compaction only deletes
+    /// inputs after unregistering them) and therefore ends up in staging.
+    /// </summary>
+    private static void CopyMissingShardFiles(string source, string staging)
+    {
+        var sourceDb = Path.Combine(source, "db");
+        if (!Directory.Exists(sourceDb)) return;
+        foreach (var srcFile in Directory.EnumerateFiles(sourceDb, "*.seg", SearchOption.AllDirectories))
+        {
+            var dst = Path.Combine(staging, Path.GetRelativePath(source, srcFile));
+            if (File.Exists(dst)) continue;
+            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+            File.Copy(srcFile, dst, overwrite: true);
+        }
+    }
+
     private static BackupMetadata BuildMetadata(string root, string sourceRoot)
     {
         var files = Directory.GetFiles(root, "*", SearchOption.AllDirectories)
             .Where(path => !string.Equals(Path.GetFileName(path), MetadataFileName, StringComparison.OrdinalIgnoreCase))
+            // WAL files keep appending during the backup, so their hash cannot be stable; they are
+            // self-validating instead (per-record CRC + torn-tail tolerance on replay).
+            .Where(path => !IsUnderDirectory(path, root, "wal"))
+            .Where(path => !path.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
             .Select(path => new BackupFileEntry(
                 Path.GetRelativePath(root, path),
                 new FileInfo(path).Length,
@@ -107,6 +146,12 @@ public static class BackupManager
             DateTimeOffset.UtcNow,
             Path.GetFullPath(sourceRoot),
             files);
+    }
+
+    private static bool IsUnderDirectory(string path, string root, string child)
+    {
+        var prefix = Path.Combine(root, child) + Path.DirectorySeparatorChar;
+        return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string ComputeSha256(string path)

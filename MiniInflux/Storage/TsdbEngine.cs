@@ -1924,6 +1924,7 @@ return Interlocked.Read(ref _bufferedByteCount);
 
     private void RunCompaction()
     {
+        if (IsBackupInProgress()) return; // a compaction during backup would delete/rename copied segments
         try
         {
             if (_compactor.CompactAll() > 0) InvalidateSegmentMetadataIndex();
@@ -2730,6 +2731,28 @@ return Interlocked.Read(ref _bufferedByteCount);
         UpdateWalCheckpoint();
     }
 
+    private int _backupInProgress;
+
+    private bool IsBackupInProgress() => Interlocked.CompareExchange(ref _backupInProgress, 0, 0) == 1;
+
+    /// <summary>
+    /// Online backup of a consistent on-disk state. Flushes buffers and advances the WAL checkpoint
+    /// so pre-backup points live in immutable segments, then pauses compaction and shard expiry for
+    /// the duration of the copy so segment files referenced by the manifest cannot disappear.
+    /// Writes that arrive during the copy land in the WAL/segments but are not part of the snapshot.
+    /// </summary>
+    public void CreateConsistentBackup(string destination)
+    {
+        if (Interlocked.Exchange(ref _backupInProgress, 1) != 0)
+            throw new InvalidOperationException("a backup is already in progress");
+        try
+        {
+            FlushAll();
+            BackupManager.CreateBackup(_root, destination);
+        }
+        finally { Interlocked.Exchange(ref _backupInProgress, 0); }
+    }
+
     public void FlushAll()
     {
         WaitForPendingFlushes();
@@ -3027,6 +3050,7 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
 
     private void CleanupExpiredShards()
     {
+        if (IsBackupInProgress()) return; // shard expiry during backup would delete copied shard dirs
         try
         {
             var removed = _shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000);

@@ -501,8 +501,7 @@ app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string
             return authResult;
     if (!TryResolveManagedBackupPath(options, path, out var backupPath))
         return Results.BadRequest(new ErrorResponse("backup path must be a relative name under Data.BackupDir"));
-    tsdbEngine.FlushAll();
-    BackupManager.CreateBackup(tsdbEngine.RootPath, backupPath);
+    tsdbEngine.CreateConsistentBackup(backupPath);
     runtimeLogger.LogInformation("backup created path={Path}", backupPath);
     return Results.Ok(new AdminMessage("backup completed"));
 });
@@ -668,8 +667,7 @@ adminApi.MapPost("/backup", async (HttpRequest request) =>
 
     try
     {
-        engine.FlushAll();
-        BackupManager.CreateBackup(engine.RootPath, backupPath);
+        engine.CreateConsistentBackup(backupPath);
         runtimeLogger.LogInformation("admin ui backup created path={Path}", backupPath);
         return Results.Json(new AdminMessage("backup completed"), AppJsonContext.Default.AdminMessage);
     }
