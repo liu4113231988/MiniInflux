@@ -27,9 +27,6 @@ public sealed class WalManager : IDisposable
     private bool _disposed;
     
     // 优化的批量提交参数
-    private readonly int _batchSize = 8192; // 8KB批处理阈值
-    private readonly TimeSpan _maxBatchDelay = TimeSpan.FromMilliseconds(10); // 最大批处理延迟
-    private DateTime _lastWriteTime = DateTime.UtcNow;
 
     public WalManager(string walDir, long maxFileBytes = 16 * 1024 * 1024, bool fsync = true, int fsyncIntervalMs = 1000,
         StorageHealth? health = null)
@@ -105,44 +102,29 @@ public sealed class WalManager : IDisposable
         if (pointList.Count == 0) return [];
 
         var positions = new List<WalPosition>(pointList.Count);
-        // Format the record *outside* the lock into a pool-backed IBufferWriter: serialization is
-        // the bulk of the work and needs no mutual exclusion, so the global WAL lock now only
-        // covers the actual file write (and CRC), shrinking the critical section substantially.
+        // Format the record *and* compute its CRC outside the lock: both are O(payload) work over
+        // immutable data with no shared state, so the global WAL lock only covers the file write.
         using var writer = new PooledBufferWriter(EstimatePayloadSize(db, rp, pointList));
         WriteRecordPayload(writer, db, rp, pointList);
         var payloadSpan = writer.WrittenSpan;
+        var crc = Crc32.Compute(payloadSpan);
         lock (_lock)
         {
             try
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
 
-                // 如果当前写入量较小且距离上次写入时间很短，可以考虑批量合并
-                var shouldBatch = !_fsync && payloadSpan.Length < _batchSize &&
-                                (DateTime.UtcNow - _lastWriteTime) < _maxBatchDelay;
-
-                var position = WriteRecord(payloadSpan, Crc32.Compute(payloadSpan));
+                var position = WriteRecord(payloadSpan, crc);
                 for (var i = 0; i < pointList.Count; i++)
                     positions.Add(position);
 
                 if (_currentFileSize >= _maxFileBytes)
                     RotateLocked();
 
-                // 更新最后写入时间
-                _lastWriteTime = DateTime.UtcNow;
-
-                // 优化：减少fsync频率，只在检查点或文件轮转时同步
-                // 系统崩溃时可能丢失最后几个batch，但大幅提升写入性能
-                if (!_fsync || _fsyncIntervalMs <= 0)
-                {
-                    // 只在禁用fsync时进行批量刷盘，或者降低fsync频率
-                    if (!_fsync && (shouldBatch || _currentFileSize % (64 * 1024) == 0))
-                    {
-                        // 每64KB进行一次轻量flush，而不是每次写入
-                        _currentStream?.Flush(false);
-                    }
-                    _health.RecordWriteSuccess();
-                }
+                // A successful append is itself proof the write path works again, so it unlatches
+                // the health gate in every fsync mode (with fsync on, this is the only self-heal
+                // signal apart from the engine's periodic probe).
+                _health.RecordWriteSuccess();
             }
             catch (Exception ex)
             {

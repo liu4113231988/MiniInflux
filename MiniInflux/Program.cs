@@ -112,7 +112,9 @@ var engine = new TsdbEngine(
     maxSegmentFileBytes: options.Storage.MaxSegmentFileBytes,
     minSegmentFileBytes: options.Storage.MinSegmentFileBytes,
     segmentFillRatio: options.Storage.MinSegmentFillRatio,
-    compactionMaxWriteBytesPerSecond: options.Storage.CompactionMaxWriteBytesPerSecond);
+    compactionMaxWriteBytesPerSecond: options.Storage.CompactionMaxWriteBytesPerSecond,
+    minFreeDiskBytes: options.Storage.MinFreeDiskBytes,
+    lastValueCacheMaxEntries: options.Storage.LastValueCacheMaxEntries);
 
 builder.Services.AddSingleton(engine);
 var writeQueue = new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize);
@@ -267,7 +269,7 @@ app.MapGet("/health", (TsdbEngine tsdbEngine) =>
 
 app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
     var stats = metrics.CollectStats();
     return Results.Json(stats, AppJsonContext.Default.DebugStats);
@@ -275,7 +277,7 @@ app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
 
 app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
     var text = metrics.FormatPrometheus();
     return Results.Text(text, "text/plain; version=0.0.4; charset=utf-8");
@@ -306,6 +308,10 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     var debug = TryParseBool(request.Query["debug"].ToString());
     var epoch = request.Query["epoch"].ToString();
     var chunkSize = ParseChunkSize(request.Query["chunk_size"].ToString());
+    var format = request.Query["format"].ToString();
+    var isCsv = string.Equals(format, "csv", StringComparison.OrdinalIgnoreCase);
+    if (isCsv && chunked)
+        return Results.BadRequest(new ErrorResponse("format=csv is not supported with chunked=true"));
     if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
     {
         var form = await request.ReadFormAsync();
@@ -321,7 +327,7 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     if (string.IsNullOrWhiteSpace(q))
         return Results.BadRequest(new ErrorResponse("missing required parameter q"));
 
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
 
     // P3 参数化查询：v1 `?params={"host":"a"}`（或 form 字段）中的 `$name` 占位符由
@@ -346,7 +352,7 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
         return ChunkedResult(chunkOutcome, metrics, runtimeLogger, db);
     }
 
-    if (!debug)
+    if (!debug && !isCsv)
     {
         var rawJsonOutcome = executor.TryExecuteBufferedRawDescendingJson(tsdbEngine, db, q, epoch, request.HttpContext.RequestAborted, queryParams);
         if (rawJsonOutcome != null)
@@ -362,6 +368,13 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
     if (debug)
         return Results.Json(new QueryDebugResponse { Response = outcome.Response, Report = outcome.Report }, AppJsonContext.Default.QueryDebugResponse);
+    if (isCsv)
+    {
+        var firstError = outcome.Response.Results.FirstOrDefault()?.Error;
+        if (firstError != null)
+            return Results.Json(new ErrorResponse(firstError), AppJsonContext.Default.ErrorResponse, statusCode: 400);
+        return Results.Text(CsvQueryResponseWriter.Write(outcome.Response), "text/csv; charset=utf-8");
+    }
     return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
 });
 
@@ -370,7 +383,7 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
 // v3 的 v1 风格 {"results":[...]} 信封，执行错误（非超时/取消）以 400 + {"error"} 返回
 app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
     V3QueryRequest? body = null;
     if (request.ContentLength > 0 && request.ContentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true)
@@ -396,8 +409,10 @@ app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor 
 
     var format = body?.Format ?? request.Query["format"].ToString();
     if (string.IsNullOrWhiteSpace(format)) format = "json";
-    if (!string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
-        return Results.BadRequest(new ErrorResponse($"unsupported format: {format} (supported: json)"));
+    var isJsonFormat = string.Equals(format, "json", StringComparison.OrdinalIgnoreCase);
+    var isCsvFormat = string.Equals(format, "csv", StringComparison.OrdinalIgnoreCase);
+    if (!isJsonFormat && !isCsvFormat)
+        return Results.BadRequest(new ErrorResponse($"unsupported format: {format} (supported: json, csv)"));
 
     var epoch = body?.Epoch ?? request.Query["epoch"].ToString();
     Dictionary<string, JsonElement>? queryParams = null;
@@ -421,6 +436,8 @@ app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor 
     LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
     if (outcome.Report.Error is not null && !outcome.Report.TimedOut && !outcome.Report.Canceled)
         return Results.Json(new ErrorResponse(outcome.Report.Error), AppJsonContext.Default.ErrorResponse, statusCode: 400);
+    if (isCsvFormat)
+        return Results.Text(CsvQueryResponseWriter.Write(outcome.Response), "text/csv; charset=utf-8");
     return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
 });
 
@@ -428,7 +445,7 @@ app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor 
 // permitted; mutation statements (DELETE/DROP/CREATE/...) are rejected before execution.
 app.MapPost("/admin/api/query", async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics, string? db, string? q) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
 
     if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
@@ -501,8 +518,7 @@ app.MapPost("/admin/backup", (HttpRequest request, TsdbEngine tsdbEngine, string
             return authResult;
     if (!TryResolveManagedBackupPath(options, path, out var backupPath))
         return Results.BadRequest(new ErrorResponse("backup path must be a relative name under Data.BackupDir"));
-    tsdbEngine.FlushAll();
-    BackupManager.CreateBackup(tsdbEngine.RootPath, backupPath);
+    tsdbEngine.CreateConsistentBackup(backupPath);
     runtimeLogger.LogInformation("backup created path={Path}", backupPath);
     return Results.Ok(new AdminMessage("backup completed"));
 });
@@ -528,7 +544,7 @@ app.MapPost("/admin/restore", (HttpRequest request, TsdbEngine tsdbEngine, strin
 
 app.MapGet("/debug/benchmark", (HttpRequest request, TsdbEngine tsdbEngine) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
     var sw = System.Diagnostics.Stopwatch.StartNew();
     var dbCount = tsdbEngine.ListDatabases().Count;
@@ -566,7 +582,7 @@ adminApi.MapGet("/session", (HttpRequest request) =>
 
 adminApi.MapGet("/overview", (HttpRequest request, MetricsCollector metrics) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
 
     var databases = engine.ListDatabases();
@@ -587,7 +603,7 @@ adminApi.MapGet("/overview", (HttpRequest request, MetricsCollector metrics) =>
 
 adminApi.MapGet("/databases", (HttpRequest request) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
 
     var payload = engine.ListDatabases()
@@ -638,7 +654,7 @@ adminApi.MapGet("/databases", (HttpRequest request) =>
 
 adminApi.MapGet("/continuous-queries", (HttpRequest request) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
 
     var payload = engine.Meta.ListContinuousQueries()
@@ -668,8 +684,7 @@ adminApi.MapPost("/backup", async (HttpRequest request) =>
 
     try
     {
-        engine.FlushAll();
-        BackupManager.CreateBackup(engine.RootPath, backupPath);
+        engine.CreateConsistentBackup(backupPath);
         runtimeLogger.LogInformation("admin ui backup created path={Path}", backupPath);
         return Results.Json(new AdminMessage("backup completed"), AppJsonContext.Default.AdminMessage);
     }
@@ -713,7 +728,7 @@ adminApi.MapPost("/maintenance/flush", (HttpRequest request) =>
 
 adminApi.MapGet("/maintenance/cache-stats", (HttpRequest request) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
         return authResult;
     var stats = engine.GetMetadataCacheStats();
     return Results.Ok(new CacheStatsResponse { Hits = stats.Hits, Misses = stats.Misses, CachedCount = stats.CachedCount });
@@ -755,7 +770,7 @@ adminApi.MapGet("/tokens", (HttpRequest request) =>
 {
     if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
-    var list = tokenStore.List().Select(t => new TokenResponse(t.Id, t.Name, null, t.Prefix, t.CreatedAtNs)).ToList();
+    var list = tokenStore.List().Select(t => new TokenResponse(t.Id, t.Name, null, t.Prefix, t.Permissions, t.CreatedAtNs)).ToList();
     return Results.Json(list, AppJsonContext.Default.ListTokenResponse);
 });
 
@@ -768,9 +783,9 @@ adminApi.MapPost("/tokens", async (HttpRequest request) =>
         return Results.BadRequest(new ErrorResponse("missing required field 'name'"));
     try
     {
-        var (rec, raw) = tokenStore.Create(body.Name);
+        var (rec, raw) = tokenStore.Create(body.Name, body.Permissions ?? "all");
         runtimeLogger.LogInformation("token created id={Id} name={Name} prefix={Prefix}", rec.Id, rec.Name, rec.Prefix);
-        return Results.Json(new TokenResponse(rec.Id, rec.Name, raw, rec.Prefix, rec.CreatedAtNs), AppJsonContext.Default.TokenResponse, statusCode: 201);
+        return Results.Json(new TokenResponse(rec.Id, rec.Name, raw, rec.Prefix, rec.Permissions, rec.CreatedAtNs), AppJsonContext.Default.TokenResponse, statusCode: 201);
     }
     catch (ArgumentException ex) { return Results.BadRequest(new ErrorResponse(ex.Message)); }
     catch (InvalidOperationException ex) { return Results.Json(new ErrorResponse(ex.Message), AppJsonContext.Default.ErrorResponse, statusCode: 409); }
@@ -843,10 +858,18 @@ app.Lifetime.ApplicationStopped.Register(() =>
 
 app.Run();
 
-static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, AuthenticationGuard authenticationGuard, ILogger logger, out IResult result, bool v2ErrorFormat = false)
+static bool EnsureAuthorized(HttpRequest request, MiniInfluxOptions options, AuthenticationGuard authenticationGuard, ILogger logger, out IResult result, bool v2ErrorFormat = false, string requiredPermission = "all")
 {
-    if (AuthorizationSupport.IsAuthorized(request, options.Auth, authenticationGuard, out var attempt))
+    if (AuthorizationSupport.IsAuthorized(request, options.Auth, authenticationGuard, out var attempt, out var grantedPermission))
     {
+        if (!AuthorizationSupport.PermissionCovers(grantedPermission, requiredPermission))
+        {
+            var forbidden = $"forbidden: token permission '{grantedPermission}' does not allow this operation";
+            result = v2ErrorFormat
+                ? Results.Json(new V2ErrorResponse("forbidden", forbidden), AppJsonContext.Default.V2ErrorResponse, statusCode: 403)
+                : Results.Json(new ErrorResponse(forbidden), AppJsonContext.Default.ErrorResponse, statusCode: 403);
+            return false;
+        }
         result = Results.Empty;
         return true;
     }
@@ -1185,7 +1208,7 @@ static bool TryParseBool(string? value) =>
 /// </summary>
 async Task<IResult> WritePointsAsync(HttpRequest request, string db, string? rp, string? precision, WriteQueue writeQueue, MetricsCollector metrics, bool isV2 = false)
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, v2ErrorFormat: isV2))
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, v2ErrorFormat: isV2, requiredPermission: "write"))
         return authResult;
     if (request.ContentLength > options.Write.MaxRequestBodyBytes)
         return isV2
@@ -1250,6 +1273,13 @@ async Task<IResult> WritePointsAsync(HttpRequest request, string db, string? rp,
             return isV2
                 ? Results.Json(new V2ErrorResponse("too many requests", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 429)
                 : Results.StatusCode(429);
+        }
+        catch (DiskSpaceExceededException ex)
+        {
+            runtimeLogger.LogWarning("write rejected because disk space is below the floor db={Db} rp={Rp}", db, rp ?? "autogen");
+            return isV2
+                ? Results.Json(new V2ErrorResponse("unavailable", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 503)
+                : Results.StatusCode(503);
         }
         catch (IOException ex)
         {
@@ -1342,12 +1372,15 @@ static IResult EmbeddedFile(Dictionary<string, string> staticAssets, string path
 public sealed record ErrorResponse([property: System.Text.Json.Serialization.JsonPropertyName("error")] string Error);
 public sealed record V2ErrorResponse([property: System.Text.Json.Serialization.JsonPropertyName("code")] string Code, [property: System.Text.Json.Serialization.JsonPropertyName("message")] string Message);
 public sealed record AdminMessage([property: System.Text.Json.Serialization.JsonPropertyName("message")] string Message);
-public sealed record CreateTokenRequest([property: System.Text.Json.Serialization.JsonPropertyName("name")] string Name);
+public sealed record CreateTokenRequest(
+    [property: System.Text.Json.Serialization.JsonPropertyName("name")] string Name,
+    [property: System.Text.Json.Serialization.JsonPropertyName("permissions")] string? Permissions = null);
 public sealed record TokenResponse(
     [property: System.Text.Json.Serialization.JsonPropertyName("id")] string Id,
     [property: System.Text.Json.Serialization.JsonPropertyName("name")] string Name,
     [property: System.Text.Json.Serialization.JsonPropertyName("token")] string? Token,
     [property: System.Text.Json.Serialization.JsonPropertyName("prefix")] string Prefix,
+    [property: System.Text.Json.Serialization.JsonPropertyName("permissions")] string Permissions,
     [property: System.Text.Json.Serialization.JsonPropertyName("createdAtNs")] long CreatedAtNs);
 public sealed record V3QueryRequest(
     [property: System.Text.Json.Serialization.JsonPropertyName("db")] string? Db,

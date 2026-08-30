@@ -10,7 +10,7 @@ namespace MiniInflux.Net10.Storage;
 public static class Crc32
 {
     private const uint Polynomial = 0x82F63B78u; // CRC32C (Castagnoli) reversed polynomial
-    private static readonly uint[][] Tables = BuildTables();
+    internal static readonly uint[][] Tables = BuildTables();
 
     private static uint[][] BuildTables()
     {
@@ -37,8 +37,30 @@ public static class Crc32
 
     public static uint Compute(ReadOnlySpan<byte> data)
     {
-        uint crc = 0xFFFFFFFFu;
-        var t = Tables;
+        var crc = IncrementalCrc32.Create();
+        crc.Append(data);
+        return crc.GetResult();
+    }
+
+    public static uint Compute(byte[] data) => Compute(data.AsSpan());
+
+    public static uint Compute(byte[] data, int offset, int length) => Compute(data.AsSpan(offset, length));
+}
+
+/// <summary>
+/// Streaming CRC32C state sharing the slicing-by-8 tables with the one-shot Compute; lets a large
+/// file be verified chunk by chunk without materializing it.
+/// </summary>
+public struct IncrementalCrc32
+{
+    private uint _crc;
+
+    public static IncrementalCrc32 Create() => new() { _crc = 0xFFFFFFFFu };
+
+    public void Append(ReadOnlySpan<byte> data)
+    {
+        var crc = _crc;
+        var t = Crc32.Tables;
         var i = 0;
         var len = data.Length;
         for (; i + 8 <= len; i += 8)
@@ -50,10 +72,8 @@ public static class Crc32
         }
         for (; i < len; i++)
             crc = t[0][(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-        return crc ^ 0xFFFFFFFFu;
+        _crc = crc;
     }
 
-    public static uint Compute(byte[] data) => Compute(data.AsSpan());
-
-    public static uint Compute(byte[] data, int offset, int length) => Compute(data.AsSpan(offset, length));
+    public readonly uint GetResult() => _crc ^ 0xFFFFFFFFu;
 }

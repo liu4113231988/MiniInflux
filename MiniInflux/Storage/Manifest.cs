@@ -463,7 +463,7 @@ public sealed class Manifest
                     changed |= tagValueSeries.Add(tagsCanon);
                 }
             }
-            if (changed) _dirty = true;
+            // Index mutations are in-memory only; nothing to persist (see DatabaseInfo notes).
         }
     }
 
@@ -637,7 +637,7 @@ public sealed class Manifest
             dbInfo.SeriesIndex.Remove(measurement);
             dbInfo.TagIndex.Remove(measurement);
             dbInfo.TagSeriesIndex.Remove(measurement);
-            Save();
+            // Indexes are in-memory only; nothing to persist.
         }
     }
 
@@ -655,7 +655,6 @@ public sealed class Manifest
             if (!dbInfo.SeriesIndex.TryGetValue(measurement, out var remaining) || remaining.Count == 0)
             {
                 dbInfo.SeriesIndex.Remove(measurement);
-                Save();
                 return;
             }
 
@@ -678,7 +677,6 @@ public sealed class Manifest
             }
             dbInfo.TagIndex[measurement] = tagMap;
             dbInfo.TagSeriesIndex[measurement] = tagSeriesMap;
-            Save();
         }
     }
 
@@ -761,8 +759,16 @@ internal sealed class DatabaseInfo
 {
     public Dictionary<string, RetentionPolicyInfo> RetentionPolicies { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, ContinuousQueryInfo> ContinuousQueries { get; set; } = new(StringComparer.Ordinal);
+
+    // ponytail: the series/tag indexes are in-memory only. Recovery rebuilds them from segment
+    // metadata anyway (TsdbEngine.Recover phase 2), so persisting them used to make every Save()
+    // O(all series of all databases) — the dominant write amplification on high-cardinality
+    // workloads — while the data itself was redundant on load.
+    [JsonIgnore]
     public Dictionary<string, HashSet<string>> SeriesIndex { get; set; } = new(StringComparer.Ordinal);
+    [JsonIgnore]
     public Dictionary<string, Dictionary<string, HashSet<string>>> TagIndex { get; set; } = new(StringComparer.Ordinal);
+    [JsonIgnore]
     public Dictionary<string, Dictionary<string, Dictionary<string, HashSet<string>>>> TagSeriesIndex { get; set; } = new(StringComparer.Ordinal);
 }
 

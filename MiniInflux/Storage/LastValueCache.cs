@@ -11,48 +11,67 @@ namespace MiniInflux.Net10.Storage;
 public sealed class LastValueCache
 {
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<SeriesKey, Point>> _store = new(StringComparer.Ordinal);
+    private readonly int _maxEntriesPerDbRp;
+    private long _updateCounter;
+
+    /// <summary>maxEntriesPerDbRp = 0 disables the cap. Evicted series fall back to scan-and-backfill (correct, slower).</summary>
+    public LastValueCache(int maxEntriesPerDbRp = 0)
+    {
+        _maxEntriesPerDbRp = maxEntriesPerDbRp;
+    }
+
+    /// <summary>
+    /// Sampled cap enforcement: checking ConcurrentDictionary.Count takes locks, so it runs every
+    /// 64th update; arbitrary entries are dropped while over the cap. The worst-case overshoot is
+    /// therefore the cap plus one sampling interval.
+    /// </summary>
+    private void EnforceCapOnSample(ConcurrentDictionary<SeriesKey, Point> inner)
+    {
+        if (_maxEntriesPerDbRp <= 0) return;
+        if ((Interlocked.Increment(ref _updateCounter) & 0x3F) != 0) return;
+        while (inner.Count > _maxEntriesPerDbRp)
+        {
+            var victim = inner.Keys.FirstOrDefault();
+            if (victim == default || !inner.ContainsKey(victim)) break;
+            inner.TryRemove(victim, out _);
+        }
+    }
 
     private static string K(string db, string rp) => db + "|" + rp;
 
-    private static Point ClonePoint(Point p)
-    {
-        // Shallow clone Tags dict (tags are small) and Fields dict (last-write-wins merge needs copy)
-        return new Point
-        {
-            Measurement = p.Measurement,
-            Tags = new Dictionary<string, string>(p.Tags, StringComparer.Ordinal),
-            Fields = new Dictionary<string, FieldValue>(p.Fields, StringComparer.Ordinal),
-            TimestampNs = p.TimestampNs,
-            TagsCanonical = p.TagsCanonical
-        };
-    }
-
+    // ponytail: points are stored by reference. Invariant: once a Point leaves the write path its
+    // Tags/Fields dictionaries are never mutated in place — the write-path dedup clones before
+    // merging fields (DeduplicateWritePoints), the query-path dedup only touches its own clones,
+    // and the parser's tag-dictionary reuse shares one dictionary per identical tag set that no
+    // code path mutates. Cloning Tags+Fields on every update used to allocate two dictionaries
+    // per written point (and the flush path ran a second update per point on top).
     /// <summary>Insert or merge a single point into cache (LWW on same timestamp).</summary>
     public void Update(string db, string rp, Point point)
     {
         var outer = _store.GetOrAdd(K(db, rp), _ => new ConcurrentDictionary<SeriesKey, Point>());
+        if (_maxEntriesPerDbRp > 0) EnforceCapOnSample(outer);
         var sk = SeriesKey.From(point);
         // normalize TagsCanonical for stable identity — Point is init-only, so create normalized copy if missing
-        var normalized = point;
+        var toStore = point;
         if (string.IsNullOrEmpty(point.TagsCanonical))
-            normalized = new Point { Measurement = point.Measurement, Tags = point.Tags, Fields = point.Fields, TimestampNs = point.TimestampNs, TagsCanonical = sk.TagsCanonical };
-        var toStore = normalized;
+            toStore = new Point { Measurement = point.Measurement, Tags = point.Tags, Fields = point.Fields, TimestampNs = point.TimestampNs, TagsCanonical = sk.TagsCanonical };
         outer.AddOrUpdate(sk,
-            _ => ClonePoint(toStore),
+            _ => toStore,
             (_, existing) =>
             {
                 if (toStore.TimestampNs > existing.TimestampNs)
-                    return ClonePoint(toStore);
+                    return toStore;
                 if (toStore.TimestampNs == existing.TimestampNs)
                 {
                     // merge fields: new overwrites old on same timestamp (duplicates LWW)
                     var merged = new Dictionary<string, FieldValue>(existing.Fields, StringComparer.Ordinal);
                     foreach (var kv in toStore.Fields) merged[kv.Key] = kv.Value;
-                    // keep existing Measurement/Tags but adopt timestamp equality merged fields
+                    // same series: measurement/tags identity is fixed by the SeriesKey, so the
+                    // existing dictionary references can be reused
                     return new Point
                     {
                         Measurement = existing.Measurement,
-                        Tags = new Dictionary<string, string>(existing.Tags, StringComparer.Ordinal),
+                        Tags = existing.Tags,
                         Fields = merged,
                         TimestampNs = existing.TimestampNs,
                         TagsCanonical = existing.TagsCanonical

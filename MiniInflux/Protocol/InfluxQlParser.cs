@@ -726,7 +726,9 @@ public static class InfluxQlParser
     static bool TryParseTimeFilter(string p, out long? min, out long? max, List<ParamFilter> paramFilters)
     {
         min = null; max = null;
-        if (!p.StartsWith("time", StringComparison.OrdinalIgnoreCase))
+        // Only the exact "time" key is a time predicate; tag keys that merely start with
+        // "time" (e.g. timer) must fall through to tag-filter parsing, not be swallowed here.
+        if (!IsTimePredicate(p))
             return false;
 
         string op, rhs;
@@ -734,7 +736,10 @@ public static class InfluxQlParser
         else if (p.Contains("<=")) { op = "<="; rhs = p.Split("<=", 2)[1]; }
         else if (p.Contains('>')) { op = ">"; rhs = p.Split('>', 2)[1]; }
         else if (p.Contains('<')) { op = "<"; rhs = p.Split('<', 2)[1]; }
-        else return true;
+        else if (p.Contains("<>") || p.Contains("!="))
+            throw new NotSupportedException($"unsupported time predicate: {p}");
+        else if (p.Contains('=')) { op = "="; rhs = p.Split('=', 2)[1]; }
+        else throw new FormatException($"unsupported time predicate: {p}");
 
         var value = rhs.Trim();
         if (TryReadPlaceholder(value, out var name))
@@ -743,9 +748,18 @@ public static class InfluxQlParser
             return true;
         }
         var t = ParseTime(value);
-        if (op == ">=" || op == ">") min = op == ">" ? t + 1 : t;
+        if (op == "=") { min = t; max = t; }
+        else if (op == ">=" || op == ">") min = op == ">" ? t + 1 : t;
         else max = op == "<" ? t - 1 : t;
         return true;
+    }
+
+    static bool IsTimePredicate(string p)
+    {
+        if (!p.StartsWith("time", StringComparison.OrdinalIgnoreCase)) return false;
+        if (p.Length == 4) return true;
+        var next = p[4];
+        return next is ' ' or '\t' or '<' or '>' or '!' or '=';
     }
 
     static void TryParseFilter(string p, List<TagFilter> tagFilters, List<FieldFilter> fieldFilters, List<ParamFilter> paramFilters)
@@ -806,11 +820,25 @@ public static class InfluxQlParser
             var x = raw.Trim();
             if (string.IsNullOrEmpty(x)) continue;
 
+            // Strip a trailing top-level "AS alias" so raw fields and aggregate calls can rename
+            // their output column; the auto-generated alias remains the fallback.
+            string? explicitAlias = null;
+            var asIndex = IndexOfTopLevelKeyword(x, " AS ");
+            if (asIndex >= 0)
+            {
+                var aliasText = x[(asIndex + 4)..].Trim();
+                if (aliasText.Length > 0)
+                {
+                    explicitAlias = Unq(aliasText);
+                    x = x[..asIndex].Trim();
+                }
+            }
+
             // Handle DISTINCT: SELECT DISTINCT field FROM ...
             if (x.StartsWith("DISTINCT ", StringComparison.OrdinalIgnoreCase))
             {
                 var fld = Unq(x["DISTINCT ".Length..].Trim());
-                items.Add(new SelectItem("", fld, "distinct_" + fld) { IsDistinct = true });
+                items.Add(new SelectItem("", fld, explicitAlias ?? ("distinct_" + fld)) { IsDistinct = true });
                 continue;
             }
 
@@ -824,14 +852,14 @@ public static class InfluxQlParser
                 if (f == "count" && inner.StartsWith("DISTINCT ", StringComparison.OrdinalIgnoreCase))
                 {
                     var fld = Unq(inner["DISTINCT ".Length..].Trim());
-                    items.Add(new SelectItem("count", fld, "count_distinct_" + fld) { IsCountDistinct = true });
+                    items.Add(new SelectItem("count", fld, explicitAlias ?? ("count_distinct_" + fld)) { IsCountDistinct = true });
                     continue;
                 }
 
                 if (f == "distinct")
                 {
                     var fld = Unq(inner);
-                    items.Add(new SelectItem("", fld, "distinct_" + fld) { IsDistinct = true });
+                    items.Add(new SelectItem("", fld, explicitAlias ?? ("distinct_" + fld)) { IsDistinct = true });
                     continue;
                 }
 
@@ -848,12 +876,12 @@ public static class InfluxQlParser
                         unitNs = DurationToNs(second);
                 }
                 var aliasSuffix = args.Length > 1 ? "_" + args[1].Trim().Replace("\"", "").Replace("'", "") : "";
-                var alias = $"{f}_{fld2}{aliasSuffix}";
+                var alias = explicitAlias ?? $"{f}_{fld2}{aliasSuffix}";
                 items.Add(new SelectItem(f, fld2, alias, param, unitNs));
             }
             else
             {
-                items.Add(new SelectItem("", Unq(x), Unq(x)));
+                items.Add(new SelectItem("", Unq(x), explicitAlias ?? Unq(x)));
             }
         }
         return items;

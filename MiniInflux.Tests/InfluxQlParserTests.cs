@@ -1,3 +1,4 @@
+using System.Text.Json;
 using MiniInflux.Net10.Protocol;
 
 namespace MiniInflux.Tests;
@@ -480,6 +481,73 @@ public class InfluxQlParserTests
         Assert.Equal(QueryKind.DropContinuousQuery, query.Kind);
         Assert.Equal("metrics", query.Database);
         Assert.Equal("cq_cpu", query.ContinuousQueryName);
+    }
+
+    [Fact]
+    public void Parse_SelectWithAsAlias_RenamesOutputColumn()
+    {
+        var query = InfluxQlParser.Parse("SELECT mean(value) AS m FROM cpu");
+
+        var item = Assert.Single(query.Select);
+        Assert.Equal("mean", item.Func);
+        Assert.Equal("value", item.Field);
+        Assert.Equal("m", item.Alias);
+    }
+
+    [Fact]
+    public void Parse_SelectRawFieldWithAsAlias_RenamesOutputColumnOnly()
+    {
+        var query = InfluxQlParser.Parse("SELECT usage_user AS user, usage_system FROM cpu");
+
+        Assert.Equal(2, query.Select.Count);
+        Assert.Equal("usage_user", query.Select[0].Field);
+        Assert.Equal("user", query.Select[0].Alias);
+        Assert.Equal("usage_system", query.Select[1].Field);
+        Assert.Equal("usage_system", query.Select[1].Alias);
+    }
+
+    [Fact]
+    public void Parse_SelectCountDistinctWithAsAlias_RenamesOutputColumn()
+    {
+        var query = InfluxQlParser.Parse("SELECT count(distinct host) AS hosts FROM cpu");
+
+        var item = Assert.Single(query.Select);
+        Assert.True(item.IsCountDistinct);
+        Assert.Equal("hosts", item.Alias);
+    }
+
+    [Fact]
+    public void Parse_TimeEqualityFilter_SetsExactTimeRange()
+    {
+        var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE time = 10s");
+
+        Assert.Equal(10_000_000_000L, query.MinTimeNs);
+        Assert.Equal(query.MinTimeNs, query.MaxTimeNs);
+    }
+
+    [Fact]
+    public void Parse_TagKeyStartingWithTime_ParsesAsTagFilter()
+    {
+        var query = InfluxQlParser.Parse("SELECT value FROM cpu WHERE timer = 'a'");
+
+        var filter = Assert.Single(query.TagFilters);
+        Assert.Equal("timer", filter.Key);
+        Assert.Equal("a", filter.Value);
+        Assert.Null(query.MinTimeNs);
+        Assert.Null(query.MaxTimeNs);
+    }
+
+    [Fact]
+    public void Parse_TimeEqualityParameter_BindsExactRange()
+    {
+        var template = InfluxQlParser.Parse("SELECT value FROM cpu WHERE time = $t");
+        var bound = QueryParamBinder.ApplyParams(template, new Dictionary<string, JsonElement>
+        {
+            ["t"] = JsonSerializer.SerializeToElement("2023-01-01T00:00:00Z")
+        });
+
+        Assert.Equal(1672531200L * 1_000_000_000L, bound.MinTimeNs);
+        Assert.Equal(bound.MinTimeNs, bound.MaxTimeNs);
     }
 
     static long NowNs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;

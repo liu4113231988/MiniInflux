@@ -43,6 +43,15 @@ public static class SegmentReader
     // needs to happen once per (path, length, mtime); previously every query re-verified the
     // whole file for segments below the streaming threshold.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Length, DateTime LastWriteUtc)> s_crcVerified = new(StringComparer.Ordinal);
+    private const int MaxCrcVerifiedEntries = 4096;
+
+    // ponytail: segments that failed structural verification (magic/size/CRC) are quarantined for
+    // the process lifetime so queries stop re-reading them on every pass; they surface in engine
+    // stats and the validate CLI instead of silently re-tainting results.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_quarantined = new(StringComparer.Ordinal);
+
+    public static bool IsQuarantined(string path) => s_quarantined.ContainsKey(path);
+    public static IReadOnlyCollection<string> Quarantined => s_quarantined.Keys.ToArray();
 
     // Decoded column block cache. Repeated dashboard-style queries used to re-run Brotli
     // decompression + delta/Gorilla decoding for the same columns on every single query; segment
@@ -173,34 +182,76 @@ public static class SegmentReader
                 continue;
             }
 
-            var codecs = ReadCodecInfo(version, br);
-            var (cachedTimestamps, cachedValues) = GetCachedColumn(path, fileLength, i);
-
-            var tl = br.ReadInt32();
-            byte[]? tb = null;
-            if (cachedTimestamps != null) SkipBytes(ms, tl);
-            else tb = br.ReadBytes(tl);
-
-            var vl = br.ReadInt32();
-            byte[]? vb = null;
-            if (cachedValues != null) SkipBytes(ms, vl);
-            else vb = br.ReadBytes(vl);
-
-            BlockStats? stats = null;
-            if (version >= 2) { stats = new BlockStats(br.ReadDouble(), br.ReadDouble(), br.ReadDouble(), br.ReadInt32()); }
-
-            var timestamps = cachedTimestamps
-                ?? CompressionCodec.DecodeTimestamps(codecs.TimestampCodec, codecs.TimestampCompression, tb!);
-            var values = cachedValues
-                ?? CompressionCodec.DecodeValues(k, codecs.ValueCodec, codecs.ValueCompression, vb!);
-            if (tb != null || vb != null)
-                CacheColumn(path, fileLength, i, timestamps, values);
-
-            result.Add(new SegmentColumn(m, tags, f, k, min, max,
-                timestamps, values, stats,
-                codecs.TimestampCodec, codecs.ValueCodec, codecs.TimestampCompression, codecs.ValueCompression));
+            result.Add(ReadColumnBody(br, ms, version, path, fileLength, i, m, tags, f, k, min, max));
         }
         return result;
+    }
+
+    /// <summary>
+    /// Read only the columns for which <paramref name="columnSelector"/> returns true, skipping all
+    /// other payloads in a single sequential pass. Used by compaction to decode exactly one output
+    /// batch's worth of columns per pass instead of materializing whole segments.
+    /// </summary>
+    public static List<SegmentColumn> ReadSegmentSelected(string path, Func<string, string, string, bool> columnSelector)
+    {
+        var result = new List<SegmentColumn>();
+        using var ms = OpenSegmentForSequentialRead(path, out var dataLength, out var fileLength);
+        using var br = new BinaryReader(ms, Encoding.UTF8);
+        if (br.ReadUInt32() != Magic) throw new InvalidDataException("invalid segment magic");
+
+        var (version, count) = ReadVersionAndCount(br, ms);
+
+        for (int i = 0; i < count; i++)
+        {
+            if (ms.Position >= dataLength) break;
+
+            var m = ReadString(br); var tags = ReadString(br); var f = ReadString(br);
+            var k = (FieldKind)br.ReadByte();
+            var min = br.ReadInt64(); var max = br.ReadInt64();
+            br.ReadInt32(); // point count (unused)
+
+            if (!columnSelector(m, tags, f))
+            {
+                SkipColumnPayload(version, br, ms);
+                continue;
+            }
+
+            result.Add(ReadColumnBody(br, ms, version, path, fileLength, i, m, tags, f, k, min, max));
+        }
+        return result;
+    }
+
+    /// <summary>Shared decode of one selected column's payload (codecs, blocks, cache, stats).</summary>
+    private static SegmentColumn ReadColumnBody(
+        BinaryReader br, Stream ms, byte version, string path, long fileLength, int ordinal,
+        string m, string tags, string f, FieldKind k, long min, long max)
+    {
+        var codecs = ReadCodecInfo(version, br);
+        var (cachedTimestamps, cachedValues) = GetCachedColumn(path, fileLength, ordinal);
+
+        var tl = br.ReadInt32();
+        byte[]? tb = null;
+        if (cachedTimestamps != null) SkipBytes(ms, tl);
+        else tb = br.ReadBytes(tl);
+
+        var vl = br.ReadInt32();
+        byte[]? vb = null;
+        if (cachedValues != null) SkipBytes(ms, vl);
+        else vb = br.ReadBytes(vl);
+
+        BlockStats? stats = null;
+        if (version >= 2) { stats = new BlockStats(br.ReadDouble(), br.ReadDouble(), br.ReadDouble(), br.ReadInt32()); }
+
+        var timestamps = cachedTimestamps
+            ?? CompressionCodec.DecodeTimestamps(codecs.TimestampCodec, codecs.TimestampCompression, tb!);
+        var values = cachedValues
+            ?? CompressionCodec.DecodeValues(k, codecs.ValueCodec, codecs.ValueCompression, vb!);
+        if (tb != null || vb != null)
+            CacheColumn(path, fileLength, ordinal, timestamps, values);
+
+        return new SegmentColumn(m, tags, f, k, min, max,
+            timestamps, values, stats,
+            codecs.TimestampCodec, codecs.ValueCodec, codecs.TimestampCompression, codecs.ValueCompression);
     }
 
     /// <summary>
@@ -271,6 +322,19 @@ public static class SegmentReader
         if (TryReadFooterMetadata(path, out var metadata))
             return new SegmentMetadataReadResult(metadata, true);
 
+        try
+        {
+            return ReadMetadataByFullScan(path);
+        }
+        catch (InvalidDataException)
+        {
+            s_quarantined.TryAdd(path, 0);
+            throw;
+        }
+    }
+
+    private static SegmentMetadataReadResult ReadMetadataByFullScan(string path)
+    {
         var allBytes = ReadAllBytesShared(path);
         if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
         var dataLength = allBytes.Length - 4;
@@ -350,13 +414,50 @@ public static class SegmentReader
     /// Open a segment's column area for sequential reading.
     /// <para>
     /// Small segments keep the original behaviour: the whole file is buffered and its CRC verified up
-    /// front. Large segments are streamed through a buffered <see cref="FileStream"/>; the trailing
-    /// CRC is not recomputed there because doing so would require reading every byte, which defeats
-    /// the purpose of column skipping. Structural corruption is still caught by the magic-number and
-    /// length checks below, and by the decoders themselves.
+    /// front. Large segments are streamed through a buffered <see cref="FileStream"/>; their trailing
+    /// CRC is verified once per (path, length, mtime) with a chunked sequential pass (see
+    /// <see cref="VerifyLargeSegmentCrc"/>), so column skipping still works after the first read.
     /// </para>
     /// </summary>
+
+    /// <summary>
+    /// Bound the verification cache: compaction constantly creates new segment paths, so stale
+    /// entries (replaced or deleted files) are swept first, then an arbitrary entry is dropped.
+    /// </summary>
+    private static void RememberCrcVerified(string path, long length, DateTime lastWriteUtc)
+    {
+        if (s_crcVerified.Count >= MaxCrcVerifiedEntries && !s_crcVerified.ContainsKey(path))
+        {
+            foreach (var kv in s_crcVerified)
+            {
+                if (kv.Key == path) continue;
+                var info = new FileInfo(kv.Key);
+                if (!info.Exists || info.Length != kv.Value.Length || info.LastWriteTimeUtc != kv.Value.LastWriteUtc)
+                    s_crcVerified.TryRemove(kv.Key, out _);
+            }
+            if (s_crcVerified.Count >= MaxCrcVerifiedEntries)
+            {
+                var first = s_crcVerified.Keys.FirstOrDefault();
+                if (first != null) s_crcVerified.TryRemove(first, out _);
+            }
+        }
+        s_crcVerified[path] = (length, lastWriteUtc);
+    }
+
     private static Stream OpenSegmentForSequentialRead(string path, out long dataLength, out long fileLength)
+    {
+        try
+        {
+            return OpenSegmentChecked(path, out dataLength, out fileLength);
+        }
+        catch (InvalidDataException)
+        {
+            s_quarantined.TryAdd(path, 0);
+            throw;
+        }
+    }
+
+    private static Stream OpenSegmentChecked(string path, out long dataLength, out long fileLength)
     {
         var info = new FileInfo(path);
         fileLength = info.Length;
@@ -365,6 +466,7 @@ public static class SegmentReader
         if (fileLength > StreamingReadThresholdBytes)
         {
             dataLength = fileLength - 4;
+            VerifyLargeSegmentCrc(path, info, fileLength);
             return new FileStream(path, FileMode.Open, FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete, StreamingBufferBytes, FileOptions.SequentialScan);
         }
@@ -380,9 +482,44 @@ public static class SegmentReader
             var storedCrc = BitConverter.ToUInt32(allBytes, (int)dataLength);
             if (storedCrc != Crc32.Compute(allBytes.AsSpan(0, (int)dataLength)))
                 throw new InvalidDataException("segment CRC mismatch");
-            s_crcVerified[path] = (allBytes.Length, info.LastWriteTimeUtc);
+            RememberCrcVerified(path, allBytes.Length, info.LastWriteTimeUtc);
         }
         return new MemoryStream(allBytes, 0, (int)dataLength, writable: false);
+    }
+
+    /// <summary>
+    /// Large segments are streamed with column skipping, so a corrupt payload may otherwise never be
+    /// read and silently return wrong results. Verify the trailing CRC once per (path, length, mtime)
+    /// with a chunked sequential pass; later reads of the same immutable file skip it entirely.
+    /// </summary>
+    private static void VerifyLargeSegmentCrc(string path, FileInfo info, long fileLength)
+    {
+        if (s_crcVerified.TryGetValue(path, out var stamp)
+            && stamp.Length == fileLength && stamp.LastWriteUtc == info.LastWriteTimeUtc)
+            return;
+
+        var dataLength = fileLength - 4;
+        var crc = IncrementalCrc32.Create();
+        var buffer = new byte[StreamingBufferBytes];
+        uint storedCrc;
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, StreamingBufferBytes, FileOptions.SequentialScan))
+        {
+            long remaining = dataLength;
+            while (remaining > 0)
+            {
+                var chunk = (int)Math.Min(buffer.Length, remaining);
+                stream.ReadExactly(buffer, 0, chunk);
+                crc.Append(buffer.AsSpan(0, chunk));
+                remaining -= chunk;
+            }
+            stream.ReadExactly(buffer, 0, 4);
+            storedCrc = BitConverter.ToUInt32(buffer, 0);
+        }
+
+        if (storedCrc != crc.GetResult())
+            throw new InvalidDataException("segment CRC mismatch");
+        RememberCrcVerified(path, fileLength, info.LastWriteTimeUtc);
     }
 
     /// <summary>

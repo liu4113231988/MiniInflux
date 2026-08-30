@@ -86,6 +86,39 @@ public class SegmentTests : IDisposable
     }
 
     [Fact]
+    public void ReadSegment_LargeCorruptedSegment_ThrowsCrcMismatch()
+    {
+        var segPath = Path.Combine(_testDir, "large.seg");
+        // Random-mantissa floats defeat Gorilla compression, so the segment lands above the 8MB
+        // streaming threshold where verification used to be skipped entirely.
+        const int count = 1_500_000;
+        var ts = new List<long>(count);
+        var vals = new List<FieldValue>(count);
+        ulong state = 0x9E3779B97F4A7C15;
+        for (var i = 0L; i < count; i++)
+        {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            ts.Add(1_000_000_000 + i * 100);
+            vals.Add(FieldValue.FromDouble((double)(long)(state >> 20) * 1e-6));
+        }
+        SegmentWriter.WriteColumns(segPath,
+            [new SegmentColumn("cpu", "host=server01", "value", FieldKind.Float, ts[0], ts[^1], ts, vals)]);
+        Assert.True(new FileInfo(segPath).Length > 8L * 1024 * 1024, $"segment was only {new FileInfo(segPath).Length} bytes");
+
+        // First read verifies the CRC in a streaming pass and succeeds.
+        var columns = SegmentReader.ReadSegment(segPath);
+        Assert.Equal(count, columns[0].Timestamps.Count);
+
+        // Corrupt a payload byte (mtime changes with the rewrite), forcing re-verification.
+        var bytes = File.ReadAllBytes(segPath);
+        bytes[bytes.Length / 2] ^= 0xFF;
+        File.WriteAllBytes(segPath, bytes);
+
+        var ex = Assert.Throws<InvalidDataException>(() => SegmentReader.ReadSegment(segPath));
+        Assert.Contains("CRC", ex.Message);
+    }
+
+    [Fact]
     public void WriteSegment_MultipleMeasurements_AllWrittenCorrectly()
     {
         var points = new List<Point>

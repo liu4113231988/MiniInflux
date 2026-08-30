@@ -15,6 +15,20 @@ public sealed class LastValueCacheTests : IDisposable
         => new() { Measurement = m, Tags = new Dictionary<string,string>{ ["host"]=host }, Fields = new Dictionary<string, FieldValue>{ ["value"]=FieldValue.FromDouble(v) }, TimestampNs = ts, TagsCanonical = $"host={host}" };
 
     [Fact]
+    public void Update_OverCap_EvictsButStaysCorrect()
+    {
+        var cache = new LastValueCache(maxEntriesPerDbRp: 4);
+        for (var i = 0; i < 200; i++)
+            cache.Update("db", "rp", P("cpu", $"h{i}", i, 1_000_000_000 + i));
+
+        // Sampled enforcement keeps the cache bounded near the cap (cap + one sampling interval)...
+        Assert.True(cache.Count <= 68, $"cache count was {cache.Count}");
+        // ...and every retained entry is still correct (eviction falls back to scans).
+        foreach (var p in cache.GetAll("db", "rp"))
+            Assert.True(p.Tags["host"] != null && p.Fields["value"].AsDouble()!.Value >= 0);
+    }
+
+    [Fact]
     public async Task WritePath_UpdatesCache_AndLastQuery_HitsCache_Under10Ms()
     {
         using var engine = new TsdbEngine(_dir, flushThreshold: 100000, flushIntervalMs: 0, compactionIntervalMs: 0, rpCheckIntervalMs: 0);

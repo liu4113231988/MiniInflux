@@ -65,8 +65,13 @@ public sealed class TsdbEngine : IDisposable
     // the buffer instead of flushing synchronously — segment encoding/CRC/fsync no longer stall
     // writers. Points stay in the buffer (and WAL) until the flush completes, so reads keep
     // seeing them and crash recovery is unaffected.
+    private readonly long _minFreeDiskBytes;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Task> _flushInFlight = new(StringComparer.Ordinal);
-    private readonly LastValueCache _lastValueCache = new();
+    // Min timestamp held by each in-flight flush snapshot, per db|rp. Snapshots may carry points that
+    // a concurrent DELETE has already purged from the buffer; tombstone GC uses this floor to avoid
+    // retiring coverage for data those snapshots will still write to segments.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _flushSnapshotMinTs = new(StringComparer.Ordinal);
+    private readonly LastValueCache _lastValueCache;
     private readonly DistinctValueCache _distinctCache = new();
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
@@ -82,13 +87,20 @@ public sealed class TsdbEngine : IDisposable
         long maxSegmentFileBytes = 0,
         long minSegmentFileBytes = 0,
         double segmentFillRatio = 0.5,
-        long compactionMaxWriteBytesPerSecond = 0)
+        long compactionMaxWriteBytesPerSecond = 0,
+        long minFreeDiskBytes = 0,
+        int lastValueCacheMaxEntries = 0)
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
+        _lastValueCache = new LastValueCache(lastValueCacheMaxEntries);
         _queryGate = new SemaphoreSlim(maxConcurrentQueries > 0 ? maxConcurrentQueries : Math.Min(Environment.ProcessorCount, 8), int.MaxValue);
         _maxQueryMemoryBytes = maxQueryMemoryBytes > 0 ? maxQueryMemoryBytes : 512L * 1024 * 1024;
         _maxSegmentFileBytes = maxSegmentFileBytes > 0 ? maxSegmentFileBytes : 512L * 1024 * 1024;
         _minSegmentFileBytes = minSegmentFileBytes > 0 ? minSegmentFileBytes : 0;
+        _minFreeDiskBytes = minFreeDiskBytes;
+        _health.SetDiskSpaceProbe(
+            () => new DriveInfo(Path.GetPathRoot(Path.GetFullPath(_root))!).AvailableFreeSpace,
+            minFreeDiskBytes);
         // ponytail: tail-merge ratio. When the remaining pending points fit under
         // (maxSegmentFileBytes * segmentFillRatio), they are merged into the current file instead of
         // being split off into a tiny trailing .seg. This caps the file count on HDD/network storage
@@ -109,7 +121,8 @@ public sealed class TsdbEngine : IDisposable
             health: _health,
             maxSegmentFileBytes: _maxSegmentFileBytes,
             segmentFillRatio: _segmentFillRatio,
-            maxWriteBytesPerSecond: compactionMaxWriteBytesPerSecond);
+            maxWriteBytesPerSecond: compactionMaxWriteBytesPerSecond,
+            inFlightFlushMinTs: GetInFlightFlushMinTs);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
         if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => RunCompaction(), null, compactionIntervalMs, compactionIntervalMs);
         if (flushIntervalMs > 0) _flushTimer = new Timer(_ => PeriodicFlush(), null, flushIntervalMs, flushIntervalMs);
@@ -119,32 +132,47 @@ public sealed class TsdbEngine : IDisposable
     {
         var result = new RecoveryResult();
 
-        // Phase 1: Replay WAL records into buffer with schema validation
+        // Phase 1: Replay WAL records into buffer with schema validation.
+        // Records are grouped per (db, rp) first so each group acquires the global + per-key locks
+        // once instead of once per point — a large WAL previously made startup O(points x locks).
+        // Append order within a group is preserved, which is all the buffer's seq/dedup logic needs.
+        var walGroups = new Dictionary<(string Db, string Rp), List<WalReplayPoint>>();
         foreach (var replayPoint in _wal.ReplayWithPositions())
         {
             result.WalRecordsReplayed++;
             CreateDatabase(replayPoint.Db);
+            var groupKey = (replayPoint.Db, replayPoint.Rp);
+            if (!walGroups.TryGetValue(groupKey, out var group)) walGroups[groupKey] = group = [];
+            group.Add(replayPoint);
+        }
 
-            // Validate schema for replayed points (skip conflicting records instead of aborting startup)
-            var validPoints = new List<BufferedPoint>();
-            try
+        foreach (var ((db, rp), records) in walGroups)
+        {
+            var validPoints = new List<BufferedPoint>(records.Count);
+            foreach (var replayPoint in records)
             {
-                _schema.ValidateAndRegister(replayPoint.Db, replayPoint.Point.Measurement, [replayPoint.Point]);
-                var seriesKey = SeriesKey.From(replayPoint.Point);
-                validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey, Interlocked.Increment(ref _bufferSeq)));
+                // Validate schema for replayed points (skip conflicting records instead of aborting startup)
+                try
+                {
+                    _schema.ValidateAndRegister(db, replayPoint.Point.Measurement, [replayPoint.Point]);
+                    var seriesKey = SeriesKey.From(replayPoint.Point);
+                    validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey, Interlocked.Increment(ref _bufferSeq)));
+                }
+                catch (FieldConflictException) { result.SchemaConflictsSkipped++; }
             }
-            catch (FieldConflictException) { result.SchemaConflictsSkipped++; }
+
+            if (validPoints.Count == 0) continue;
 
             _globalLock.EnterWriteLock();
             try
             {
-                var key = K(replayPoint.Db, replayPoint.Rp);
+                var key = K(db, rp);
                 var lk = GetLock(key, alreadyHoldingGlobalWrite: true);
                 lk.EnterWriteLock();
                 try
                 {
                     if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
-                    AddBufferedPoints(key, list, validPoints); TrackSeriesKeys(replayPoint.Db, validPoints);
+                    AddBufferedPoints(key, list, validPoints); TrackSeriesKeys(db, validPoints);
                     _lastBufferWriteTicks[key] = DateTime.UtcNow.Ticks;
                     UpdateBufferReplayFloor(key, list);
                 }
@@ -207,6 +235,8 @@ public sealed class TsdbEngine : IDisposable
     {
         if (!_health.WriteAvailable)
             throw new IOException("write path is unavailable after a WAL persistence failure");
+        if (!_health.IsDiskSpaceSufficient())
+            throw new DiskSpaceExceededException($"insufficient disk space: below the configured minimum of {_minFreeDiskBytes} bytes");
         // EnsureDatabase/EnsureRp/CreateDirectory are idempotent; do them once per (db,rp) per
         // session instead of on every write batch.
         if (_ensuredDbRp.TryAdd(K(db, rp), 0))
@@ -561,7 +591,7 @@ public sealed class TsdbEngine : IDisposable
         }
         finally { lk.ExitReadLock(); }
 
-        var segments = _shards.ListSegments(db, rp, min, max);
+        var segments = ListReadableSegments(db, rp, min, max);
 
         // Fast path: single segment — read sequentially and merge with buffer (limit-aware).
         if (segments.Count <= 1)
@@ -669,7 +699,7 @@ public sealed class TsdbEngine : IDisposable
     }
 
     public bool HasSegments(string db, string rp, long? min, long? max) =>
-        _shards.ListSegments(db, rp, min, max).Count > 0;
+        ListReadableSegments(db, rp, min, max).Count > 0;
 
     public DescendingSeriesReadResult? TryReadBufferedSeriesDescending(string db, string rp, string measurement, string tagsCanonical,
         long? min, long? max, HashSet<string>? requestedFields = null, int? limit = null, CancellationToken cancellationToken = default)
@@ -1009,7 +1039,7 @@ public sealed class TsdbEngine : IDisposable
         long cutoff = limit.HasValue && result.Count >= limit.Value ? KthLargestTimestamp(result, limit.Value) : long.MinValue;
 
         var candidates = new List<(string Path, long MaxTime)>();
-        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var (segPath, _) in ListReadableSegments(db, rp, min, max))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var maxTime = long.MinValue;
@@ -1112,7 +1142,7 @@ public sealed class TsdbEngine : IDisposable
         long cutoff = limit.HasValue && result.Count >= limit.Value ? KthSmallestTimestamp(result, limit.Value) : long.MaxValue;
 
         var candidates = new List<(string Path, long MinTime)>();
-        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var (segPath, _) in ListReadableSegments(db, rp, min, max))
         {
             cancellationToken.ThrowIfCancellationRequested();
             long minTime = long.MaxValue;
@@ -1316,7 +1346,7 @@ public sealed class TsdbEngine : IDisposable
         var buffered = SnapshotBufferedForStream(db, rp, meas, min, max, requestedFields, allowedTagsCanonical);
         streamContext.EstimatedBytes += buffered.Count * 128L;
         CheckStreamMemoryBudget(streamContext.EstimatedBytes);
-        var segments = _shards.ListSegments(db, rp, min, max);
+        var segments = ListReadableSegments(db, rp, min, max);
 
         // Priority encodes recency: ListSegments yields oldest (most compacted) first; the buffer
         // holds the newest writes and always wins.
@@ -1762,7 +1792,7 @@ return Interlocked.Read(ref _bufferedByteCount);
 
         var reads = new System.Collections.Concurrent.ConcurrentBag<(IReadOnlyList<SegmentColumnMeta> Metas, bool UsedFooter)>();
         Parallel.ForEach(
-            _shards.ListSegments(db, rp, min, max),
+            ListReadableSegments(db, rp, min, max),
             new ParallelOptions { CancellationToken = cancellationToken, MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8) },
             segment =>
             {
@@ -1804,7 +1834,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         CancellationToken cancellationToken)
     {
         var hasTombstones = _tombstones.HasTombstones(db);
-        var segments = _shards.ListSegments(db, rp, min, max);
+        var segments = ListReadableSegments(db, rp, min, max);
 
         // Read timestamps from segments in parallel; value blocks are skipped.
         var bag = new System.Collections.Concurrent.ConcurrentBag<List<SegmentTimestampColumn>>();
@@ -1919,6 +1949,7 @@ return Interlocked.Read(ref _bufferedByteCount);
 
     private void RunCompaction()
     {
+        if (IsBackupInProgress()) return; // a compaction during backup would delete/rename copied segments
         try
         {
             if (_compactor.CompactAll() > 0) InvalidateSegmentMetadataIndex();
@@ -1937,7 +1968,10 @@ return Interlocked.Read(ref _bufferedByteCount);
             _ensuredDbRp.TryRemove(ensured, out _);
         _lastValueCache.ClearDb(db);
         _globalLock.EnterWriteLock();
-        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); _locks.TryRemove(k, out var lk); lk?.Dispose(); _bufferReplayFloors.TryRemove(k, out _); _lastBufferWriteTicks.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
+        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); // Do NOT dispose the removed lock: another thread may have obtained it via GetLock's
+        // GetOrAdd right before the removal, and disposing it would pull an ObjectDisposedException
+        // out from under that thread. The lock object is tiny and GC-collectable once unreferenced.
+        _locks.TryRemove(k, out _); _bufferReplayFloors.TryRemove(k, out _); _lastBufferWriteTicks.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
         finally { _globalLock.ExitWriteLock(); }
     }
 
@@ -2246,7 +2280,7 @@ return Interlocked.Read(ref _bufferedByteCount);
             yield break;
         }
 
-        foreach (var (path, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var (path, _) in ListReadableSegments(db, rp, min, max))
         {
             cancellationToken.ThrowIfCancellationRequested();
             IndexedSegmentMetadata metadata;
@@ -2283,6 +2317,19 @@ return Interlocked.Read(ref _bufferedByteCount);
     /// <summary>
     /// Get cache statistics for diagnostics.
     /// </summary>
+    /// <summary>Segment paths that failed structural verification and are excluded from reads.</summary>
+    public IReadOnlyCollection<string> QuarantinedSegments => SegmentReader.Quarantined;
+
+    /// <summary>Segment listing that skips quarantined (structurally corrupt) files.</summary>
+    private IReadOnlyList<(string SegPath, ShardGroupInfo Shard)> ListReadableSegments(
+        string db, string rp, long? min, long? max)
+    {
+        var segments = _shards.ListSegments(db, rp, min, max);
+        return segments.Count == 0
+            ? segments
+            : segments.Where(s => !SegmentReader.IsQuarantined(s.SegPath)).ToList();
+    }
+
     public (long Hits, long Misses, int CachedCount) GetMetadataCacheStats() =>
         (Interlocked.Read(ref _metadataCacheHits), Interlocked.Read(ref _metadataCacheMisses), _segmentMetadataCache.Count);
 
@@ -2433,8 +2480,8 @@ return Interlocked.Read(ref _bufferedByteCount);
         var flushedSnapshot = l.ToArray();
         FlushPointsToSegments(db, rp, l);
 
-        // sync path: cache already updated at write time, validate via footer maxTime by re-asserting flushed values
-        foreach (var bp in flushedSnapshot) _lastValueCache.Update(db, rp, bp.Point);
+        // Cache was already updated per point at write time; footer validation backfills anything
+        // stale or missing, so re-asserting every flushed point here is redundant work.
         ValidateLastValueCacheFromFooter(db, rp, flushedSnapshot);
 
         _bufferedPointCount -= flushCount;
@@ -2535,6 +2582,11 @@ return Interlocked.Read(ref _bufferedByteCount);
 
         var snapshot = list.ToArray();
         var maxSeq = snapshot[^1].Seq; // seq is assigned in append order, so the last one is max
+        long snapshotMinTs = long.MaxValue;
+        foreach (var bp in snapshot)
+            if (bp.Point.TimestampNs < snapshotMinTs)
+                snapshotMinTs = bp.Point.TimestampNs;
+        _flushSnapshotMinTs[key] = snapshotMinTs;
         _flushInFlight[key] = Task.Run(() => FlushSnapshotAsync(db, rp, key, snapshot, maxSeq));
     }
 
@@ -2599,7 +2651,36 @@ return Interlocked.Read(ref _bufferedByteCount);
         finally
         {
             _flushInFlight.TryRemove(key, out _);
+            // Snapshot points are either in segments or back in the buffer by now, so the floor
+            // tracking is done either way (the buffer accounts for them after a failed flush).
+            _flushSnapshotMinTs.TryRemove(key, out _);
         }
+    }
+
+    private bool ProbeDataDirWritable()
+    {
+        try
+        {
+            var probe = Path.Combine(_root, ".health-probe");
+            File.WriteAllBytes(probe, [1]);
+            File.Delete(probe);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Min timestamp held by any in-flight flush snapshot of the database (long.MaxValue when none).
+    /// Consumed by tombstone GC: data at or above this floor may still land in a new segment.
+    /// </summary>
+    private long GetInFlightFlushMinTs(string db)
+    {
+        long min = long.MaxValue;
+        var prefix = db + "|";
+        foreach (var kv in _flushSnapshotMinTs)
+            if (kv.Key.StartsWith(prefix, StringComparison.Ordinal) && kv.Value < min)
+                min = kv.Value;
+        return min;
     }
 
     /// <summary>
@@ -2701,6 +2782,28 @@ return Interlocked.Read(ref _bufferedByteCount);
             finally { lk.ExitWriteLock(); }
         }
         UpdateWalCheckpoint();
+    }
+
+    private int _backupInProgress;
+
+    private bool IsBackupInProgress() => Interlocked.CompareExchange(ref _backupInProgress, 0, 0) == 1;
+
+    /// <summary>
+    /// Online backup of a consistent on-disk state. Flushes buffers and advances the WAL checkpoint
+    /// so pre-backup points live in immutable segments, then pauses compaction and shard expiry for
+    /// the duration of the copy so segment files referenced by the manifest cannot disappear.
+    /// Writes that arrive during the copy land in the WAL/segments but are not part of the snapshot.
+    /// </summary>
+    public void CreateConsistentBackup(string destination)
+    {
+        if (Interlocked.Exchange(ref _backupInProgress, 1) != 0)
+            throw new InvalidOperationException("a backup is already in progress");
+        try
+        {
+            FlushAll();
+            BackupManager.CreateBackup(_root, destination);
+        }
+        finally { Interlocked.Exchange(ref _backupInProgress, 0); }
     }
 
     public void FlushAll()
@@ -3000,6 +3103,7 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
 
     private void CleanupExpiredShards()
     {
+        if (IsBackupInProgress()) return; // shard expiry during backup would delete copied shard dirs
         try
         {
             var removed = _shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000);
@@ -3072,6 +3176,10 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
 
     private void PeriodicFlush()
     {
+        // Self-heal: when writes are latched (transient WAL/disk failure), probe the data dir
+        // periodically and unlatch writes once a small write succeeds again.
+        if (_health.NeedsRecoveryProbe)
+            _health.TryRecover(ProbeDataDirWritable);
         try
         {
             var coldBefore = DateTime.UtcNow.Ticks - _flushColdTicks;
@@ -3120,6 +3228,12 @@ public sealed class RecoveryResult
 public sealed class CardinalityLimitExceededException : Exception
 {
     public CardinalityLimitExceededException(string message) : base(message) { }
+}
+
+/// <summary>Thrown when free disk space is below Storage.MinFreeDiskBytes.</summary>
+public sealed class DiskSpaceExceededException : Exception
+{
+    public DiskSpaceExceededException(string message) : base(message) { }
 }
 
 public sealed class MemoryLimitExceededException : Exception

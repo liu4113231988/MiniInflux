@@ -9,7 +9,7 @@ MiniInflux.Net10 is a small single-node time-series database built with .NET 10 
 ### Highlights
 
 - HTTP endpoints: `GET /ping`, `GET /health`, `GET /debug/stats`, `GET /debug/benchmark`, `GET /metrics`, `POST /write`, `POST /api/v2/write`, `GET|POST /query`, `POST /api/v3/query_influxql`
-- InfluxQL subset: `CREATE DATABASE`, `SHOW ...`, `SELECT`, `GROUP BY time(...)`, `fill(...)`, `SELECT ... INTO ...`, `DELETE`, `DROP SERIES`, `CREATE|SHOW|DROP CONTINUOUS QUERY`
+- InfluxQL subset: `CREATE DATABASE`, `SHOW ...`, `SELECT` (incl. `AS` aliases), `GROUP BY time(...)`, `fill(...)`, `SELECT ... INTO ...`, `DELETE`, `DROP SERIES`, `CREATE|SHOW|DROP CONTINUOUS QUERY`; `format=csv` server-side CSV output on both query endpoints
 - Parameterized queries: `$name` placeholders in WHERE predicates bound per request on `/query` and `/api/v3/query_influxql` (no SQL text concatenation, parse-tree cached)
 - Storage path: write queue, WAL recovery, segment compaction, schema registry, manifest/index metadata
 - Operations: admin UI at `/admin`, CLI commands for `benchmark`, `inspect`, `validate`, `repair`, `compact`, `backup`, `restore`
@@ -85,8 +85,8 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
 - `GET /ping`
 - `POST /write?db=metrics&precision=ns|u|ms|s|m|h`
 - `POST /api/v2/write?bucket=metrics&org=&precision=...`（v2 兼容写入，`bucket` 支持 `db/rp` 形式，接受 `Authorization: Token xxx`）
-- `GET|POST /query?db=metrics&q=...`
-- `POST /api/v3/query_influxql`（JSON 请求体 `{db, q, params?, format?, epoch?}`）
+- `GET|POST /query?db=metrics&q=...&format=csv`（`format=csv` 返回服务器端 CSV）
+- `POST /api/v3/query_influxql`（JSON 请求体 `{db, q, params?, format?(json|csv), epoch?}`）
 - Line Protocol 写入
   - 首次向不存在的 `db` 写入时会自动创建数据库和默认 RP `autogen`
 - InfluxQL 子集：
@@ -107,6 +107,7 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
   - 已支持 `GROUP BY time(...)`、`GROUP BY tag`、`GROUP BY time(...),tag`
   - 已支持 `GROUP BY *`，用于在 `SELECT INTO` / Continuous Query 中保留源 tags
   - 已支持 `fill(none|null|previous|linear|zero)`、`ORDER BY time DESC`、`SLIMIT`、`SOFFSET`
+  - 已支持 `AS` 别名（`SELECT mean(value) AS m FROM cpu`）；`time = X` 相等过滤（min=max 区间）
 - `SELECT ... INTO ...`
   - 支持写回 `measurement`、`db.measurement`、`db.rp.measurement`
 - `DELETE` / `DROP SERIES`
@@ -119,14 +120,21 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
   - `MaxQueryDuration`、`MaxQueryPoints`、`MaxResponseRows`、`MaxQueryMemoryBytes`
 - 写入保护
   - `MaxRequestBodyBytes`、`MaxBufferPoints`、`MaxBufferBytes`
+  - 磁盘空间门控：空闲空间低于 `MinFreeDiskBytes` 时写入直接返回 503（5s 缓存探测），并在存储故障解除后周期探测自动恢复写路径
 - 权限与认证
-  - HTTP Basic 认证；query 参数认证默认关闭，仅兼容模式启用
-  - `Authorization: Bearer/Token` 命名 token（`POST/GET /admin/api/tokens`、`DELETE /admin/api/tokens/{id}`，等权于超级管理员）
+  - HTTP Basic 认证（全权）；query 参数认证默认关闭，仅兼容模式启用
+  - `Authorization: Bearer/Token` 命名 token（`POST/GET /admin/api/tokens`、`DELETE /admin/api/tokens/{id}`），创建时可指定权限分级 `all`（默认）/`read`/`write`：`read` 仅可查询与只读管理，`write` 仅可写入；存量 token 缺省按 `all` 处理
   - 配置文件中的单一超级管理员账号
-  - 不支持运行时创建用户、改密或细粒度授权
+  - 不支持运行时创建用户、改密或按 db 授权
 - WAL + Segment 存储
 - Segment v3 列编码：时间戳 `delta-of-delta/Gorilla`、浮点 `legacy XOR/Gorilla`、整数 delta、bool bit-pack、string 字典
 - 自适应浮点压缩策略：在 `legacy_raw`、`legacy_brotli`、`gorilla_raw` 之间按体积/速度折中选择
+- 存储健壮性
+  - 在线备份一致性：备份前 flush + WAL checkpoint，备份期间暂停 compaction/shard 过期，manifest 最后拷贝并补齐引用段
+  - 墓碑 GC：compaction 全量重写 shard 后回收已应用的 delete 覆盖范围，DELETE 不再留下永久读放大
+  - 部分过期：compaction 合并时丢弃早于 `now - duration` 的点（有界 RP），shard 内数据不再陪跑到整 shard 老化
+  - 损坏段隔离：结构校验失败的 segment 进入 quarantine，不再被查询反复读取，`/debug/stats` 报告计数
+  - 缓存上限：CRC 校验缓存与 Last Value Cache 均有逐出上限（`LastValueCacheMaxEntries`），超限回退全扫保证正确性
 - 管理 CLI：`benchmark`、`inspect`、`validate`、`repair`、`compact`、`backup`、`restore`
 - Native AOT 友好：无动态代理、JSON Source Generator
 
