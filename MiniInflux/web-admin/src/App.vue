@@ -31,6 +31,7 @@ const backupPath = ref('./backup/admin-snapshot')
 const restorePath = ref('./backup/admin-snapshot')
 const tokens = ref([])
 const newTokenName = ref('')
+const newTokenPermissions = ref('all')
 const createdToken = ref(null)
 const newDbName = ref('')
 const newRp = ref({ db: '', name: '', duration: '7d', isDefault: false })
@@ -189,7 +190,7 @@ async function createToken() {
   if (!newTokenName.value.trim()) { error.value = '请输入令牌名称（A-Za-z0-9 _ -，1..64）'; return }
   busy.value = true; error.value = ''; notice.value = ''
   try {
-    const rec = await api('/admin/api/tokens', { method: 'POST', body: JSON.stringify({ name: newTokenName.value.trim() }) })
+    const rec = await api('/admin/api/tokens', { method: 'POST', body: JSON.stringify({ name: newTokenName.value.trim(), permissions: newTokenPermissions.value }) })
     createdToken.value = rec
     newTokenName.value = ''
     await loadTokens()
@@ -727,7 +728,7 @@ onMounted(async () => {
 
       <section v-else-if="activeTab === 'tokens'" class="page">
         <article class="panel">
-          <div class="section-title">令牌管理（等权 Bearer Token，与 Basic 并存）</div>
+          <div class="section-title">令牌管理（分级权限 Bearer Token，与 Basic 并存）</div>
           <div class="subtle">创建后 token 仅显示一次，请立即复制；列表仅展示前缀。用于 <code>Authorization: Bearer &lt;token&gt;</code> 或 <code>Token &lt;token&gt;</code>。</div>
           <div v-if="createdToken" class="banner success" style="margin-top:12px; word-break:break-all">
             <div><strong>新令牌：{{ createdToken.name }}</strong> <span class="subtle">({{ createdToken.prefix }}...)</span></div>
@@ -737,14 +738,19 @@ onMounted(async () => {
           </div>
           <div class="query-form" style="grid-template-columns: 1fr auto; margin-top:14px">
             <input v-model.trim="newTokenName" placeholder="新令牌名称（A-Za-z0-9 _ -，1..64）" @keyup.enter="createToken" />
+            <select v-model="newTokenPermissions" style="margin-left:8px">
+              <option value="all">all（全权）</option>
+              <option value="read">read（只读查询）</option>
+              <option value="write">write（仅写入）</option>
+            </select>
             <button class="primary" :disabled="busy" @click="createToken">创建令牌</button>
           </div>
           <div class="table-wrap">
             <table class="table">
-              <thead><tr><th>名称</th><th>前缀</th><th>ID</th><th>创建时间(ns)</th><th>操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>前缀</th><th>权限</th><th>ID</th><th>创建时间(ns)</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="t in tokens" :key="t.id">
-                  <td>{{ t.name }}</td><td style="font-family:monospace">{{ t.prefix }}</td><td style="font-family:monospace; font-size:11px">{{ t.id.slice(0,8) }}…</td><td>{{ t.createdAtNs }}</td>
+                  <td>{{ t.name }}</td><td style="font-family:monospace">{{ t.prefix }}</td><td>{{ t.permissions || 'all' }}</td><td style="font-family:monospace; font-size:11px">{{ t.id.slice(0,8) }}…</td><td>{{ t.createdAtNs }}</td>
                   <td><button class="danger" :disabled="busy" @click="revokeToken(t.id, t.name)">吊销</button></td>
                 </tr>
               </tbody>

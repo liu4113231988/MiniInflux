@@ -17,7 +17,12 @@ public sealed class ApiToken
     public string TokenHash { get; set; } = "";
     /// <summary>明文前缀（前 8 字符）用于列表展示，不泄露完整 token.</summary>
     public string Prefix { get; set; } = "";
+    /// <summary>权限分级：all（默认）| read | write。缺省字段（旧数据）按 all 处理.</summary>
+    public string Permissions { get; set; } = "all";
     public long CreatedAtNs { get; set; }
+
+    public static bool IsValidPermission(string permission) =>
+        permission is "all" or "read" or "write";
 }
 
 public sealed class TokenStore
@@ -76,12 +81,14 @@ public sealed class TokenStore
     /// Create a new named token. Name must be unique, 1..64 chars, [A-Za-z0-9_-].
     /// Returns (record, rawToken) — rawToken is shown only once.
     /// </summary>
-    public (ApiToken Record, string RawToken) Create(string name)
+    public (ApiToken Record, string RawToken) Create(string name, string permissions = "all")
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("token name is required", nameof(name));
         name = name.Trim();
         if (name.Length > 64) throw new ArgumentException("token name must be <=64 chars", nameof(name));
         if (!IsValidName(name)) throw new ArgumentException("token name may only contain A-Za-z0-9 _ -", nameof(name));
+        permissions = permissions?.Trim().ToLowerInvariant() ?? "all";
+        if (!ApiToken.IsValidPermission(permissions)) throw new ArgumentException("token permissions must be all, read or write", nameof(permissions));
 
         lock (_lock)
         {
@@ -102,6 +109,7 @@ public sealed class TokenStore
                 Name = name,
                 TokenHash = hash,
                 Prefix = prefix,
+                Permissions = permissions,
                 CreatedAtNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000
             };
             _byId[id] = rec;

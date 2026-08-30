@@ -23,6 +23,8 @@ public sealed class AuthenticationAttempt
 
     public bool Authenticated => Status == AuthenticationAttemptStatus.Success;
     public bool IsRateLimited => Status == AuthenticationAttemptStatus.RateLimited;
+    /// <summary>Granted permission tier for successful auth: all（默认）| read | write.</summary>
+    public string Permission { get; init; } = "all";
 }
 
 public sealed class AuthenticationGuard
@@ -81,8 +83,9 @@ public sealed class AuthenticationGuard
             if (state.FailureCount > 0 && now - state.WindowStartedUtc >= _failureWindow)
                 state.Reset();
 
+            var grantedPermission = "all";
             var credentialsOk = source == "token"
-                ? TokenMatches(password ?? "")
+                ? (grantedPermission = ResolveTokenPermission(password ?? "")) != null
                 : CredentialsMatch(userName, password);
             if (credentialsOk)
             {
@@ -92,7 +95,8 @@ public sealed class AuthenticationGuard
                     Status = AuthenticationAttemptStatus.Success,
                     ClientId = clientId,
                     CredentialSource = source,
-                    PresentedUserName = _options.Username
+                    PresentedUserName = _options.Username,
+                    Permission = grantedPermission
                 };
             }
 
@@ -156,23 +160,27 @@ public sealed class AuthenticationGuard
     /// <summary>
     /// InfluxDB 2.x/3.x clients send `Authorization: Token xxx` (or `Bearer xxx`) instead of
     /// Basic auth. P2 等权 token 与超管密码并存：先查 TokenStore（多命名 token），再回退到密码/组合形式。
+    /// Returns the granted permission tier when the token matches, null otherwise.
     /// </summary>
-    private bool TokenMatches(string token)
+    private string? ResolveTokenPermission(string token)
     {
         if (string.IsNullOrEmpty(token))
-            return false;
+            return null;
 
-        // P2: named equal-weight tokens
-        if (_tokenStore != null && _tokenStore.Validate(token) != null)
-            return true;
+        // named tokens carry their own permission tier
+        var record = _tokenStore?.Validate(token);
+        if (record != null)
+            return MiniInflux.Net10.Storage.ApiToken.IsValidPermission(record.Permissions) ? record.Permissions : "all";
 
         var expected = Encoding.UTF8.GetBytes(_options.Password);
         var actual = Encoding.UTF8.GetBytes(token);
         if (expected.Length == actual.Length && CryptographicOperations.FixedTimeEquals(expected, actual))
-            return true;
+            return "all";
 
         var combined = Encoding.UTF8.GetBytes($"{_options.Username}:{_options.Password}");
-        return combined.Length == actual.Length && CryptographicOperations.FixedTimeEquals(combined, actual);
+        return combined.Length == actual.Length && CryptographicOperations.FixedTimeEquals(combined, actual)
+            ? "all"
+            : null;
     }
 
     private bool RateLimitEnabled =>
