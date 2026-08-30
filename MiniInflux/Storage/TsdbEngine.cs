@@ -1943,7 +1943,10 @@ return Interlocked.Read(ref _bufferedByteCount);
             _ensuredDbRp.TryRemove(ensured, out _);
         _lastValueCache.ClearDb(db);
         _globalLock.EnterWriteLock();
-        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); _locks.TryRemove(k, out var lk); lk?.Dispose(); _bufferReplayFloors.TryRemove(k, out _); _lastBufferWriteTicks.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
+        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); // Do NOT dispose the removed lock: another thread may have obtained it via GetLock's
+        // GetOrAdd right before the removal, and disposing it would pull an ObjectDisposedException
+        // out from under that thread. The lock object is tiny and GC-collectable once unreferenced.
+        _locks.TryRemove(k, out _); _bufferReplayFloors.TryRemove(k, out _); _lastBufferWriteTicks.TryRemove(k, out _); } _seriesKeys.TryRemove(db, out _); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
         finally { _globalLock.ExitWriteLock(); }
     }
 
