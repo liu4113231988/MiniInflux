@@ -100,6 +100,7 @@ public static class QueryParamBinder
             ">" => (ns + 1, null),
             "<=" => (null, ns),
             "<" => (null, ns - 1),
+            "=" => (ns, ns),
             _ => throw new FormatException($"operator {param.Op} is not supported for time parameters")
         };
     }

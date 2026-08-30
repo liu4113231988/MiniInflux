@@ -460,4 +460,31 @@ public class AggregationTests : IDisposable
                 Directory.Delete(dir, true);
         }
     }
+
+    [Fact]
+    public async Task Select_AsAlias_UsesAliasInColumnHeader()
+    {
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT mean(value) AS avg_value FROM cpu GROUP BY time(100s)");
+        Assert.Null(result.Results[0].Error);
+        var series = result.Results[0].Series!;
+        Assert.Contains("avg_value", series[0].Columns);
+        Assert.DoesNotContain("mean_value", series[0].Columns);
+    }
+
+    [Fact]
+    public async Task Select_TimeEqualityFilter_ReturnsOnlyExactTimestamp()
+    {
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT value FROM cpu WHERE time = 5000000000");
+        Assert.Null(result.Results[0].Error);
+        var series = result.Results[0].Series!;
+        Assert.True(series.Count > 0);
+        var row = Assert.Single(series[0].Values);
+        Assert.Equal("1970-01-01T00:00:05.000000000Z", Assert.IsType<string>(row[0]));
+        // Raw SELECT results also carry tag columns; locate the field column by name.
+        var valueIndex = series[0].Columns.IndexOf("value");
+        Assert.True(valueIndex > 0);
+        Assert.Equal(5.0, Convert.ToDouble(row[valueIndex]));
+    }
 }
