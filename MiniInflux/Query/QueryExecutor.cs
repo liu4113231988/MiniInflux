@@ -1826,12 +1826,22 @@ public sealed class QueryExecutor
 
     static List<List<object?>> BuildGroupedRows(List<Point> groupPts, List<SelectItem> items, long? bucketTimeNs, CancellationToken cancellationToken)
     {
+        // ponytail: pairs are built once per distinct field and shared across the aggregate items of
+        // this group, instead of re-filtering and re-sorting the group for every item.
+        var pairsByField = new Dictionary<string, List<(long TimestampNs, FieldValue Value)>>(StringComparer.Ordinal);
+        List<(long TimestampNs, FieldValue Value)> PairsFor(string field)
+        {
+            if (!pairsByField.TryGetValue(field, out var pairs))
+                pairs = pairsByField[field] = BuildValuePairs(groupPts, field);
+            return pairs;
+        }
+
         if (!items.Any(IsRowExpandingGroupFunction))
         {
             var row = new List<object?> { Time(bucketTimeNs ?? 0) };
             foreach (var it in items)
             {
-                var pairs = BuildValuePairs(groupPts, it.Field);
+                var pairs = PairsFor(it.Field);
                 var groupValues = pairs.Select(p => p.Value).ToList();
                 var groupTimestamps = pairs.Select(p => p.TimestampNs).ToList();
                 row.Add(Calc(groupValues, it.Func, it.Param, groupTimestamps, it.UnitNs));
@@ -1849,7 +1859,7 @@ public sealed class QueryExecutor
                 continue;
             }
 
-            var pairs = BuildValuePairs(groupPts, item.Field);
+            var pairs = PairsFor(item.Field);
             var values = pairs.Select(p => p.Value).ToList();
             var timestamps = pairs.Select(p => p.TimestampNs).ToList();
             var scalar = Calc(values, item.Func, item.Param, timestamps, item.UnitNs, item.IsCountDistinct);
@@ -2510,6 +2520,18 @@ public sealed class QueryExecutor
             var filledRows = new List<List<object?>>();
             var prevValues = new object?[items.Count];
             var original = series.Values.ToDictionary(row => ParseTimeNs(row[0]), row => row);
+            // ponytail: per-column valid (time, value) pairs sorted by time, so linear fill locates
+            // its neighbors by binary search instead of two full scans per missing bucket per column.
+            var validByCol = new List<(long T, double V)>[items.Count];
+            for (int i = 0; i < items.Count; i++)
+            {
+                var valid = new List<(long T, double V)>();
+                foreach (var row in series.Values)
+                    if (row.Count > i + 1 && TryDouble(row[i + 1], out var d))
+                        valid.Add((ParseTimeNs(row[0]), d));
+                valid.Sort((a, b) => a.T.CompareTo(b.T));
+                validByCol[i] = valid;
+            }
             for (long t = minBucket; t <= maxBucket; t += step)
             {
                 if (timeSet.Contains(t))
@@ -2529,7 +2551,7 @@ public sealed class QueryExecutor
                     {
                         FillMode.Zero => 0,
                         FillMode.Previous => prevValues[i],
-                        FillMode.Linear => LinearFill(original, t, i + 1),
+                        FillMode.Linear => LinearFill(validByCol[i], t),
                         _ => null
                     });
                 }
@@ -2788,24 +2810,31 @@ public sealed class QueryExecutor
     static Dictionary<Dictionary<string,string>, List<Point>> GroupPointsByTag(List<Point> points, List<string> groupByTags, bool groupByAllTags)
     {
         var groups = new Dictionary<string, (Dictionary<string,string> Tags, List<Point> Points)>(StringComparer.Ordinal);
+        // ponytail: keys are built from a fixed sorted tag order without allocating a tag dictionary
+        // per point — the dictionary is only materialized when a group is first created.
+        var sortedTags = groupByTags.OrderBy(k => k, StringComparer.Ordinal).ToArray();
         foreach (var p in points)
         {
-            Dictionary<string,string> keyTags;
             string key;
             if (groupByAllTags)
             {
-                keyTags = new Dictionary<string,string>(p.Tags, StringComparer.Ordinal);
                 key = p.TagsCanonical ?? "";
             }
             else
             {
-                keyTags = new Dictionary<string,string>(StringComparer.Ordinal);
-                foreach (var g in groupByTags)
-                    if (p.Tags.TryGetValue(g, out var v)) keyTags[g] = v;
-                key = string.Join(",", keyTags.OrderBy(k => k.Key, StringComparer.Ordinal).Select(k => k.Key + "=" + k.Value));
+                key = string.Join(",", sortedTags.Where(g => p.Tags.ContainsKey(g)).Select(g => g + "=" + p.Tags[g]));
             }
             if (!groups.TryGetValue(key, out var entry))
             {
+                Dictionary<string,string> keyTags;
+                if (groupByAllTags)
+                    keyTags = new Dictionary<string,string>(p.Tags, StringComparer.Ordinal);
+                else
+                {
+                    keyTags = new Dictionary<string,string>(StringComparer.Ordinal);
+                    foreach (var g in sortedTags)
+                        if (p.Tags.TryGetValue(g, out var v)) keyTags[g] = v;
+                }
                 entry = (keyTags, new List<Point>());
                 groups[key] = entry;
             }
@@ -3950,6 +3979,20 @@ public sealed class QueryExecutor
         return Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
     }
 
+    // ponytail: compiled tag-filter regex cache. Regex.IsMatch re-compiles uncached patterns inside
+    // the per-point loop on regex-heavy scans; the cache is bounded like the parse-template cache.
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Regex> s_tagRegexCache = new(StringComparer.Ordinal);
+
+    static Regex GetTagRegex(string pattern)
+    {
+        if (s_tagRegexCache.Count >= 256 && !s_tagRegexCache.ContainsKey(pattern))
+        {
+            var first = s_tagRegexCache.Keys.FirstOrDefault();
+            if (first != null) s_tagRegexCache.TryRemove(first, out _);
+        }
+        return s_tagRegexCache.GetOrAdd(pattern, p => new Regex(p, RegexOptions.CultureInvariant));
+    }
+
     static bool MatchesTagFilters(Point point, List<TagFilter> filters)
     {
         if (filters.Count == 0) return true;
@@ -3964,8 +4007,8 @@ public sealed class QueryExecutor
             {
                 case TagOp.Eq: if (tagVal != f.Value) return false; break;
                 case TagOp.Neq: if (tagVal == f.Value) return false; break;
-                case TagOp.Regex: if (tagVal == null || !Regex.IsMatch(tagVal, f.Value)) return false; break;
-                case TagOp.NotRegex: if (tagVal != null && Regex.IsMatch(tagVal, f.Value)) return false; break;
+                case TagOp.Regex: if (tagVal == null || !GetTagRegex(f.Value).IsMatch(tagVal)) return false; break;
+                case TagOp.NotRegex: if (tagVal != null && GetTagRegex(f.Value).IsMatch(tagVal)) return false; break;
             }
         }
         return true;
@@ -3980,8 +4023,8 @@ public sealed class QueryExecutor
             {
                 TagOp.Eq => value == filter.Value,
                 TagOp.Neq => value != filter.Value,
-                TagOp.Regex => value != null && Regex.IsMatch(value, filter.Value),
-                TagOp.NotRegex => value == null || !Regex.IsMatch(value, filter.Value),
+                TagOp.Regex => value != null && GetTagRegex(filter.Value).IsMatch(value),
+                TagOp.NotRegex => value == null || !GetTagRegex(filter.Value).IsMatch(value),
                 _ => false
             };
             if (!matches) return false;
@@ -4210,14 +4253,30 @@ public sealed class QueryExecutor
         return DateTimeOffset.TryParse(s, out var dto) ? dto.ToUnixTimeMilliseconds() * 1_000_000 : 0;
     }
 
-    static object? LinearFill(Dictionary<long, List<object?>> rows, long time, int col)
+    static object? LinearFill(List<(long T, double V)> valid, long time)
     {
-        var prev = rows.Where(kv => kv.Key < time && kv.Value.Count > col && TryDouble(kv.Value[col], out _)).LastOrDefault();
-        var next = rows.Where(kv => kv.Key > time && kv.Value.Count > col && TryDouble(kv.Value[col], out _)).FirstOrDefault();
-        if (prev.Value == null || next.Value == null) return null;
-        if (!TryDouble(prev.Value[col], out var y0) || !TryDouble(next.Value[col], out var y1)) return null;
-        var ratio = (double)(time - prev.Key) / (next.Key - prev.Key);
-        return y0 + (y1 - y0) * ratio;
+        // last entry strictly before time
+        int lo = 0, hi = valid.Count - 1, prevIdx = -1;
+        while (lo <= hi)
+        {
+            var mid = (lo + hi) >> 1;
+            if (valid[mid].T < time) { prevIdx = mid; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        // first entry strictly after time
+        lo = 0; hi = valid.Count - 1;
+        var nextIdx = -1;
+        while (lo <= hi)
+        {
+            var mid = (lo + hi) >> 1;
+            if (valid[mid].T > time) { nextIdx = mid; hi = mid - 1; }
+            else lo = mid + 1;
+        }
+        if (prevIdx < 0 || nextIdx < 0) return null;
+        var (t0, v0) = valid[prevIdx];
+        var (t1, v1) = valid[nextIdx];
+        var ratio = (double)(time - t0) / (t1 - t0);
+        return v0 + (v1 - v0) * ratio;
     }
 
     static bool TryDouble(object? value, out double result)
@@ -4238,10 +4297,12 @@ public sealed class QueryExecutor
         return string.IsNullOrWhiteSpace(tagsCanonical) ? measurement : $"{measurement},{tagsCanonical}";
     }
 
-    static List<List<object?>> OrderRowsByTime(List<List<object?>> rows, bool desc) =>
-        desc
-            ? rows.OrderByDescending(r => ParseTimeNs(r[0])).ToList()
-            : rows.OrderBy(r => ParseTimeNs(r[0])).ToList();
+    static List<List<object?>> OrderRowsByTime(List<List<object?>> rows, bool desc)
+        // ponytail: parse each row's time once (decorate-sort-undecorate) instead of re-parsing the
+        // RFC3339 string on every comparison.
+        => desc
+            ? rows.Select(r => (Row: r, T: ParseTimeNs(r[0]))).OrderByDescending(x => x.T).Select(x => x.Row).ToList()
+            : rows.Select(r => (Row: r, T: ParseTimeNs(r[0]))).OrderBy(x => x.T).Select(x => x.Row).ToList();
 
     static List<QuerySeries> ApplySeriesWindow(IEnumerable<QuerySeries> series, int? offset, int? limit)
     {
