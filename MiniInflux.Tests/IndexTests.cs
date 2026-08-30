@@ -153,7 +153,7 @@ public class IndexTests : IDisposable
     }
 
     [Fact]
-    public async Task Indexes_ArePersistedWhenEngineDisposes()
+    public async Task Indexes_AreRebuiltFromSegmentsOnRecover()
     {
         await _engine.WriteAsync("testdb", "autogen",
             [
@@ -165,12 +165,16 @@ public class IndexTests : IDisposable
                     TimestampNs = 1000_000_000
                 }
             ]);
+        _engine.FlushAll();
         _engine.Dispose();
         _engineDisposed = true;
 
-        var reloaded = new Manifest(_testDir);
-        Assert.Single(reloaded.GetSeries("testdb", "cpu"));
-        Assert.Single(reloaded.GetTagValues("testdb", "cpu", "host"));
+        // Series/tag indexes are in-memory only now; engine recovery rebuilds them from segment
+        // metadata, so a restarted engine sees the same metadata queries as before the restart.
+        using var restarted = new TsdbEngine(_testDir, flushThreshold: 1000);
+        restarted.Recover();
+        Assert.Single(restarted.Meta.GetSeries("testdb", "cpu"));
+        Assert.Single(restarted.Meta.GetTagValues("testdb", "cpu", "host"));
     }
 
     [Fact]
