@@ -294,6 +294,7 @@ public sealed class Compactor
 
         var shardDir = _shardManager.ShardDir(db, rp, shard.Id);
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var retentionCutoffNs = GetRetentionCutoffNs(db, rp);
 
         // Enumerate distinct (measurement, tags, field) groups across all inputs with their
         // per-input columns.
@@ -335,7 +336,7 @@ public sealed class Compactor
         var fillFloor = (long)(_maxSegmentFileBytes * _segmentFillRatio);
         var remaining = totalEstimate;
 
-        foreach (var col in MergeColumnsStreaming(db, inputMetas, groups, orderedGroups))
+        foreach (var col in MergeColumnsStreaming(db, inputMetas, groups, orderedGroups, retentionCutoffNs))
         {
             var colBytes = EstimateColumnBytes(col);
             remaining -= groupEstimate[(col.Measurement, col.TagsCanonical, col.Field)];
@@ -370,7 +371,8 @@ public sealed class Compactor
         string db,
         List<(string Path, List<SegmentColumnMeta> Metas)> inputMetas,
         Dictionary<(string Meas, string Tags, string Field), List<(int FileIdx, SegmentColumnMeta Meta)>> groups,
-        List<(string Meas, string Tags, string Field)> orderedGroups)
+        List<(string Meas, string Tags, string Field)> orderedGroups,
+        long? retentionCutoffNs)
     {
         var batch = new List<(string Meas, string Tags, string Field)>();
         long batchPoints = 0;
@@ -380,13 +382,13 @@ public sealed class Compactor
             foreach (var (_, meta) in groups[group]) batchPoints += meta.PointCount;
             if (batchPoints < CompactionBatchPointBudget) continue;
 
-            foreach (var col in MergeBatch(db, batch, groups, inputMetas))
+            foreach (var col in MergeBatch(db, batch, groups, inputMetas, retentionCutoffNs))
                 yield return col;
             batch = [];
             batchPoints = 0;
         }
         if (batch.Count > 0)
-            foreach (var col in MergeBatch(db, batch, groups, inputMetas))
+            foreach (var col in MergeBatch(db, batch, groups, inputMetas, retentionCutoffNs))
                 yield return col;
     }
 
@@ -394,7 +396,8 @@ public sealed class Compactor
         string db,
         List<(string Meas, string Tags, string Field)> batch,
         Dictionary<(string Meas, string Tags, string Field), List<(int FileIdx, SegmentColumnMeta Meta)>> groups,
-        List<(string Path, List<SegmentColumnMeta> Metas)> inputMetas)
+        List<(string Path, List<SegmentColumnMeta> Metas)> inputMetas,
+        long? retentionCutoffNs)
     {
         var batchSet = new HashSet<(string Meas, string Tags, string Field)>(batch);
 
@@ -429,6 +432,8 @@ public sealed class Compactor
                 if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime))
                     continue;
                 var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values);
+                if (retentionCutoffNs.HasValue)
+                    (ts, vals) = ApplyRetentionCutoff(ts, vals, retentionCutoffNs.Value);
                 if (ts.Count == 0) continue;
                 filtered.Add(col with { Timestamps = ts, Values = vals, MinTime = ts[0], MaxTime = ts[^1] });
             }
@@ -498,6 +503,35 @@ public sealed class Compactor
         }
     }
 
+    /// <summary>
+    /// Retention cutoff (now - duration) for the db/rp, or null for infinite retention. Points
+    /// older than the cutoff are dropped during compaction so data inside a long-lived shard
+    /// does not survive until the whole shard ages out.
+    /// </summary>
+    private long? GetRetentionCutoffNs(string db, string rp)
+    {
+        var rpInfo = _manifest.GetRp(db, rp);
+        if (rpInfo == null || rpInfo.DurationNs <= 0) return null;
+        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+        return nowNs - rpInfo.DurationNs;
+    }
+
+    /// <summary>Drop timestamps below the retention cutoff (sorted input; binary search the split).</summary>
+    private static (List<long> Ts, List<FieldValue> Vals) ApplyRetentionCutoff(
+        List<long> ts, List<FieldValue> vals, long cutoffNs)
+    {
+        int lo = 0, hi = ts.Count - 1, first = ts.Count;
+        while (lo <= hi)
+        {
+            var mid = (lo + hi) >> 1;
+            if (ts[mid] >= cutoffNs) { first = mid; hi = mid - 1; }
+            else lo = mid + 1;
+        }
+        if (first == 0) return (ts, vals);
+        if (first == ts.Count) return (new List<long>(), new List<FieldValue>());
+        return (ts.GetRange(first, ts.Count - first), vals.GetRange(first, vals.Count - first));
+    }
+
     private static long EstimateGroupBytes(SegmentColumnMeta meta)
     {
         long perPoint = meta.Kind == FieldKind.String ? 8 + 24 : 8 + 8;
@@ -521,6 +555,7 @@ public sealed class Compactor
 
         if (allColumns.Count == 0) return false;
 
+        var retentionCutoffNs = GetRetentionCutoffNs(db, rp);
         var filtered = new List<SegmentColumn>();
         foreach (var col in allColumns)
         {
@@ -528,6 +563,8 @@ public sealed class Compactor
                 continue;
 
             var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values);
+            if (retentionCutoffNs.HasValue)
+                (ts, vals) = ApplyRetentionCutoff(ts, vals, retentionCutoffNs.Value);
             if (ts.Count == 0) continue;
 
             filtered.Add(new SegmentColumn(
