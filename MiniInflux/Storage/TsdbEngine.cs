@@ -2457,8 +2457,8 @@ return Interlocked.Read(ref _bufferedByteCount);
         var flushedSnapshot = l.ToArray();
         FlushPointsToSegments(db, rp, l);
 
-        // sync path: cache already updated at write time, validate via footer maxTime by re-asserting flushed values
-        foreach (var bp in flushedSnapshot) _lastValueCache.Update(db, rp, bp.Point);
+        // Cache was already updated per point at write time; footer validation backfills anything
+        // stale or missing, so re-asserting every flushed point here is redundant work.
         ValidateLastValueCacheFromFooter(db, rp, flushedSnapshot);
 
         _bufferedPointCount -= flushCount;
