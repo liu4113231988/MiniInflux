@@ -133,6 +133,7 @@ public sealed class MetricsCollector
             ContinuousQueryRecomputeBucketsTotal = ContinuousQueryRecomputeBucketsTotal,
             LastContinuousQueryDurationMs = LastContinuousQueryDurationMs,
             SegmentCount = CountSegmentFiles(),
+            QuarantinedSegments = _engine.QuarantinedSegments.Count,
             CompactionRunning = compaction.Running || CompactionRunning,
             CompactionCount = compaction.TotalRuns > 0 ? compaction.TotalRuns : CompactionCount,
             CompactionQueuedTasks = compaction.QueuedTasks,
@@ -372,6 +373,7 @@ public sealed class DebugStats
     public long WriteQueuePendingRequests { get; set; }
     public Dictionary<string, long> QueryDurationBuckets { get; set; } = new();
     public List<ContinuousQueryMetrics> ContinuousQueryMetrics { get; set; } = [];
+    public int QuarantinedSegments { get; set; }
 }
 
 public sealed class ContinuousQueryMetrics

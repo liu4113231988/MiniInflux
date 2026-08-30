@@ -45,6 +45,14 @@ public static class SegmentReader
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Length, DateTime LastWriteUtc)> s_crcVerified = new(StringComparer.Ordinal);
     private const int MaxCrcVerifiedEntries = 4096;
 
+    // ponytail: segments that failed structural verification (magic/size/CRC) are quarantined for
+    // the process lifetime so queries stop re-reading them on every pass; they surface in engine
+    // stats and the validate CLI instead of silently re-tainting results.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_quarantined = new(StringComparer.Ordinal);
+
+    public static bool IsQuarantined(string path) => s_quarantined.ContainsKey(path);
+    public static IReadOnlyCollection<string> Quarantined => s_quarantined.Keys.ToArray();
+
     // Decoded column block cache. Repeated dashboard-style queries used to re-run Brotli
     // decompression + delta/Gorilla decoding for the same columns on every single query; segment
     // files are immutable, so decoded blocks can be shared safely. Bounded by a byte budget with
@@ -314,6 +322,19 @@ public static class SegmentReader
         if (TryReadFooterMetadata(path, out var metadata))
             return new SegmentMetadataReadResult(metadata, true);
 
+        try
+        {
+            return ReadMetadataByFullScan(path);
+        }
+        catch (InvalidDataException)
+        {
+            s_quarantined.TryAdd(path, 0);
+            throw;
+        }
+    }
+
+    private static SegmentMetadataReadResult ReadMetadataByFullScan(string path)
+    {
         var allBytes = ReadAllBytesShared(path);
         if (allBytes.Length < 8) throw new InvalidDataException("segment file too small");
         var dataLength = allBytes.Length - 4;
@@ -424,6 +445,19 @@ public static class SegmentReader
     }
 
     private static Stream OpenSegmentForSequentialRead(string path, out long dataLength, out long fileLength)
+    {
+        try
+        {
+            return OpenSegmentChecked(path, out dataLength, out fileLength);
+        }
+        catch (InvalidDataException)
+        {
+            s_quarantined.TryAdd(path, 0);
+            throw;
+        }
+    }
+
+    private static Stream OpenSegmentChecked(string path, out long dataLength, out long fileLength)
     {
         var info = new FileInfo(path);
         fileLength = info.Length;

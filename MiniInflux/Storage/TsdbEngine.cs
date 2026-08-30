@@ -591,7 +591,7 @@ public sealed class TsdbEngine : IDisposable
         }
         finally { lk.ExitReadLock(); }
 
-        var segments = _shards.ListSegments(db, rp, min, max);
+        var segments = ListReadableSegments(db, rp, min, max);
 
         // Fast path: single segment — read sequentially and merge with buffer (limit-aware).
         if (segments.Count <= 1)
@@ -699,7 +699,7 @@ public sealed class TsdbEngine : IDisposable
     }
 
     public bool HasSegments(string db, string rp, long? min, long? max) =>
-        _shards.ListSegments(db, rp, min, max).Count > 0;
+        ListReadableSegments(db, rp, min, max).Count > 0;
 
     public DescendingSeriesReadResult? TryReadBufferedSeriesDescending(string db, string rp, string measurement, string tagsCanonical,
         long? min, long? max, HashSet<string>? requestedFields = null, int? limit = null, CancellationToken cancellationToken = default)
@@ -1039,7 +1039,7 @@ public sealed class TsdbEngine : IDisposable
         long cutoff = limit.HasValue && result.Count >= limit.Value ? KthLargestTimestamp(result, limit.Value) : long.MinValue;
 
         var candidates = new List<(string Path, long MaxTime)>();
-        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var (segPath, _) in ListReadableSegments(db, rp, min, max))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var maxTime = long.MinValue;
@@ -1142,7 +1142,7 @@ public sealed class TsdbEngine : IDisposable
         long cutoff = limit.HasValue && result.Count >= limit.Value ? KthSmallestTimestamp(result, limit.Value) : long.MaxValue;
 
         var candidates = new List<(string Path, long MinTime)>();
-        foreach (var (segPath, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var (segPath, _) in ListReadableSegments(db, rp, min, max))
         {
             cancellationToken.ThrowIfCancellationRequested();
             long minTime = long.MaxValue;
@@ -1346,7 +1346,7 @@ public sealed class TsdbEngine : IDisposable
         var buffered = SnapshotBufferedForStream(db, rp, meas, min, max, requestedFields, allowedTagsCanonical);
         streamContext.EstimatedBytes += buffered.Count * 128L;
         CheckStreamMemoryBudget(streamContext.EstimatedBytes);
-        var segments = _shards.ListSegments(db, rp, min, max);
+        var segments = ListReadableSegments(db, rp, min, max);
 
         // Priority encodes recency: ListSegments yields oldest (most compacted) first; the buffer
         // holds the newest writes and always wins.
@@ -1792,7 +1792,7 @@ return Interlocked.Read(ref _bufferedByteCount);
 
         var reads = new System.Collections.Concurrent.ConcurrentBag<(IReadOnlyList<SegmentColumnMeta> Metas, bool UsedFooter)>();
         Parallel.ForEach(
-            _shards.ListSegments(db, rp, min, max),
+            ListReadableSegments(db, rp, min, max),
             new ParallelOptions { CancellationToken = cancellationToken, MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8) },
             segment =>
             {
@@ -1834,7 +1834,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         CancellationToken cancellationToken)
     {
         var hasTombstones = _tombstones.HasTombstones(db);
-        var segments = _shards.ListSegments(db, rp, min, max);
+        var segments = ListReadableSegments(db, rp, min, max);
 
         // Read timestamps from segments in parallel; value blocks are skipped.
         var bag = new System.Collections.Concurrent.ConcurrentBag<List<SegmentTimestampColumn>>();
@@ -2280,7 +2280,7 @@ return Interlocked.Read(ref _bufferedByteCount);
             yield break;
         }
 
-        foreach (var (path, _) in _shards.ListSegments(db, rp, min, max))
+        foreach (var (path, _) in ListReadableSegments(db, rp, min, max))
         {
             cancellationToken.ThrowIfCancellationRequested();
             IndexedSegmentMetadata metadata;
@@ -2317,6 +2317,19 @@ return Interlocked.Read(ref _bufferedByteCount);
     /// <summary>
     /// Get cache statistics for diagnostics.
     /// </summary>
+    /// <summary>Segment paths that failed structural verification and are excluded from reads.</summary>
+    public IReadOnlyCollection<string> QuarantinedSegments => SegmentReader.Quarantined;
+
+    /// <summary>Segment listing that skips quarantined (structurally corrupt) files.</summary>
+    private IReadOnlyList<(string SegPath, ShardGroupInfo Shard)> ListReadableSegments(
+        string db, string rp, long? min, long? max)
+    {
+        var segments = _shards.ListSegments(db, rp, min, max);
+        return segments.Count == 0
+            ? segments
+            : segments.Where(s => !SegmentReader.IsQuarantined(s.SegPath)).ToList();
+    }
+
     public (long Hits, long Misses, int CachedCount) GetMetadataCacheStats() =>
         (Interlocked.Read(ref _metadataCacheHits), Interlocked.Read(ref _metadataCacheMisses), _segmentMetadataCache.Count);
 
