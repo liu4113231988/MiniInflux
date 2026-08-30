@@ -350,10 +350,9 @@ public static class SegmentReader
     /// Open a segment's column area for sequential reading.
     /// <para>
     /// Small segments keep the original behaviour: the whole file is buffered and its CRC verified up
-    /// front. Large segments are streamed through a buffered <see cref="FileStream"/>; the trailing
-    /// CRC is not recomputed there because doing so would require reading every byte, which defeats
-    /// the purpose of column skipping. Structural corruption is still caught by the magic-number and
-    /// length checks below, and by the decoders themselves.
+    /// front. Large segments are streamed through a buffered <see cref="FileStream"/>; their trailing
+    /// CRC is verified once per (path, length, mtime) with a chunked sequential pass (see
+    /// <see cref="VerifyLargeSegmentCrc"/>), so column skipping still works after the first read.
     /// </para>
     /// </summary>
     private static Stream OpenSegmentForSequentialRead(string path, out long dataLength, out long fileLength)
@@ -365,6 +364,7 @@ public static class SegmentReader
         if (fileLength > StreamingReadThresholdBytes)
         {
             dataLength = fileLength - 4;
+            VerifyLargeSegmentCrc(path, info, fileLength);
             return new FileStream(path, FileMode.Open, FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete, StreamingBufferBytes, FileOptions.SequentialScan);
         }
@@ -383,6 +383,41 @@ public static class SegmentReader
             s_crcVerified[path] = (allBytes.Length, info.LastWriteTimeUtc);
         }
         return new MemoryStream(allBytes, 0, (int)dataLength, writable: false);
+    }
+
+    /// <summary>
+    /// Large segments are streamed with column skipping, so a corrupt payload may otherwise never be
+    /// read and silently return wrong results. Verify the trailing CRC once per (path, length, mtime)
+    /// with a chunked sequential pass; later reads of the same immutable file skip it entirely.
+    /// </summary>
+    private static void VerifyLargeSegmentCrc(string path, FileInfo info, long fileLength)
+    {
+        if (s_crcVerified.TryGetValue(path, out var stamp)
+            && stamp.Length == fileLength && stamp.LastWriteUtc == info.LastWriteTimeUtc)
+            return;
+
+        var dataLength = fileLength - 4;
+        var crc = IncrementalCrc32.Create();
+        var buffer = new byte[StreamingBufferBytes];
+        uint storedCrc;
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, StreamingBufferBytes, FileOptions.SequentialScan))
+        {
+            long remaining = dataLength;
+            while (remaining > 0)
+            {
+                var chunk = (int)Math.Min(buffer.Length, remaining);
+                stream.ReadExactly(buffer, 0, chunk);
+                crc.Append(buffer.AsSpan(0, chunk));
+                remaining -= chunk;
+            }
+            stream.ReadExactly(buffer, 0, 4);
+            storedCrc = BitConverter.ToUInt32(buffer, 0);
+        }
+
+        if (storedCrc != crc.GetResult())
+            throw new InvalidDataException("segment CRC mismatch");
+        s_crcVerified[path] = (fileLength, info.LastWriteTimeUtc);
     }
 
     /// <summary>
