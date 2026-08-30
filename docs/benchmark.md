@@ -95,3 +95,15 @@ Raw `ORDER BY time DESC LIMIT 1000` 在 buffer-only 单 series 场景已命中�
 压测脚本已修正为默认在 MiniInflux 写入计时后显式 flush，并输出 `FlushAfterWriteMs` 与 segment/WAL 文件统计；`-BufferOnly` 仅用于复现纯 WAL/buffer 口径。当前 `/write` 更接近 InfluxDB 1.x 的 WAL/cache 模型：写请求写入 WAL + 内存 buffer 后返回，segment 落盘由后台或显式 flush 完成。
 
 最新 100,000 points / batch size 5,000 / concurrency 1 复测中，MiniInflux 写请求吞吐约 `87k pts/s`，aggregate median 约 `1.9 ms`，raw `LIMIT 1000` median 约 `12.9 ms`，并在写后 flush 生成 segment。后续若继续优化，优先看 flush/segment 编码成本和更大规模混合 workload，而不是继续小改查询主路径。
+
+## 2026-09 优化批次复测
+
+2026-09 批次（正确性修复、Manifest/WAL/compaction/LVC/查询热路径性能优化、备份一致性、磁盘门控、缓存上限、token 分级、CSV、部分过期）落地后按标准口径复测：`100,000` points、`batch size = 5,000`、`concurrency = 1`，查询延迟 5 次 median；MiniInflux 由脚本以 `dotnet run -c Release --no-restore` 启动，写后显式 flush。
+
+| Metric | MiniInflux | InfluxDB 1.7.9 | Ratio |
+| --- | ---: | ---: | ---: |
+| 100,000 points write throughput (points/s) | 120,940.45 | 276,902.23 | InfluxDB 1.7.9 is `2.29x` |
+| 100,000 points aggregate query latency median (ms) | 1.09 | 3.34 | MiniInflux is `3.06x` faster |
+| 100,000 points raw `LIMIT 1000` query latency median (ms) | 3.48 | 5.36 | MiniInflux is `1.54x` faster |
+
+结论：查询方向较 2026-07-04（aggregate `1.9ms`、raw `12.9ms`）继续改善，aggregate 与 raw 均稳定快于本机 InfluxDB 1.7.9。写入 `120,940 pts/s` 与 2026-06-30 收口轮（`120,418`）持平——本批次未针对写入主路径做专门优化（WAL CRC 出锁的收益被 HTTP/解析侧噪声掩盖）。注意本轮 InfluxDB 写入读数 `276,902 pts/s` 明显高于其历史区间（`77k-159k`），单轮对比仅作参考；MiniInflux 侧的稳定结论是写入维持 `12-13 万 pts/s` 级别、查询持续领先。
