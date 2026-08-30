@@ -112,7 +112,8 @@ var engine = new TsdbEngine(
     maxSegmentFileBytes: options.Storage.MaxSegmentFileBytes,
     minSegmentFileBytes: options.Storage.MinSegmentFileBytes,
     segmentFillRatio: options.Storage.MinSegmentFillRatio,
-    compactionMaxWriteBytesPerSecond: options.Storage.CompactionMaxWriteBytesPerSecond);
+    compactionMaxWriteBytesPerSecond: options.Storage.CompactionMaxWriteBytesPerSecond,
+    minFreeDiskBytes: options.Storage.MinFreeDiskBytes);
 
 builder.Services.AddSingleton(engine);
 var writeQueue = new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize);
@@ -1248,6 +1249,13 @@ async Task<IResult> WritePointsAsync(HttpRequest request, string db, string? rp,
             return isV2
                 ? Results.Json(new V2ErrorResponse("too many requests", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 429)
                 : Results.StatusCode(429);
+        }
+        catch (DiskSpaceExceededException ex)
+        {
+            runtimeLogger.LogWarning("write rejected because disk space is below the floor db={Db} rp={Rp}", db, rp ?? "autogen");
+            return isV2
+                ? Results.Json(new V2ErrorResponse("unavailable", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 503)
+                : Results.StatusCode(503);
         }
         catch (IOException ex)
         {

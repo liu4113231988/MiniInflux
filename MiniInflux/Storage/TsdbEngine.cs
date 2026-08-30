@@ -65,6 +65,7 @@ public sealed class TsdbEngine : IDisposable
     // the buffer instead of flushing synchronously — segment encoding/CRC/fsync no longer stall
     // writers. Points stay in the buffer (and WAL) until the flush completes, so reads keep
     // seeing them and crash recovery is unaffected.
+    private readonly long _minFreeDiskBytes;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Task> _flushInFlight = new(StringComparer.Ordinal);
     // Min timestamp held by each in-flight flush snapshot, per db|rp. Snapshots may carry points that
     // a concurrent DELETE has already purged from the buffer; tombstone GC uses this floor to avoid
@@ -86,13 +87,18 @@ public sealed class TsdbEngine : IDisposable
         long maxSegmentFileBytes = 0,
         long minSegmentFileBytes = 0,
         double segmentFillRatio = 0.5,
-        long compactionMaxWriteBytesPerSecond = 0)
+        long compactionMaxWriteBytesPerSecond = 0,
+        long minFreeDiskBytes = 0)
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
         _queryGate = new SemaphoreSlim(maxConcurrentQueries > 0 ? maxConcurrentQueries : Math.Min(Environment.ProcessorCount, 8), int.MaxValue);
         _maxQueryMemoryBytes = maxQueryMemoryBytes > 0 ? maxQueryMemoryBytes : 512L * 1024 * 1024;
         _maxSegmentFileBytes = maxSegmentFileBytes > 0 ? maxSegmentFileBytes : 512L * 1024 * 1024;
         _minSegmentFileBytes = minSegmentFileBytes > 0 ? minSegmentFileBytes : 0;
+        _minFreeDiskBytes = minFreeDiskBytes;
+        _health.SetDiskSpaceProbe(
+            () => new DriveInfo(Path.GetPathRoot(Path.GetFullPath(_root))!).AvailableFreeSpace,
+            minFreeDiskBytes);
         // ponytail: tail-merge ratio. When the remaining pending points fit under
         // (maxSegmentFileBytes * segmentFillRatio), they are merged into the current file instead of
         // being split off into a tiny trailing .seg. This caps the file count on HDD/network storage
@@ -227,6 +233,8 @@ public sealed class TsdbEngine : IDisposable
     {
         if (!_health.WriteAvailable)
             throw new IOException("write path is unavailable after a WAL persistence failure");
+        if (!_health.IsDiskSpaceSufficient())
+            throw new DiskSpaceExceededException($"insufficient disk space: below the configured minimum of {_minFreeDiskBytes} bytes");
         // EnsureDatabase/EnsureRp/CreateDirectory are idempotent; do them once per (db,rp) per
         // session instead of on every write batch.
         if (_ensuredDbRp.TryAdd(K(db, rp), 0))
@@ -2634,6 +2642,18 @@ return Interlocked.Read(ref _bufferedByteCount);
         }
     }
 
+    private bool ProbeDataDirWritable()
+    {
+        try
+        {
+            var probe = Path.Combine(_root, ".health-probe");
+            File.WriteAllBytes(probe, [1]);
+            File.Delete(probe);
+            return true;
+        }
+        catch { return false; }
+    }
+
     /// <summary>
     /// Min timestamp held by any in-flight flush snapshot of the database (long.MaxValue when none).
     /// Consumed by tombstone GC: data at or above this floor may still land in a new segment.
@@ -3141,6 +3161,10 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
 
     private void PeriodicFlush()
     {
+        // Self-heal: when writes are latched (transient WAL/disk failure), probe the data dir
+        // periodically and unlatch writes once a small write succeeds again.
+        if (_health.NeedsRecoveryProbe)
+            _health.TryRecover(ProbeDataDirWritable);
         try
         {
             var coldBefore = DateTime.UtcNow.Ticks - _flushColdTicks;
@@ -3189,6 +3213,12 @@ public sealed class RecoveryResult
 public sealed class CardinalityLimitExceededException : Exception
 {
     public CardinalityLimitExceededException(string message) : base(message) { }
+}
+
+/// <summary>Thrown when free disk space is below Storage.MinFreeDiskBytes.</summary>
+public sealed class DiskSpaceExceededException : Exception
+{
+    public DiskSpaceExceededException(string message) : base(message) { }
 }
 
 public sealed class MemoryLimitExceededException : Exception

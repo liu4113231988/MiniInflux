@@ -121,12 +121,10 @@ public sealed class WalManager : IDisposable
                 if (_currentFileSize >= _maxFileBytes)
                     RotateLocked();
 
-                // Durability note: with fsync enabled, the OS flush timer (FsyncIntervalMs) groups
-                // commits — an acknowledged write can lose the last fsync window on power loss.
-                if (!_fsync || _fsyncIntervalMs <= 0)
-                {
-                    _health.RecordWriteSuccess();
-                }
+                // A successful append is itself proof the write path works again, so it unlatches
+                // the health gate in every fsync mode (with fsync on, this is the only self-heal
+                // signal apart from the engine's periodic probe).
+                _health.RecordWriteSuccess();
             }
             catch (Exception ex)
             {
