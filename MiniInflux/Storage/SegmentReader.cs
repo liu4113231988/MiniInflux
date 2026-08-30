@@ -173,34 +173,76 @@ public static class SegmentReader
                 continue;
             }
 
-            var codecs = ReadCodecInfo(version, br);
-            var (cachedTimestamps, cachedValues) = GetCachedColumn(path, fileLength, i);
-
-            var tl = br.ReadInt32();
-            byte[]? tb = null;
-            if (cachedTimestamps != null) SkipBytes(ms, tl);
-            else tb = br.ReadBytes(tl);
-
-            var vl = br.ReadInt32();
-            byte[]? vb = null;
-            if (cachedValues != null) SkipBytes(ms, vl);
-            else vb = br.ReadBytes(vl);
-
-            BlockStats? stats = null;
-            if (version >= 2) { stats = new BlockStats(br.ReadDouble(), br.ReadDouble(), br.ReadDouble(), br.ReadInt32()); }
-
-            var timestamps = cachedTimestamps
-                ?? CompressionCodec.DecodeTimestamps(codecs.TimestampCodec, codecs.TimestampCompression, tb!);
-            var values = cachedValues
-                ?? CompressionCodec.DecodeValues(k, codecs.ValueCodec, codecs.ValueCompression, vb!);
-            if (tb != null || vb != null)
-                CacheColumn(path, fileLength, i, timestamps, values);
-
-            result.Add(new SegmentColumn(m, tags, f, k, min, max,
-                timestamps, values, stats,
-                codecs.TimestampCodec, codecs.ValueCodec, codecs.TimestampCompression, codecs.ValueCompression));
+            result.Add(ReadColumnBody(br, ms, version, path, fileLength, i, m, tags, f, k, min, max));
         }
         return result;
+    }
+
+    /// <summary>
+    /// Read only the columns for which <paramref name="columnSelector"/> returns true, skipping all
+    /// other payloads in a single sequential pass. Used by compaction to decode exactly one output
+    /// batch's worth of columns per pass instead of materializing whole segments.
+    /// </summary>
+    public static List<SegmentColumn> ReadSegmentSelected(string path, Func<string, string, string, bool> columnSelector)
+    {
+        var result = new List<SegmentColumn>();
+        using var ms = OpenSegmentForSequentialRead(path, out var dataLength, out var fileLength);
+        using var br = new BinaryReader(ms, Encoding.UTF8);
+        if (br.ReadUInt32() != Magic) throw new InvalidDataException("invalid segment magic");
+
+        var (version, count) = ReadVersionAndCount(br, ms);
+
+        for (int i = 0; i < count; i++)
+        {
+            if (ms.Position >= dataLength) break;
+
+            var m = ReadString(br); var tags = ReadString(br); var f = ReadString(br);
+            var k = (FieldKind)br.ReadByte();
+            var min = br.ReadInt64(); var max = br.ReadInt64();
+            br.ReadInt32(); // point count (unused)
+
+            if (!columnSelector(m, tags, f))
+            {
+                SkipColumnPayload(version, br, ms);
+                continue;
+            }
+
+            result.Add(ReadColumnBody(br, ms, version, path, fileLength, i, m, tags, f, k, min, max));
+        }
+        return result;
+    }
+
+    /// <summary>Shared decode of one selected column's payload (codecs, blocks, cache, stats).</summary>
+    private static SegmentColumn ReadColumnBody(
+        BinaryReader br, Stream ms, byte version, string path, long fileLength, int ordinal,
+        string m, string tags, string f, FieldKind k, long min, long max)
+    {
+        var codecs = ReadCodecInfo(version, br);
+        var (cachedTimestamps, cachedValues) = GetCachedColumn(path, fileLength, ordinal);
+
+        var tl = br.ReadInt32();
+        byte[]? tb = null;
+        if (cachedTimestamps != null) SkipBytes(ms, tl);
+        else tb = br.ReadBytes(tl);
+
+        var vl = br.ReadInt32();
+        byte[]? vb = null;
+        if (cachedValues != null) SkipBytes(ms, vl);
+        else vb = br.ReadBytes(vl);
+
+        BlockStats? stats = null;
+        if (version >= 2) { stats = new BlockStats(br.ReadDouble(), br.ReadDouble(), br.ReadDouble(), br.ReadInt32()); }
+
+        var timestamps = cachedTimestamps
+            ?? CompressionCodec.DecodeTimestamps(codecs.TimestampCodec, codecs.TimestampCompression, tb!);
+        var values = cachedValues
+            ?? CompressionCodec.DecodeValues(k, codecs.ValueCodec, codecs.ValueCompression, vb!);
+        if (tb != null || vb != null)
+            CacheColumn(path, fileLength, ordinal, timestamps, values);
+
+        return new SegmentColumn(m, tags, f, k, min, max,
+            timestamps, values, stats,
+            codecs.TimestampCodec, codecs.ValueCodec, codecs.TimestampCompression, codecs.ValueCompression);
     }
 
     /// <summary>

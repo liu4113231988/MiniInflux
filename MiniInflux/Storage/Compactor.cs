@@ -276,6 +276,242 @@ public sealed class Compactor
             .ThenBy(f => f.Path, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+        // Footer metadata per input, read once: drives group enumeration, batch sizing, and the
+        // legacy-format detection.
+        var inputMetas = new List<(string Path, List<SegmentColumnMeta> Metas)>(orderedInputs.Count);
+        foreach (var file in orderedInputs)
+        {
+            try { inputMetas.Add((file.Path, SegmentReader.ReadMetadata(file.Path))); }
+            catch (Exception ex) { _health?.RecordFailure("compaction_metadata", ex); return false; }
+        }
+
+        // Legacy v2 files store tags in a synthetic column and need whole-file materialization to
+        // normalize; fall back to the original path for them (rare, old data only).
+        var hasLegacyTagColumns = inputMetas.Any(x => x.Metas.Any(m =>
+            m.TagsCanonical.Length == 0 && m.Field == "tag" && m.Kind == FieldKind.String));
+        if (hasLegacyTagColumns)
+            return CompactShardMaterialized(db, rp, shard, outputLevel, orderedInputs, gcFloor, tombstoneVersionAtRead);
+
+        var shardDir = _shardManager.ShardDir(db, rp, shard.Id);
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        // Enumerate distinct (measurement, tags, field) groups across all inputs with their
+        // per-input columns.
+        var groups = new Dictionary<(string Meas, string Tags, string Field), List<(int FileIdx, SegmentColumnMeta Meta)>>();
+        for (var fi = 0; fi < inputMetas.Count; fi++)
+            foreach (var meta in inputMetas[fi].Metas)
+            {
+                var key = (meta.Measurement, meta.TagsCanonical, meta.Field);
+                if (!groups.TryGetValue(key, out var list)) groups[key] = list = [];
+                list.Add((fi, meta));
+            }
+
+        if (groups.Count == 0) return false;
+
+        var orderedGroups = groups.Keys
+            .OrderBy(k => k.Meas, StringComparer.Ordinal)
+            .ThenBy(k => k.Tags, StringComparer.Ordinal)
+            .ThenBy(k => k.Field, StringComparer.Ordinal)
+            .ToList();
+
+        // Pre-estimate every group's output bytes from metadata so the chunker's remaining-bytes
+        // check (no tiny trailing file) still works with lazy merging.
+        long totalEstimate = 0;
+        var groupEstimate = new Dictionary<(string Meas, string Tags, string Field), long>();
+        foreach (var g in orderedGroups)
+        {
+            long est = 0;
+            foreach (var (_, meta) in groups[g]) est += EstimateGroupBytes(meta);
+            groupEstimate[g] = est;
+            totalEstimate += est;
+        }
+
+        // ponytail: honor MaxSegmentFileBytes on the *output* too. Merged columns are packed into
+        // chunks of at most the cap (column-aligned so each output file stays a valid segment), with
+        // the same tail-merge fill rule as the flush path.
+        var mergedPaths = new List<string>();
+        var chunk = new List<SegmentColumn>(Math.Min(orderedGroups.Count, 1 << 14));
+        long chunkBytes = 0;
+        var fillFloor = (long)(_maxSegmentFileBytes * _segmentFillRatio);
+        var remaining = totalEstimate;
+
+        foreach (var col in MergeColumnsStreaming(db, inputMetas, groups, orderedGroups))
+        {
+            var colBytes = EstimateColumnBytes(col);
+            remaining -= groupEstimate[(col.Measurement, col.TagsCanonical, col.Field)];
+            if (chunk.Count > 0 && chunkBytes >= fillFloor && chunkBytes + colBytes > _maxSegmentFileBytes
+                && remaining >= fillFloor)
+            {
+                WriteMergedChunk(shardDir, outputLevel, nowMs, chunk, mergedPaths);
+                chunk.Clear();
+                chunkBytes = 0;
+            }
+            chunk.Add(col);
+            chunkBytes += colBytes;
+        }
+        if (chunk.Count > 0)
+            WriteMergedChunk(shardDir, outputLevel, nowMs, chunk, mergedPaths);
+
+        var finalized = FinalizeCompaction(db, rp, shard.Id, orderedInputs, mergedPaths);
+        if (finalized) TryRetireTombstones(db, rp, shard, orderedInputs, gcFloor, tombstoneVersionAtRead);
+        return finalized;
+    }
+
+    private const long CompactionBatchPointBudget = 2_000_000;
+
+    /// <summary>
+    /// ponytail: streaming merge. Previously every input segment was fully decoded into memory
+    /// before merging, so a byte-triggered compaction of large files pinned multiple GB on the heap.
+    /// Now groups are processed in batches sized by metadata point counts; each batch decodes only
+    /// its own columns (one pass per input file), merges them, and the resulting columns are written
+    /// out and dropped before the next batch. Peak memory is one batch plus one output chunk.
+    /// </summary>
+    private IEnumerable<SegmentColumn> MergeColumnsStreaming(
+        string db,
+        List<(string Path, List<SegmentColumnMeta> Metas)> inputMetas,
+        Dictionary<(string Meas, string Tags, string Field), List<(int FileIdx, SegmentColumnMeta Meta)>> groups,
+        List<(string Meas, string Tags, string Field)> orderedGroups)
+    {
+        var batch = new List<(string Meas, string Tags, string Field)>();
+        long batchPoints = 0;
+        foreach (var group in orderedGroups)
+        {
+            batch.Add(group);
+            foreach (var (_, meta) in groups[group]) batchPoints += meta.PointCount;
+            if (batchPoints < CompactionBatchPointBudget) continue;
+
+            foreach (var col in MergeBatch(db, batch, groups, inputMetas))
+                yield return col;
+            batch = [];
+            batchPoints = 0;
+        }
+        if (batch.Count > 0)
+            foreach (var col in MergeBatch(db, batch, groups, inputMetas))
+                yield return col;
+    }
+
+    private IEnumerable<SegmentColumn> MergeBatch(
+        string db,
+        List<(string Meas, string Tags, string Field)> batch,
+        Dictionary<(string Meas, string Tags, string Field), List<(int FileIdx, SegmentColumnMeta Meta)>> groups,
+        List<(string Path, List<SegmentColumnMeta> Metas)> inputMetas)
+    {
+        var batchSet = new HashSet<(string Meas, string Tags, string Field)>(batch);
+
+        // One pass per input file, decoding only the batch's columns; columns arrive in input
+        // order, which preserves the existing last-write-wins tie-break (newest input wins).
+        var decoded = new Dictionary<(string Meas, string Tags, string Field), List<SegmentColumn>>();
+        for (var fi = 0; fi < inputMetas.Count; fi++)
+        {
+            List<SegmentColumn> cols;
+            try { cols = SegmentReader.ReadSegmentSelected(inputMetas[fi].Path, (m, t, f) => batchSet.Contains((m, t, f))); }
+            catch (Exception ex)
+            {
+                _health?.RecordFailure("compaction_read", ex);
+                throw;
+            }
+            foreach (var col in cols)
+            {
+                var key = (col.Measurement, col.TagsCanonical, col.Field);
+                if (!decoded.TryGetValue(key, out var list)) decoded[key] = list = [];
+                list.Add(col);
+            }
+        }
+
+        foreach (var group in batch)
+        {
+            if (!decoded.TryGetValue(group, out var cols)) continue;
+
+            // Tombstones are applied per column before the merge, matching the previous behavior.
+            var filtered = new List<SegmentColumn>(cols.Count);
+            foreach (var col in cols)
+            {
+                if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime))
+                    continue;
+                var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values);
+                if (ts.Count == 0) continue;
+                filtered.Add(col with { Timestamps = ts, Values = vals, MinTime = ts[0], MaxTime = ts[^1] });
+            }
+            if (filtered.Count == 0) continue;
+
+            var merged = MergeGroupColumns(group, filtered);
+            _schema.ValidateAndRegisterColumns(db, [merged]);
+            _manifest.UpdateIndexes(db, [(group.Meas, group.Tags, ParseTags(group.Tags))]);
+            yield return merged;
+        }
+    }
+
+    /// <summary>
+    /// K-way merge of sorted, deduplicated columns. On equal timestamps the column from the latest
+    /// input (highest position in the ordered input list) wins, matching the previous
+    /// SortedDictionary-based merge semantics.
+    /// </summary>
+    private static SegmentColumn MergeGroupColumns((string Meas, string Tags, string Field) group, List<SegmentColumn> cols)
+    {
+        var heap = new PriorityQueue<(int Col, int Idx, long Ts), long>();
+        for (var c = 0; c < cols.Count; c++)
+        {
+            var timestamps = cols[c].Timestamps;
+            if (timestamps.Count > 0) heap.Enqueue((c, 0, timestamps[0]), timestamps[0]);
+        }
+
+        var ts = new List<long>();
+        var vals = new List<FieldValue>();
+
+        while (heap.TryDequeue(out var item, out var priority))
+        {
+            var (col, idx, timestamp) = item;
+            var value = cols[col].Values[idx];
+
+            // Resolve equal-timestamp duplicates: the highest input position wins. Every losing
+            // cursor must advance here; the final winner advances exactly once below.
+            while (heap.TryPeek(out _, out var nextPriority) && nextPriority == priority)
+            {
+                var (col2, idx2, _) = heap.Dequeue();
+                if (col2 > col)
+                {
+                    EnqueueNext(heap, cols, col, idx);
+                    col = col2; idx = idx2;
+                    value = cols[col].Values[idx];
+                }
+                else
+                {
+                    EnqueueNext(heap, cols, col2, idx2);
+                }
+            }
+
+            ts.Add(timestamp);
+            vals.Add(value);
+            EnqueueNext(heap, cols, col, idx);
+        }
+
+        return new SegmentColumn(group.Meas, group.Tags, group.Field, cols[0].Kind, ts[0], ts[^1], ts, vals);
+    }
+
+    private static void EnqueueNext(PriorityQueue<(int Col, int Idx, long Ts), long> heap, List<SegmentColumn> cols, int col, int idx)
+    {
+        var next = idx + 1;
+        if (next < cols[col].Timestamps.Count)
+        {
+            var ts = cols[col].Timestamps[next];
+            heap.Enqueue((col, next, ts), ts);
+        }
+    }
+
+    private static long EstimateGroupBytes(SegmentColumnMeta meta)
+    {
+        long perPoint = meta.Kind == FieldKind.String ? 8 + 24 : 8 + 8;
+        long header = 128 + (meta.Measurement.Length + meta.TagsCanonical.Length + meta.Field.Length) * 2L;
+        return meta.PointCount * perPoint + header;
+    }
+
+    /// <summary>
+    /// Original whole-file materialization path, kept for legacy v2 tag-column normalization where
+    /// points must be rebuilt before the merge.
+    /// </summary>
+    private bool CompactShardMaterialized(string db, string rp, ShardGroupInfo shard, int outputLevel,
+        List<FileCandidate> orderedInputs, long gcFloor, long tombstoneVersionAtRead)
+    {
         var allColumns = new List<SegmentColumn>();
         foreach (var file in orderedInputs)
         {
@@ -312,7 +548,6 @@ public sealed class Compactor
         _schema.ValidateAndRegisterColumns(db, merged);
         var shardDir = _shardManager.ShardDir(db, rp, shard.Id);
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
         // ponytail: honor MaxSegmentFileBytes on the *output* too. A merge of N 512MB inputs could
         // otherwise produce a multi-GB L1/L2 file that violates the configured size cap. Split the
         // merged columns (kept column-aligned so each output file stays a valid segment) into chunks
