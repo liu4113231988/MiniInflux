@@ -308,6 +308,10 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     var debug = TryParseBool(request.Query["debug"].ToString());
     var epoch = request.Query["epoch"].ToString();
     var chunkSize = ParseChunkSize(request.Query["chunk_size"].ToString());
+    var format = request.Query["format"].ToString();
+    var isCsv = string.Equals(format, "csv", StringComparison.OrdinalIgnoreCase);
+    if (isCsv && chunked)
+        return Results.BadRequest(new ErrorResponse("format=csv is not supported with chunked=true"));
     if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
     {
         var form = await request.ReadFormAsync();
@@ -348,7 +352,7 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
         return ChunkedResult(chunkOutcome, metrics, runtimeLogger, db);
     }
 
-    if (!debug)
+    if (!debug && !isCsv)
     {
         var rawJsonOutcome = executor.TryExecuteBufferedRawDescendingJson(tsdbEngine, db, q, epoch, request.HttpContext.RequestAborted, queryParams);
         if (rawJsonOutcome != null)
@@ -364,6 +368,13 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
     if (debug)
         return Results.Json(new QueryDebugResponse { Response = outcome.Response, Report = outcome.Report }, AppJsonContext.Default.QueryDebugResponse);
+    if (isCsv)
+    {
+        var firstError = outcome.Response.Results.FirstOrDefault()?.Error;
+        if (firstError != null)
+            return Results.Json(new ErrorResponse(firstError), AppJsonContext.Default.ErrorResponse, statusCode: 400);
+        return Results.Text(CsvQueryResponseWriter.Write(outcome.Response), "text/csv; charset=utf-8");
+    }
     return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
 });
 
@@ -398,8 +409,10 @@ app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor 
 
     var format = body?.Format ?? request.Query["format"].ToString();
     if (string.IsNullOrWhiteSpace(format)) format = "json";
-    if (!string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
-        return Results.BadRequest(new ErrorResponse($"unsupported format: {format} (supported: json)"));
+    var isJsonFormat = string.Equals(format, "json", StringComparison.OrdinalIgnoreCase);
+    var isCsvFormat = string.Equals(format, "csv", StringComparison.OrdinalIgnoreCase);
+    if (!isJsonFormat && !isCsvFormat)
+        return Results.BadRequest(new ErrorResponse($"unsupported format: {format} (supported: json, csv)"));
 
     var epoch = body?.Epoch ?? request.Query["epoch"].ToString();
     Dictionary<string, JsonElement>? queryParams = null;
@@ -423,6 +436,8 @@ app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor 
     LogQueryOutcome(runtimeLogger, db, outcome.Report, outcome.Response.Results.FirstOrDefault()?.Error);
     if (outcome.Report.Error is not null && !outcome.Report.TimedOut && !outcome.Report.Canceled)
         return Results.Json(new ErrorResponse(outcome.Report.Error), AppJsonContext.Default.ErrorResponse, statusCode: 400);
+    if (isCsvFormat)
+        return Results.Text(CsvQueryResponseWriter.Write(outcome.Response), "text/csv; charset=utf-8");
     return QueryResponseResult(outcome.Response, ParseEpochDivisor(epoch));
 });
 
