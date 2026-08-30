@@ -71,7 +71,7 @@ public sealed class TsdbEngine : IDisposable
     // a concurrent DELETE has already purged from the buffer; tombstone GC uses this floor to avoid
     // retiring coverage for data those snapshots will still write to segments.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _flushSnapshotMinTs = new(StringComparer.Ordinal);
-    private readonly LastValueCache _lastValueCache = new();
+    private readonly LastValueCache _lastValueCache;
     private readonly DistinctValueCache _distinctCache = new();
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
@@ -88,9 +88,11 @@ public sealed class TsdbEngine : IDisposable
         long minSegmentFileBytes = 0,
         double segmentFillRatio = 0.5,
         long compactionMaxWriteBytesPerSecond = 0,
-        long minFreeDiskBytes = 0)
+        long minFreeDiskBytes = 0,
+        int lastValueCacheMaxEntries = 0)
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
+        _lastValueCache = new LastValueCache(lastValueCacheMaxEntries);
         _queryGate = new SemaphoreSlim(maxConcurrentQueries > 0 ? maxConcurrentQueries : Math.Min(Environment.ProcessorCount, 8), int.MaxValue);
         _maxQueryMemoryBytes = maxQueryMemoryBytes > 0 ? maxQueryMemoryBytes : 512L * 1024 * 1024;
         _maxSegmentFileBytes = maxSegmentFileBytes > 0 ? maxSegmentFileBytes : 512L * 1024 * 1024;

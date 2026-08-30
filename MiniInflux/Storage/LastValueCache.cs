@@ -11,6 +11,31 @@ namespace MiniInflux.Net10.Storage;
 public sealed class LastValueCache
 {
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<SeriesKey, Point>> _store = new(StringComparer.Ordinal);
+    private readonly int _maxEntriesPerDbRp;
+    private long _updateCounter;
+
+    /// <summary>maxEntriesPerDbRp = 0 disables the cap. Evicted series fall back to scan-and-backfill (correct, slower).</summary>
+    public LastValueCache(int maxEntriesPerDbRp = 0)
+    {
+        _maxEntriesPerDbRp = maxEntriesPerDbRp;
+    }
+
+    /// <summary>
+    /// Sampled cap enforcement: checking ConcurrentDictionary.Count takes locks, so it runs every
+    /// 64th update; arbitrary entries are dropped while over the cap. The worst-case overshoot is
+    /// therefore the cap plus one sampling interval.
+    /// </summary>
+    private void EnforceCapOnSample(ConcurrentDictionary<SeriesKey, Point> inner)
+    {
+        if (_maxEntriesPerDbRp <= 0) return;
+        if ((Interlocked.Increment(ref _updateCounter) & 0x3F) != 0) return;
+        while (inner.Count > _maxEntriesPerDbRp)
+        {
+            var victim = inner.Keys.FirstOrDefault();
+            if (victim == default || !inner.ContainsKey(victim)) break;
+            inner.TryRemove(victim, out _);
+        }
+    }
 
     private static string K(string db, string rp) => db + "|" + rp;
 
@@ -24,6 +49,7 @@ public sealed class LastValueCache
     public void Update(string db, string rp, Point point)
     {
         var outer = _store.GetOrAdd(K(db, rp), _ => new ConcurrentDictionary<SeriesKey, Point>());
+        if (_maxEntriesPerDbRp > 0) EnforceCapOnSample(outer);
         var sk = SeriesKey.From(point);
         // normalize TagsCanonical for stable identity — Point is init-only, so create normalized copy if missing
         var toStore = point;

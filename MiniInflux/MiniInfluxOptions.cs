@@ -100,7 +100,8 @@ public sealed class MiniInfluxOptions
                 MaxSegmentFileBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:MaxSegmentFileBytes"),
             MinSegmentFileBytes = ReadLong(config, 0L, "Storage:MinSegmentFileBytes"),
             MinSegmentFillRatio = ReadDouble(config, 0.5, "Storage:MinSegmentFillRatio"),
-            CompactionMaxWriteBytesPerSecond = ReadLong(config, 0L, "Storage:CompactionMaxWriteBytesPerSecond")
+            CompactionMaxWriteBytesPerSecond = ReadLong(config, 0L, "Storage:CompactionMaxWriteBytesPerSecond"),
+            LastValueCacheMaxEntries = (int)ReadLong(config, 1_000_000L, "Storage:LastValueCacheMaxEntries")
             },
             Auth = new AuthOptions
             {
@@ -313,6 +314,9 @@ public sealed class StorageOptions
     /// compaction output writes are throttled to roughly this rate so a large merge cannot saturate
     /// disk and degrade foreground read/write latency. 0 (default) disables throttling.</summary>
     public long CompactionMaxWriteBytesPerSecond { get; init; } = 0L;
+
+    /// <summary>Cap on cached last points per db/rp; 0 = unlimited. Eviction falls back to full scans (correct, slower).</summary>
+    public int LastValueCacheMaxEntries { get; init; } = 1_000_000;
 }
 
 public sealed class AuthOptions

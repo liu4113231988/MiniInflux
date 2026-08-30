@@ -43,6 +43,7 @@ public static class SegmentReader
     // needs to happen once per (path, length, mtime); previously every query re-verified the
     // whole file for segments below the streaming threshold.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Length, DateTime LastWriteUtc)> s_crcVerified = new(StringComparer.Ordinal);
+    private const int MaxCrcVerifiedEntries = 4096;
 
     // Decoded column block cache. Repeated dashboard-style queries used to re-run Brotli
     // decompression + delta/Gorilla decoding for the same columns on every single query; segment
@@ -397,6 +398,31 @@ public static class SegmentReader
     /// <see cref="VerifyLargeSegmentCrc"/>), so column skipping still works after the first read.
     /// </para>
     /// </summary>
+
+    /// <summary>
+    /// Bound the verification cache: compaction constantly creates new segment paths, so stale
+    /// entries (replaced or deleted files) are swept first, then an arbitrary entry is dropped.
+    /// </summary>
+    private static void RememberCrcVerified(string path, long length, DateTime lastWriteUtc)
+    {
+        if (s_crcVerified.Count >= MaxCrcVerifiedEntries && !s_crcVerified.ContainsKey(path))
+        {
+            foreach (var kv in s_crcVerified)
+            {
+                if (kv.Key == path) continue;
+                var info = new FileInfo(kv.Key);
+                if (!info.Exists || info.Length != kv.Value.Length || info.LastWriteTimeUtc != kv.Value.LastWriteUtc)
+                    s_crcVerified.TryRemove(kv.Key, out _);
+            }
+            if (s_crcVerified.Count >= MaxCrcVerifiedEntries)
+            {
+                var first = s_crcVerified.Keys.FirstOrDefault();
+                if (first != null) s_crcVerified.TryRemove(first, out _);
+            }
+        }
+        s_crcVerified[path] = (length, lastWriteUtc);
+    }
+
     private static Stream OpenSegmentForSequentialRead(string path, out long dataLength, out long fileLength)
     {
         var info = new FileInfo(path);
@@ -422,7 +448,7 @@ public static class SegmentReader
             var storedCrc = BitConverter.ToUInt32(allBytes, (int)dataLength);
             if (storedCrc != Crc32.Compute(allBytes.AsSpan(0, (int)dataLength)))
                 throw new InvalidDataException("segment CRC mismatch");
-            s_crcVerified[path] = (allBytes.Length, info.LastWriteTimeUtc);
+            RememberCrcVerified(path, allBytes.Length, info.LastWriteTimeUtc);
         }
         return new MemoryStream(allBytes, 0, (int)dataLength, writable: false);
     }
@@ -459,7 +485,7 @@ public static class SegmentReader
 
         if (storedCrc != crc.GetResult())
             throw new InvalidDataException("segment CRC mismatch");
-        s_crcVerified[path] = (fileLength, info.LastWriteTimeUtc);
+        RememberCrcVerified(path, fileLength, info.LastWriteTimeUtc);
     }
 
     /// <summary>

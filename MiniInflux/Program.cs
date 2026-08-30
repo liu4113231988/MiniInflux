@@ -113,7 +113,8 @@ var engine = new TsdbEngine(
     minSegmentFileBytes: options.Storage.MinSegmentFileBytes,
     segmentFillRatio: options.Storage.MinSegmentFillRatio,
     compactionMaxWriteBytesPerSecond: options.Storage.CompactionMaxWriteBytesPerSecond,
-    minFreeDiskBytes: options.Storage.MinFreeDiskBytes);
+    minFreeDiskBytes: options.Storage.MinFreeDiskBytes,
+    lastValueCacheMaxEntries: options.Storage.LastValueCacheMaxEntries);
 
 builder.Services.AddSingleton(engine);
 var writeQueue = new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize);
