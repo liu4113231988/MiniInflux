@@ -66,6 +66,10 @@ public sealed class TsdbEngine : IDisposable
     // writers. Points stay in the buffer (and WAL) until the flush completes, so reads keep
     // seeing them and crash recovery is unaffected.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Task> _flushInFlight = new(StringComparer.Ordinal);
+    // Min timestamp held by each in-flight flush snapshot, per db|rp. Snapshots may carry points that
+    // a concurrent DELETE has already purged from the buffer; tombstone GC uses this floor to avoid
+    // retiring coverage for data those snapshots will still write to segments.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _flushSnapshotMinTs = new(StringComparer.Ordinal);
     private readonly LastValueCache _lastValueCache = new();
     private readonly DistinctValueCache _distinctCache = new();
     private Timer? _rpExpiryTimer;
@@ -109,7 +113,8 @@ public sealed class TsdbEngine : IDisposable
             health: _health,
             maxSegmentFileBytes: _maxSegmentFileBytes,
             segmentFillRatio: _segmentFillRatio,
-            maxWriteBytesPerSecond: compactionMaxWriteBytesPerSecond);
+            maxWriteBytesPerSecond: compactionMaxWriteBytesPerSecond,
+            inFlightFlushMinTs: GetInFlightFlushMinTs);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
         if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => RunCompaction(), null, compactionIntervalMs, compactionIntervalMs);
         if (flushIntervalMs > 0) _flushTimer = new Timer(_ => PeriodicFlush(), null, flushIntervalMs, flushIntervalMs);
@@ -2535,6 +2540,11 @@ return Interlocked.Read(ref _bufferedByteCount);
 
         var snapshot = list.ToArray();
         var maxSeq = snapshot[^1].Seq; // seq is assigned in append order, so the last one is max
+        long snapshotMinTs = long.MaxValue;
+        foreach (var bp in snapshot)
+            if (bp.Point.TimestampNs < snapshotMinTs)
+                snapshotMinTs = bp.Point.TimestampNs;
+        _flushSnapshotMinTs[key] = snapshotMinTs;
         _flushInFlight[key] = Task.Run(() => FlushSnapshotAsync(db, rp, key, snapshot, maxSeq));
     }
 
@@ -2599,7 +2609,24 @@ return Interlocked.Read(ref _bufferedByteCount);
         finally
         {
             _flushInFlight.TryRemove(key, out _);
+            // Snapshot points are either in segments or back in the buffer by now, so the floor
+            // tracking is done either way (the buffer accounts for them after a failed flush).
+            _flushSnapshotMinTs.TryRemove(key, out _);
         }
+    }
+
+    /// <summary>
+    /// Min timestamp held by any in-flight flush snapshot of the database (long.MaxValue when none).
+    /// Consumed by tombstone GC: data at or above this floor may still land in a new segment.
+    /// </summary>
+    private long GetInFlightFlushMinTs(string db)
+    {
+        long min = long.MaxValue;
+        var prefix = db + "|";
+        foreach (var kv in _flushSnapshotMinTs)
+            if (kv.Key.StartsWith(prefix, StringComparison.Ordinal) && kv.Value < min)
+                min = kv.Value;
+        return min;
     }
 
     /// <summary>

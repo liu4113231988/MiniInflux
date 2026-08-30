@@ -27,6 +27,10 @@ public sealed class TombstoneStore
     private readonly string _dir;
     private readonly object _lock = new();
     private readonly Dictionary<string, List<Tombstone>> _tombstones = new(StringComparer.Ordinal);
+    private long _version;
+    private RangeCache? _rangeCache;
+
+    private sealed record RangeCache(long Version, Dictionary<string, List<(long Min, long Max)>> ByKey);
 
     public TombstoneStore(string dataPath)
     {
@@ -48,7 +52,10 @@ public sealed class TombstoneStore
                 MaxTimeNs = maxTime,
                 CreatedAtNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000
             }))
+            {
+                _version++;
                 Save(db);
+            }
         }
     }
 
@@ -68,7 +75,10 @@ public sealed class TombstoneStore
                 MaxTimeNs = maxTime,
                 CreatedAtNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000
             }))
+            {
+                _version++;
                 Save(db);
+            }
         }
     }
 
@@ -91,7 +101,10 @@ public sealed class TombstoneStore
             }
 
             if (changed)
+            {
+                _version++;
                 Save(db);
+            }
         }
     }
 
@@ -103,6 +116,8 @@ public sealed class TombstoneStore
         lock (_lock)
         {
             _tombstones.Remove(db);
+            _version++;
+            _rangeCache = null;
             var path = Path.Combine(_dir, $"{db}.json");
             if (File.Exists(path)) try { File.Delete(path); } catch { /* best effort */ }
         }
@@ -116,13 +131,28 @@ public sealed class TombstoneStore
     {
         lock (_lock)
         {
-            if (!_tombstones.TryGetValue(db, out var list) || list.Count == 0) return false;
-            return list.Any(t => t.Measurement == measurement
-                && (t.TagsCanonical == null || t.TagsCanonical == tagsCanonical)
-                && (!t.MinTimeNs.HasValue || t.MinTimeNs.Value <= minTime)
-                && (!t.MaxTimeNs.HasValue || t.MaxTimeNs.Value >= maxTime));
+            var ranges = GetMergedRangesLocked(db, measurement, tagsCanonical);
+            if (ranges.Count == 0) return false;
+
+            // Merged ranges are disjoint and sorted by Min, so the only candidate that can cover
+            // minTime is the rightmost range starting at or before it.
+            int lo = 0, hi = ranges.Count - 1, idx = -1;
+            while (lo <= hi)
+            {
+                var mid = (lo + hi) >> 1;
+                if (ranges[mid].Min <= minTime) { idx = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            return idx >= 0 && ranges[idx].Max >= maxTime;
         }
     }
+
+    /// <summary>
+    /// Monotonic store version, bumped on every mutation. Compaction captures it before reading
+    /// data and re-checks before retiring coverage: a delete that lands in between must keep its
+    /// tombstone (the rewritten output can contain the deleted point).
+    /// </summary>
+    public long CurrentVersion { get { lock (_lock) return _version; } }
 
     /// <summary>
     /// Check if any tombstones exist for the given database (fast path to skip filtering when clean).
@@ -143,11 +173,9 @@ public sealed class TombstoneStore
     {
         lock (_lock)
         {
-            if (!_tombstones.TryGetValue(db, out var list) || list.Count == 0)
+            var ranges = GetMergedRangesLocked(db, measurement, tagsCanonical);
+            if (ranges.Count == 0)
                 return timestamps;
-
-            var ranges = BuildMergedRanges(list, measurement, tagsCanonical);
-            if (ranges.Count == 0) return timestamps;
 
             var filteredTs = new List<long>(timestamps.Count);
             var rangeIndex = 0;
@@ -187,12 +215,9 @@ public sealed class TombstoneStore
     {
         lock (_lock)
         {
-            if (!_tombstones.TryGetValue(db, out var list) || list.Count == 0)
+            var ranges = GetMergedRangesLocked(db, measurement, tagsCanonical);
+            if (ranges.Count == 0)
                 return (timestamps, values);
-
-            var ranges = BuildMergedRanges(list, measurement, tagsCanonical);
-
-            if (ranges.Count == 0) return (timestamps, values);
 
             var filteredTs = new List<long>();
             var filteredVals = new List<FieldValue>();
@@ -216,12 +241,57 @@ public sealed class TombstoneStore
     }
 
     /// <summary>
-    /// Clear all tombstones for a shard after compaction has applied them.
+    /// Retire tombstone coverage for [minNs, maxNs] after compaction physically rewrote every
+    /// segment of a shard containing that range: the deleted data no longer exists, so filtering
+    /// on read would be dead weight. Fully covered tombstones are dropped; partially overlapping
+    /// ones are split so only the still-unapplied ranges remain.
     /// </summary>
-    public void ClearApplied(string db, int shardId)
+    public void RemoveCoveredRange(string db, long minNs, long maxNs)
     {
-        // In a full implementation, we'd track which tombstones have been applied to which shards.
-        // For simplicity, we keep all tombstones and let compaction check each time.
+        lock (_lock)
+        {
+            if (!_tombstones.TryGetValue(db, out var list) || list.Count == 0) return;
+
+            var changed = false;
+            for (var i = list.Count - 1; i >= 0; i--)
+            {
+                var t = list[i];
+                var tMin = t.MinTimeNs ?? long.MinValue;
+                var tMax = t.MaxTimeNs ?? long.MaxValue;
+                if (tMax < minNs || tMin > maxNs) continue;
+
+                var coveredMin = Math.Max(tMin, minNs);
+                var coveredMax = Math.Min(tMax, maxNs);
+                changed = true;
+                list.RemoveAt(i);
+
+                // Keep the unapplied remainders; null bounds stay unbounded on their side.
+                if (tMin < coveredMin)
+                    list.Add(new Tombstone
+                    {
+                        Measurement = t.Measurement,
+                        TagsCanonical = t.TagsCanonical,
+                        MinTimeNs = t.MinTimeNs,
+                        MaxTimeNs = coveredMin - 1,
+                        CreatedAtNs = t.CreatedAtNs
+                    });
+                if (tMax > coveredMax)
+                    list.Add(new Tombstone
+                    {
+                        Measurement = t.Measurement,
+                        TagsCanonical = t.TagsCanonical,
+                        MinTimeNs = coveredMax + 1,
+                        MaxTimeNs = t.MaxTimeNs,
+                        CreatedAtNs = t.CreatedAtNs
+                    });
+            }
+
+            if (changed)
+            {
+                _version++;
+                Save(db);
+            }
+        }
     }
 
     private bool IsDeletedLocked(Point p, List<Tombstone> list)
@@ -234,7 +304,7 @@ public sealed class TombstoneStore
             (!t.MaxTimeNs.HasValue || t.MaxTimeNs.Value >= p.TimestampNs));
     }
 
-    private static List<(long Min, long Max)> BuildMergedRanges(List<Tombstone> tombstones, string measurement, string tagsCanonical)
+    private static List<(long Min, long Max)> BuildMergedRanges(List<Tombstone> tombstones, string measurement, string? tagsCanonical)
     {
         var ranges = tombstones
             .Where(t => t.Measurement == measurement && (t.TagsCanonical == null || t.TagsCanonical == tagsCanonical))
@@ -255,6 +325,34 @@ public sealed class TombstoneStore
                 merged.Add(current);
         }
         return merged;
+    }
+
+    /// <summary>
+    /// Merged, sorted, disjoint ranges for one (db, measurement, tags) key, cached until the store
+    /// mutates. Building per query per column is the hot read-path cost once deletes exist.
+    /// </summary>
+    private List<(long Min, long Max)> GetMergedRangesLocked(string db, string measurement, string tagsCanonical)
+    {
+        if (!_tombstones.TryGetValue(db, out var list) || list.Count == 0) return [];
+
+        Dictionary<string, List<(long Min, long Max)>> byKey;
+        var cache = _rangeCache;
+        if (cache == null || cache.Version != _version)
+        {
+            byKey = new Dictionary<string, List<(long Min, long Max)>>(StringComparer.Ordinal);
+            _rangeCache = new RangeCache(_version, byKey);
+        }
+        else
+        {
+            byKey = cache.ByKey;
+        }
+
+        var key = measurement + "\n" + (tagsCanonical ?? "*");
+        if (byKey.TryGetValue(key, out var ranges)) return ranges;
+
+        ranges = BuildMergedRanges(list, measurement, tagsCanonical);
+        byKey[key] = ranges;
+        return ranges;
     }
 
     private List<Tombstone> GetList(string db)

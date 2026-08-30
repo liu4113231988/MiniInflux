@@ -13,6 +13,10 @@ public sealed class Compactor
     private readonly TombstoneStore _tombstones;
     private readonly SchemaRegistry _schema;
     private readonly StorageHealth? _health;
+    // ponytail: min timestamp held by an in-flight flush snapshot, per db (long.MaxValue when none).
+    // Data at or above it may still land in a new segment after this task's snapshot was taken, so
+    // tombstone coverage is only retired below it (see TryRetireTombstones).
+    private readonly Func<string, long>? _inFlightFlushMinTs;
     private readonly int _maxL0Segments;
     private readonly int _maxL1Segments;
     private readonly long _maxL0Bytes;
@@ -38,13 +42,14 @@ public sealed class Compactor
         long maxL0Bytes = 512 * 1024 * 1024, long maxL1Bytes = 512 * 1024 * 1024,
         int minFilesPerCompaction = 2, int maxPassesPerRun = 8, StorageHealth? health = null,
         long maxSegmentFileBytes = 0, double segmentFillRatio = 0.5,
-        long maxWriteBytesPerSecond = 0)
+        long maxWriteBytesPerSecond = 0, Func<string, long>? inFlightFlushMinTs = null)
     {
         _manifest = manifest;
         _shardManager = shardManager;
         _tombstones = tombstones;
         _schema = schema;
         _health = health;
+        _inFlightFlushMinTs = inFlightFlushMinTs;
         _maxL0Segments = maxL0Segments;
         _maxL1Segments = maxL1Segments;
         _maxL0Bytes = maxL0Bytes;
@@ -256,6 +261,15 @@ public sealed class Compactor
     {
         if (segFiles.Count == 0) return false;
 
+        // Capture before rewriting: a flush snapshot in flight now may write pre-delete points to a
+        // new segment after this task's snapshot was taken, so coverage is only retired below it.
+        long gcFloor = _inFlightFlushMinTs != null && _tombstones.HasTombstones(db)
+            ? _inFlightFlushMinTs(db)
+            : long.MaxValue;
+        // A delete that lands after the inputs were read cannot have been applied to the rewritten
+        // output, so retirement is skipped whenever the store mutated during the rewrite.
+        long tombstoneVersionAtRead = _tombstones.CurrentVersion;
+
         var orderedInputs = segFiles
             .OrderByDescending(f => f.Level)
             .ThenBy(f => f.LastWriteUtc)
@@ -287,7 +301,9 @@ public sealed class Compactor
 
         if (filtered.Count == 0)
         {
-            return FinalizeCompaction(db, rp, shard.Id, orderedInputs, []);
+            var emptied = FinalizeCompaction(db, rp, shard.Id, orderedInputs, []);
+            if (emptied) TryRetireTombstones(db, rp, shard, orderedInputs, gcFloor, tombstoneVersionAtRead);
+            return emptied;
         }
 
         var merged = MergeColumns(filtered);
@@ -330,7 +346,39 @@ public sealed class Compactor
         _manifest.UpdateIndexes(db, merged
             .GroupBy(c => (c.Measurement, c.TagsCanonical))
             .Select(g => (g.Key.Measurement, g.Key.TagsCanonical, ParseTags(g.Key.TagsCanonical))));
-        return FinalizeCompaction(db, rp, shard.Id, orderedInputs, mergedPaths);
+        var finalized = FinalizeCompaction(db, rp, shard.Id, orderedInputs, mergedPaths);
+        if (finalized) TryRetireTombstones(db, rp, shard, orderedInputs, gcFloor, tombstoneVersionAtRead);
+        return finalized;
+    }
+
+    /// <summary>
+    /// Tombstone GC: when a pass rewrites EVERY segment file currently registered for the shard,
+    /// the deletes inside the rewritten range were physically applied and the corresponding
+    /// coverage can be retired, ending the permanent read-time filtering cost after a DELETE.
+    /// Coverage at or above the in-flight-flush floor is kept — that data may still land in a
+    /// segment written after this task's snapshot was taken.
+    /// </summary>
+    private void TryRetireTombstones(string db, string rp, ShardGroupInfo shard, List<FileCandidate> inputs, long gcFloor, long tombstoneVersionAtRead)
+    {
+        if (_tombstones.CurrentVersion != tombstoneVersionAtRead) return;
+        if (!FullyRewroteShard(db, rp, shard, inputs)) return;
+        if (inputs.Any(f => !f.MinTimeNs.HasValue || !f.MaxTimeNs.HasValue)) return;
+
+        var rewrittenMin = inputs.Min(f => f.MinTimeNs!.Value);
+        var rewrittenMax = inputs.Max(f => f.MaxTimeNs!.Value);
+        var retireMax = Math.Min(rewrittenMax, gcFloor - 1);
+        if (retireMax < rewrittenMin) return;
+
+        _tombstones.RemoveCoveredRange(db, rewrittenMin, retireMax);
+    }
+
+    private bool FullyRewroteShard(string db, string rp, ShardGroupInfo shard, List<FileCandidate> inputs)
+    {
+        var inputPaths = new HashSet<string>(inputs.Select(f => f.Path), StringComparer.OrdinalIgnoreCase);
+        var shardDir = _shardManager.ShardDir(db, rp, shard.Id);
+        return shard.SegmentFiles
+            .Select(name => Path.Combine(shardDir, name))
+            .All(path => !File.Exists(path) || inputPaths.Contains(path));
     }
 
     private static long EstimateColumnBytes(SegmentColumn col)
