@@ -18,14 +18,15 @@ public static class CsvQueryResponseWriter
             if (result.Error != null || result.Series == null) continue;
             foreach (var series in result.Series)
             {
+                // Per-column escaping so "time,value" stays two columns (InfluxDB v1 CSV compatible)
                 sb.Append("name,tags,");
-                sb.AppendLine(EscapeJoin(series.Columns, ','));
+                sb.AppendLine(string.Join(",", series.Columns.Select(Escape)));
 
                 var tagText = series.Tags == null || series.Tags.Count == 0
                     ? ""
                     : string.Join(";",
                         series.Tags.OrderBy(kv => kv.Key, StringComparer.Ordinal)
-                            .Select(kv => $"{kv.Key}={kv.Value}"));
+                            .Select(kv => $"{EscapeTagComponent(kv.Key)}={EscapeTagComponent(kv.Value)}"));
 
                 foreach (var row in series.Values)
                 {
@@ -54,14 +55,22 @@ public static class CsvQueryResponseWriter
         _ => Escape(value.ToString() ?? "")
     };
 
-    private static string EscapeJoin(IEnumerable<string> values, char delimiter)
+    private static string EscapeTagComponent(string value)
     {
-        var joined = string.Join(delimiter, values);
-        return Escape(joined);
+        // Escape characters that conflict with the "k=v; k=v" encoding: % ; = , newlines.
+        // Percent-encode to keep round-tripping distinct from literal values containing ';'/'='.
+        if (value.IndexOfAny(['%', ';', '=', ',', '\n', '\r', '\\']) < 0) return value;
+        return value.Replace("%", "%25").Replace(";", "%3B").Replace("=", "%3D").Replace(",", "%2C").Replace("\n", "%0A").Replace("\r", "%0D").Replace("\\", "%5C");
     }
 
     private static string Escape(string value)
     {
+        // CSV formula injection: leading = + - @ | or tab can trigger spreadsheet execution.
+        var needsForceQuote = value.Length > 0 && value[0] is '=' or '+' or '-' or '@' or '|' or '\t';
+        if (needsForceQuote)
+        {
+            return "\"'" + value.Replace("\"", "\"\"") + "\"";
+        }
         if (value.Contains(',') || value.Contains('"') || value.Contains('\n') || value.Contains('\r'))
             return "\"" + value.Replace("\"", "\"\"") + "\"";
         return value;

@@ -83,8 +83,8 @@ public class CsvQueryResponseTests : IDisposable
         var csv = CsvQueryResponseWriter.Write(response);
         var lines = csv.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
 
-        // The header's column list contains a comma, so it is quoted as one CSV field.
-        Assert.Contains("\"time,value\"", lines[0]);
+        // Per-column escaping: header stays as distinct columns (InfluxDB v1 CSV compatible)
+        Assert.Equal("name,tags,time,value", lines[0]);
         Assert.Contains("\"cpu,meta\"", lines[1]);
         Assert.Contains("\"host=", lines[1]);
         Assert.Contains("a\"\"b", lines[1]);

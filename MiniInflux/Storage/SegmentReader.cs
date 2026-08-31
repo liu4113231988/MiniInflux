@@ -49,9 +49,17 @@ public static class SegmentReader
     // the process lifetime so queries stop re-reading them on every pass; they surface in engine
     // stats and the validate CLI instead of silently re-tainting results.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_quarantined = new(StringComparer.Ordinal);
+    private const int MaxQuarantinedEntries = 1024;
 
     public static bool IsQuarantined(string path) => s_quarantined.ContainsKey(path);
     public static IReadOnlyCollection<string> Quarantined => s_quarantined.Keys.ToArray();
+    public static void ClearQuarantined(string path) => s_quarantined.TryRemove(path, out _);
+    public static void ClearQuarantinedByPrefix(string prefix)
+    {
+        foreach (var key in s_quarantined.Keys)
+            if (key.StartsWith(prefix, StringComparison.Ordinal))
+                s_quarantined.TryRemove(key, out _);
+    }
 
     // Decoded column block cache. Repeated dashboard-style queries used to re-run Brotli
     // decompression + delta/Gorilla decoding for the same columns on every single query; segment
@@ -423,13 +431,17 @@ public static class SegmentReader
     /// <summary>
     /// Bound the verification cache: compaction constantly creates new segment paths, so stale
     /// entries (replaced or deleted files) are swept first, then an arbitrary entry is dropped.
+    /// Sampled sweep avoids 4096 stat calls on every insert at capacity.
     /// </summary>
     private static void RememberCrcVerified(string path, long length, DateTime lastWriteUtc)
     {
         if (s_crcVerified.Count >= MaxCrcVerifiedEntries && !s_crcVerified.ContainsKey(path))
         {
+            // Sample up to 16 entries for stale-file eviction instead of scanning the whole table
+            var sampled = 0;
             foreach (var kv in s_crcVerified)
             {
+                if (sampled++ >= 16) break;
                 if (kv.Key == path) continue;
                 var info = new FileInfo(kv.Key);
                 if (!info.Exists || info.Length != kv.Value.Length || info.LastWriteTimeUtc != kv.Value.LastWriteUtc)
@@ -442,6 +454,12 @@ public static class SegmentReader
             }
         }
         s_crcVerified[path] = (length, lastWriteUtc);
+        // Bound quarantine as well to avoid unbounded growth under pathological corruption
+        if (s_quarantined.Count > MaxQuarantinedEntries)
+        {
+            var first = s_quarantined.Keys.FirstOrDefault();
+            if (first != null) s_quarantined.TryRemove(first, out _);
+        }
     }
 
     private static Stream OpenSegmentForSequentialRead(string path, out long dataLength, out long fileLength)

@@ -1962,6 +1962,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         FlushDatabase(db);
         var dbDir = Path.Combine(_root, "db", db);
         if (Directory.Exists(dbDir)) try { Directory.Delete(dbDir, true); } catch { }
+        SegmentReader.ClearQuarantinedByPrefix(dbDir);
         InvalidateSegmentMetadataIndex();
         _manifest.DropDatabase(db); _manifest.SaveIfDirty(); _tombstones.DropDatabase(db);
         foreach (var ensured in _ensuredDbRp.Keys.Where(k => k.StartsWith(db + "|", StringComparison.Ordinal)).ToList())
@@ -2096,6 +2097,7 @@ return Interlocked.Read(ref _bufferedByteCount);
                 if (shard == null) continue;
                 var dir = _shards.ShardDir(db, rp, shardId);
                 if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+                SegmentReader.ClearQuarantinedByPrefix(dir);
                 InvalidateSegmentMetadataIndex();
                 _manifest.RemoveShardGroup(db, rp, shardId);
                 return true;

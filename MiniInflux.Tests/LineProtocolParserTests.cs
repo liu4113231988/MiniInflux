@@ -67,8 +67,12 @@ public class LineProtocolParserTests
         var text = "cpu,host=server01,region=us value=1.5 1000000000\ncpu,host=server01,region=us value=2.5 2000000000";
         var points = LineProtocolParser.ParseMany(text, TimestampPrecision.Parse("ns"));
 
-        Assert.Same(points[0].Tags, points[1].Tags);
+        // Dictionaries are equal but not same instance: mutating one must not pollute the other
+        Assert.Equal(points[0].Tags, points[1].Tags);
+        Assert.NotSame(points[0].Tags, points[1].Tags);
         Assert.Equal("host=server01,region=us", points[0].TagsCanonical);
+        points[0].Tags["host"] = "mutated";
+        Assert.Equal("server01", points[1].Tags["host"]);
     }
 
     [Fact]

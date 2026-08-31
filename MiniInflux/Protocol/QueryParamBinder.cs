@@ -18,13 +18,16 @@ public static class QueryParamBinder
     {
         if (_parseCache.TryGetValue(query, out var cached)) return cached;
         var parsed = InfluxQlParser.Parse(query);
+        // Bounded cache: TryAdd is atomic; eviction is best-effort under contention (overshoot by at most a few entries).
         if (_parseCache.Count >= MaxCacheSize)
         {
-            // bounded cache: evict an arbitrary entry to stay AOT friendly (no LRU)
             var first = _parseCache.Keys.FirstOrDefault();
             if (first != null) _parseCache.TryRemove(first, out _);
         }
-        _parseCache[query] = parsed;
+        _parseCache.TryAdd(query, parsed);
+        // If another thread raced, return the existing entry to keep single cached instance
+        if (_parseCache.TryGetValue(query, out var winner) && !ReferenceEquals(winner, parsed))
+            return winner;
         return parsed;
     }
 
@@ -85,8 +88,15 @@ public static class QueryParamBinder
     static (long? Min, long? Max) ResolveTimeParam(ParamFilter param, JsonElement value)
     {
         string text;
-        if (value.ValueKind is JsonValueKind.String or JsonValueKind.Number)
-            text = value.ValueKind == JsonValueKind.String ? value.GetString()! : value.GetRawText();
+        if (value.ValueKind == JsonValueKind.String)
+            text = value.GetString()!;
+        else if (value.ValueKind == JsonValueKind.Number)
+        {
+            // Only integer epoch values are accepted for numeric time params; fractional/scientific would be mis-parsed as dates
+            if (!value.TryGetInt64(out var intNs))
+                throw new FormatException($"parameter ${param.Name} must be an integer timestamp for time comparison: {value.GetRawText()}");
+            text = intNs.ToString(CultureInfo.InvariantCulture);
+        }
         else
             throw new FormatException($"parameter ${param.Name} must be a timestamp string for time comparison");
 
@@ -97,9 +107,9 @@ public static class QueryParamBinder
         return param.Op switch
         {
             ">=" => (ns, null),
-            ">" => (ns + 1, null),
+            ">" => (checked(ns + 1), null),
             "<=" => (null, ns),
-            "<" => (null, ns - 1),
+            "<" => (null, checked(ns - 1)),
             "=" => (ns, ns),
             _ => throw new FormatException($"operator {param.Op} is not supported for time parameters")
         };

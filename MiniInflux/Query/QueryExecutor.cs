@@ -2557,7 +2557,7 @@ public sealed class QueryExecutor
                 }
                 filledRows.Add(row);
             }
-            series.Values = filledRows.OrderBy(r => r[0]?.ToString()).ToList();
+            series.Values = filledRows.OrderBy(r => ParseTimeNs(r[0])).ToList();
         }
     }
 
@@ -3601,7 +3601,9 @@ public sealed class QueryExecutor
             return ToCanonicalTagKey(tags);
         if (groupByTags.Count == 0)
             return string.Empty;
-        return string.Join("|", groupByTags.Select(tag => tags.TryGetValue(tag, out var value) ? value : ""));
+        // Use \0 as separator and percent-encode occurrences inside values to avoid collisions
+        // e.g. ["a|","b"] vs ["a","|b"] previously collided with '|' join.
+        return string.Join('\0', groupByTags.Select(tag => tags.TryGetValue(tag, out var value) ? EscapeGroupKeyPart(value) : ""));
     }
 
     static Dictionary<string, string>? BuildGroupByTags(string groupKey, List<string> groupByTags, bool groupByAllTags)
@@ -3611,15 +3613,18 @@ public sealed class QueryExecutor
         if (groupByTags.Count == 0)
             return null;
 
-        var values = groupKey.Split('|');
+        var values = groupKey.Split('\0');
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
         for (int i = 0; i < groupByTags.Count; i++)
         {
-            var value = i < values.Length ? values[i] : "";
+            var value = i < values.Length ? UnescapeGroupKeyPart(values[i]) : "";
             result[groupByTags[i]] = value;
         }
         return result;
     }
+
+    static string EscapeGroupKeyPart(string v) => v.Replace("%", "%25").Replace("\0", "%00");
+    static string UnescapeGroupKeyPart(string v) => v.Replace("%00", "\0").Replace("%25", "%");
 
     static string ToCanonicalTagKey(IReadOnlyDictionary<string, string> tags) =>
         string.Join(",",
@@ -3985,12 +3990,26 @@ public sealed class QueryExecutor
 
     static Regex GetTagRegex(string pattern)
     {
+        if (s_tagRegexCache.TryGetValue(pattern, out var cached)) return cached;
         if (s_tagRegexCache.Count >= 256 && !s_tagRegexCache.ContainsKey(pattern))
         {
             var first = s_tagRegexCache.Keys.FirstOrDefault();
             if (first != null) s_tagRegexCache.TryRemove(first, out _);
         }
-        return s_tagRegexCache.GetOrAdd(pattern, p => new Regex(p, RegexOptions.CultureInvariant));
+        try
+        {
+            var regex = new Regex(pattern, RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+            s_tagRegexCache[pattern] = regex;
+            return regex;
+        }
+        catch (ArgumentException ex)
+        {
+            throw new FormatException($"invalid regex pattern: {pattern}", ex);
+        }
+        catch (RegexMatchTimeoutException ex)
+        {
+            throw new FormatException($"regex timeout for pattern: {pattern}", ex);
+        }
     }
 
     static bool MatchesTagFilters(Point point, List<TagFilter> filters)

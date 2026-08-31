@@ -42,7 +42,7 @@ public sealed class StorageHealth
     public void SetDiskSpaceProbe(Func<long> availableBytesProvider, long minFreeDiskBytes)
     {
         _diskProbe = availableBytesProvider;
-        _diskFloorBytes = minFreeDiskBytes;
+        _diskFloorBytes = Math.Max(0, minFreeDiskBytes);
     }
 
     /// <summary>

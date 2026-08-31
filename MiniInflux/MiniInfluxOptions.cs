@@ -94,7 +94,7 @@ public sealed class MiniInfluxOptions
                 MaxConcurrentQueries = ReadInt(config, 0, "Storage:MaxConcurrentQueries"),
                 MaxBufferBytes = ReadLong(config, 0, "Storage:MaxBufferBytes"),
                 MaxQueryMemoryBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:MaxQueryMemoryBytes"),
-                MinFreeDiskBytes = ReadLong(config, 1L * 1024 * 1024 * 1024, "Storage:MinFreeDiskBytes"),
+                MinFreeDiskBytes = Math.Max(0, ReadLong(config, 1L * 1024 * 1024 * 1024, "Storage:MinFreeDiskBytes")),
                 FlushColdDurationMs = ReadInt(config, 600_000, "Storage:FlushColdDurationMs"),
                 CompactionTargetBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:CompactionTargetBytes"),
                 MaxSegmentFileBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:MaxSegmentFileBytes"),

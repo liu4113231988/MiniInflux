@@ -726,18 +726,17 @@ public static class InfluxQlParser
     static bool TryParseTimeFilter(string p, out long? min, out long? max, List<ParamFilter> paramFilters)
     {
         min = null; max = null;
-        // Only the exact "time" key is a time predicate; tag keys that merely start with
-        // "time" (e.g. timer) must fall through to tag-filter parsing, not be swallowed here.
         if (!IsTimePredicate(p))
             return false;
 
         string op, rhs;
-        if (p.Contains(">=")) { op = ">="; rhs = p.Split(">=", 2)[1]; }
+        // Multi-char operators must be checked before single-char '>'/'<' to keep "<>"/"!=" reachable
+        if (p.Contains("<>") || p.Contains("!="))
+            throw new NotSupportedException($"unsupported time predicate: {p}");
+        else if (p.Contains(">=")) { op = ">="; rhs = p.Split(">=", 2)[1]; }
         else if (p.Contains("<=")) { op = "<="; rhs = p.Split("<=", 2)[1]; }
         else if (p.Contains('>')) { op = ">"; rhs = p.Split('>', 2)[1]; }
         else if (p.Contains('<')) { op = "<"; rhs = p.Split('<', 2)[1]; }
-        else if (p.Contains("<>") || p.Contains("!="))
-            throw new NotSupportedException($"unsupported time predicate: {p}");
         else if (p.Contains('=')) { op = "="; rhs = p.Split('=', 2)[1]; }
         else throw new FormatException($"unsupported time predicate: {p}");
 
@@ -749,16 +748,26 @@ public static class InfluxQlParser
         }
         var t = ParseTime(value);
         if (op == "=") { min = t; max = t; }
-        else if (op == ">=" || op == ">") min = op == ">" ? t + 1 : t;
-        else max = op == "<" ? t - 1 : t;
+        else if (op == ">=") min = t;
+        else if (op == ">") min = checked(t + 1);
+        else if (op == "<=") max = t;
+        else if (op == "<") max = checked(t - 1);
         return true;
     }
 
     static bool IsTimePredicate(string p)
     {
-        if (!p.StartsWith("time", StringComparison.OrdinalIgnoreCase)) return false;
-        if (p.Length == 4) return true;
-        var next = p[4];
+        var trimmed = p.TrimStart();
+        // Quoted "time" is an identifier/tag, not the time column
+        if (trimmed.Length >= 2 && trimmed[0] == '"' && trimmed.Length > 4)
+        {
+            // starts with "time" quoted  -> not a time predicate
+            if (trimmed.StartsWith("\"time\"", StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        if (!trimmed.StartsWith("time", StringComparison.OrdinalIgnoreCase)) return false;
+        if (trimmed.Length == 4) return true;
+        var next = trimmed[4];
         return next is ' ' or '\t' or '<' or '>' or '!' or '=';
     }
 

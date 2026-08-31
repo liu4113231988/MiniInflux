@@ -24,7 +24,7 @@ public static class LineProtocolParser
                 end = text.Length;
 
             var lineEnd = end > start && text[end - 1] == '\r' ? end - 1 : end;
-            if (HasContent(text, start, lineEnd) && text[start] != '#')
+            if (HasContent(text, start, lineEnd) && !IsCommentLine(text, start, lineEnd))
             {
                 res.Add(HasSpecial(text, start, lineEnd)
                     ? ParseOne(text[start..lineEnd], precision)
@@ -41,6 +41,27 @@ public static class LineProtocolParser
         for (var i = start; i < end; i++)
             if (!char.IsWhiteSpace(text[i]))
                 return true;
+        return false;
+    }
+
+    private static bool IsCommentLine(string text, int start, int end)
+    {
+        for (var i = start; i < end; i++)
+        {
+            var ch = text[i];
+            if (ch is ' ' or '\t' or '\r' or '\v' or '\f') continue;
+            return ch == '#';
+        }
+        return false;
+    }
+
+    private static bool IsCommentLineUtf8(ReadOnlySpan<byte> line)
+    {
+        foreach (var b in line)
+        {
+            if (b is (byte)' ' or (byte)'\t' or (byte)'\r' or 0x0B or 0x0C) continue;
+            return b == (byte)'#';
+        }
         return false;
     }
 
@@ -62,7 +83,7 @@ public static class LineProtocolParser
             var end = nl < 0 ? utf8.Length : start + nl;
             var lineEnd = end > start && utf8[end - 1] == (byte)'\r' ? end - 1 : end;
             var line = utf8[start..lineEnd];
-            if (HasContentUtf8(line) && line.Length > 0 && utf8[start] != (byte)'#')
+            if (HasContentUtf8(line) && line.Length > 0 && !IsCommentLineUtf8(line))
             {
                 res.Add(line.IndexOfAny((byte)'\\', (byte)'"') >= 0
                     ? ParseOne(Encoding.UTF8.GetString(line), precision)
@@ -145,14 +166,16 @@ public static class LineProtocolParser
         }
 
         var hasTime = false;
+        var timeEnd = line.Length;
         if (timeStart >= 0)
         {
             while (timeStart < line.Length && line[timeStart] is (byte)' ' or (byte)'\t') timeStart++;
-            hasTime = timeStart < line.Length;
+            while (timeEnd > timeStart && line[timeEnd - 1] is (byte)' ' or (byte)'\t' or (byte)'\r') timeEnd--;
+            hasTime = timeStart < timeEnd;
         }
         var ts = !hasTime
             ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000
-            : checked(ParseInt64Utf8(line[timeStart..]) * precision.Multiplier);
+            : checked(ParseInt64Utf8(line[timeStart..timeEnd]) * precision.Multiplier);
 
         return new Point
         {
@@ -255,8 +278,10 @@ public static class LineProtocolParser
         public bool TryGetTags(ReadOnlySpan<byte> utf8, out string canonical, out Dictionary<string, string> tags)
         {
             canonical = Get(utf8);
-            if (_tagsByCanonical.TryGetValue(canonical, out tags!))
+            if (_tagsByCanonical.TryGetValue(canonical, out var cached))
             {
+                // Return a copy so each Point owns its dictionary; caller may mutate without polluting the pool.
+                tags = new Dictionary<string, string>(cached!, StringComparer.Ordinal);
                 return true;
             }
 
@@ -264,7 +289,7 @@ public static class LineProtocolParser
             return false;
         }
 
-        public void AddTags(string canonical, Dictionary<string, string> tags) => _tagsByCanonical.TryAdd(canonical, tags);
+        public void AddTags(string canonical, Dictionary<string, string> tags) => _tagsByCanonical.TryAdd(canonical, new Dictionary<string, string>(tags, StringComparer.Ordinal));
     }
 
     private static int EstimatePointCapacity(string text) => Math.Min(100_000, text.Length / 64);
@@ -359,14 +384,16 @@ public static class LineProtocolParser
         }
 
         var hasTime = false;
+        var timeEnd = end;
         if (timeStart >= 0)
         {
             while (timeStart < end && char.IsWhiteSpace(line[timeStart])) timeStart++;
-            hasTime = timeStart < end;
+            while (timeEnd > timeStart && char.IsWhiteSpace(line[timeEnd - 1])) timeEnd--;
+            hasTime = timeStart < timeEnd;
         }
         var ts = !hasTime
             ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000
-            : checked(long.Parse(line.AsSpan(timeStart, end - timeStart), CultureInfo.InvariantCulture) * precision.Multiplier);
+            : checked(long.Parse(line.AsSpan(timeStart, timeEnd - timeStart), CultureInfo.InvariantCulture) * precision.Multiplier);
 
         return new Point
         {
@@ -407,8 +434,9 @@ public static class LineProtocolParser
         public bool TryGetTags(string text, int start, int length, out string canonical, out Dictionary<string, string> tags)
         {
             canonical = Get(text, start, length);
-            if (_tagsByCanonical.TryGetValue(canonical, out tags!))
+            if (_tagsByCanonical.TryGetValue(canonical, out var cached))
             {
+                tags = new Dictionary<string, string>(cached!, StringComparer.Ordinal);
                 return true;
             }
 
@@ -416,7 +444,7 @@ public static class LineProtocolParser
             return false;
         }
 
-        public void AddTags(string canonical, Dictionary<string, string> tags) => _tagsByCanonical.TryAdd(canonical, tags);
+        public void AddTags(string canonical, Dictionary<string, string> tags) => _tagsByCanonical.TryAdd(canonical, new Dictionary<string, string>(tags, StringComparer.Ordinal));
     }
 
     private static FieldValue ParseSimpleFieldValue(string text, int start, int end)
