@@ -1,5 +1,6 @@
 using MiniInflux.Net10.Model;
 using Microsoft.Extensions.Logging;
+using MiniInflux.Net10.Protocol;
 using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
 
@@ -776,6 +777,20 @@ public class P2TodoTests : IDisposable
         Assert.Equal(bucketStart, rollup.TimestampNs);
         Assert.Equal("server01", rollup.Tags["host"]);
         Assert.Equal(35.0, rollup.Fields["mean_max_value"].AsDouble());
+    }
+
+    [Fact]
+    public void AdminQueryWhitelist_ParsesReadAndMutatingStatements()
+    {
+        // Read-only statements the admin console allows.
+        Assert.Equal(QueryKind.Select, InfluxQlParser.Parse("SELECT mean(value) FROM cpu WHERE time > now() - 1h GROUP BY time(10s)").Kind);
+        Assert.Equal(QueryKind.ShowMeasurements, InfluxQlParser.Parse("SHOW MEASUREMENTS").Kind);
+        Assert.Equal(QueryKind.ShowDatabases, InfluxQlParser.Parse("SHOW DATABASES").Kind);
+
+        // Mutating statements that must be rejected by the admin query console.
+        Assert.Equal(QueryKind.DropDatabase, InfluxQlParser.Parse("DROP DATABASE testdb").Kind);
+        Assert.Equal(QueryKind.Delete, InfluxQlParser.Parse("DELETE FROM cpu WHERE time < now() - 30d").Kind);
+        Assert.Equal(QueryKind.CreateDatabase, InfluxQlParser.Parse("CREATE DATABASE newdb").Kind);
     }
 
     private static Point Point(string measurement, string host, double value, long timestampNs) => new()

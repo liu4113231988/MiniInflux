@@ -41,4 +41,32 @@ public class Crc32Tests
         var result = Crc32.Compute(data);
         Assert.Equal(0xE3069283u, result);
     }
+
+    [Fact]
+    public void Compute_LargeInput_MatchesSingleByteReference()
+    {
+        // Cross-check the slicing-by-8 implementation against a straightforward single-byte
+        // table implementation on a large, non-8-aligned payload.
+        var random = new Random(42);
+        var data = new byte[1_000_003];
+        random.NextBytes(data);
+        Assert.Equal(ReferenceCrc32C(data), Crc32.Compute(data));
+    }
+
+    private static uint ReferenceCrc32C(byte[] data)
+    {
+        var table = new uint[256];
+        for (uint i = 0; i < 256; i++)
+        {
+            var crc = i;
+            for (var j = 0; j < 8; j++)
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0x82F63B78u : crc >> 1;
+            table[i] = crc;
+        }
+
+        uint value = 0xFFFFFFFFu;
+        foreach (var b in data)
+            value = table[(value ^ b) & 0xFF] ^ (value >> 8);
+        return value ^ 0xFFFFFFFFu;
+    }
 }

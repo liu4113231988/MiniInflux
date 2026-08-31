@@ -90,10 +90,18 @@ public sealed class MiniInfluxOptions
                 MaxResponseRows = ReadInt(config, 100_000, "Storage:MaxResponseRows"),
                 MaxQueryPoints = ReadInt(config, 1_000_000, "Storage:MaxQueryPoints"),
                 MaxBufferPoints = ReadLong(config, 1_000_000, "Storage:MaxBufferPoints"),
-                MaxQueryDurationMs = ReadInt(config, 30_000, "Storage:MaxQueryDurationMs"),
+                MaxQueryDurationMs = ReadInt(config, 10_000, "Storage:MaxQueryDurationMs"),
+                MaxConcurrentQueries = ReadInt(config, 0, "Storage:MaxConcurrentQueries"),
                 MaxBufferBytes = ReadLong(config, 0, "Storage:MaxBufferBytes"),
                 MaxQueryMemoryBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:MaxQueryMemoryBytes"),
-                MinFreeDiskBytes = ReadLong(config, 1L * 1024 * 1024 * 1024, "Storage:MinFreeDiskBytes")
+                MinFreeDiskBytes = ReadLong(config, 1L * 1024 * 1024 * 1024, "Storage:MinFreeDiskBytes"),
+                FlushColdDurationMs = ReadInt(config, 600_000, "Storage:FlushColdDurationMs"),
+                CompactionTargetBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:CompactionTargetBytes"),
+                MaxSegmentFileBytes = ReadLong(config, 512L * 1024 * 1024, "Storage:MaxSegmentFileBytes"),
+            MinSegmentFileBytes = ReadLong(config, 0L, "Storage:MinSegmentFileBytes"),
+            MinSegmentFillRatio = ReadDouble(config, 0.5, "Storage:MinSegmentFillRatio"),
+            CompactionMaxWriteBytesPerSecond = ReadLong(config, 0L, "Storage:CompactionMaxWriteBytesPerSecond"),
+            LastValueCacheMaxEntries = (int)ReadLong(config, 1_000_000L, "Storage:LastValueCacheMaxEntries")
             },
             Auth = new AuthOptions
             {
@@ -143,6 +151,14 @@ public sealed class MiniInfluxOptions
     {
         foreach (var key in keys)
             if (long.TryParse(config[key], out var value))
+                return value;
+        return fallback;
+    }
+
+    private static double ReadDouble(IConfiguration config, double fallback, params string[] keys)
+    {
+        foreach (var key in keys)
+            if (double.TryParse(config[key], out var value) && value is > 0 and <= 1)
                 return value;
         return fallback;
     }
@@ -271,10 +287,36 @@ public sealed class StorageOptions
     public int MaxResponseRows { get; init; } = 100_000;
     public int MaxQueryPoints { get; init; } = 1_000_000;
     public long MaxBufferPoints { get; init; } = 1_000_000;
-    public int MaxQueryDurationMs { get; init; } = 30_000;
+    public int MaxQueryDurationMs { get; init; } = 10_000;
+    public int MaxConcurrentQueries { get; init; } = 0;
     public long MaxBufferBytes { get; init; }
     public long MaxQueryMemoryBytes { get; init; } = 512L * 1024 * 1024;
     public long MinFreeDiskBytes { get; init; } = 1L * 1024 * 1024 * 1024;
+    public int FlushColdDurationMs { get; init; } = 600_000;
+    public long CompactionTargetBytes { get; init; } = 512L * 1024 * 1024;
+    /// <summary>Hard cap on a single flushed <c>.seg</c> file's estimated size. FlushLocked splits a
+    /// shard's pending points into chunks of at most this many bytes so segment files never exceed
+    /// the configured limit; smaller flushes land in one file (compacted later).</summary>
+    public long MaxSegmentFileBytes { get; init; } = 512L * 1024 * 1024;
+    /// <summary>Below this estimated buffer size a flush is deferred so cold/low-volume shards don't
+    /// scatter many tiny <c>.seg</c> files. Data is merged into larger files as it accumulates. 0
+    /// disables the floor (flush on every trigger). A shard that stays cold past twice
+    /// <see cref="FlushColdDurationMs"/> is still force-flushed regardless of this floor.</summary>
+    public long MinSegmentFileBytes { get; init; } = 0L;
+    /// <summary>Tail-merge ratio in (0,1]. When the remaining unwritten data drops below
+    /// <c>MaxSegmentFileBytes * MinSegmentFillRatio</c>, it is packed into the current file instead
+    /// of being split off into a tiny trailing <c>.seg</c>. This caps the file count on HDD/network
+    /// storage where "file count x random IO" dominates. Higher = fewer, larger files (more memory
+    /// per flush); lower = closer to the strict hard cap. 1 reverts to the old strict split-at-cap
+    /// behavior. Files are intentionally <em>not</em> exact-size aligned.</summary>
+    public double MinSegmentFillRatio { get; init; } = 0.5;
+    /// <summary>Optional I/O budget for background compaction, in bytes per second. When non-zero,
+    /// compaction output writes are throttled to roughly this rate so a large merge cannot saturate
+    /// disk and degrade foreground read/write latency. 0 (default) disables throttling.</summary>
+    public long CompactionMaxWriteBytesPerSecond { get; init; } = 0L;
+
+    /// <summary>Cap on cached last points per db/rp; 0 = unlimited. Eviction falls back to full scans (correct, slower).</summary>
+    public int LastValueCacheMaxEntries { get; init; } = 1_000_000;
 }
 
 public sealed class AuthOptions

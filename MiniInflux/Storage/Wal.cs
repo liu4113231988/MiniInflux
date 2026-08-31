@@ -25,6 +25,8 @@ public sealed class WalManager : IDisposable
     private WalPosition _checkpoint = WalPosition.Start;
     private Timer? _fsyncTimer;
     private bool _disposed;
+    
+    // 优化的批量提交参数
 
     public WalManager(string walDir, long maxFileBytes = 16 * 1024 * 1024, bool fsync = true, int fsyncIntervalMs = 1000,
         StorageHealth? health = null)
@@ -100,35 +102,29 @@ public sealed class WalManager : IDisposable
         if (pointList.Count == 0) return [];
 
         var positions = new List<WalPosition>(pointList.Count);
+        // Format the record *and* compute its CRC outside the lock: both are O(payload) work over
+        // immutable data with no shared state, so the global WAL lock only covers the file write.
+        using var writer = new PooledBufferWriter(EstimatePayloadSize(db, rp, pointList));
+        WriteRecordPayload(writer, db, rp, pointList);
+        var payloadSpan = writer.WrittenSpan;
+        var crc = Crc32.Compute(payloadSpan);
         lock (_lock)
         {
             try
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
-                // Build payload directly into a pooled byte array, avoiding StringBuilder→string→byte[] double copy.
-                var payloadSize = EstimatePayloadSize(db, rp, pointList);
-                var payload = ArrayPool<byte>.Shared.Rent(payloadSize);
-                try
-                {
-                    var actualSize = FormatRecordUtf8(payload, db, rp, pointList);
-                    var payloadSpan = payload.AsSpan(0, actualSize);
-                    var position = WriteRecord(payloadSpan, Crc32.Compute(payloadSpan));
-                    for (var i = 0; i < pointList.Count; i++)
-                        positions.Add(position);
 
-                    if (_currentFileSize >= _maxFileBytes)
-                        RotateLocked();
+                var position = WriteRecord(payloadSpan, crc);
+                for (var i = 0; i < pointList.Count; i++)
+                    positions.Add(position);
 
-                    if (!_fsync || _fsyncIntervalMs <= 0)
-                    {
-                        _currentStream?.Flush(_fsync);
-                        _health.RecordWriteSuccess();
-                    }
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(payload);
-                }
+                if (_currentFileSize >= _maxFileBytes)
+                    RotateLocked();
+
+                // A successful append is itself proof the write path works again, so it unlatches
+                // the health gate in every fsync mode (with fsync on, this is the only self-heal
+                // signal apart from the engine's periodic probe).
+                _health.RecordWriteSuccess();
             }
             catch (Exception ex)
             {
@@ -137,6 +133,16 @@ public sealed class WalManager : IDisposable
             }
         }
         return positions;
+    }
+
+    private static void WriteRecordPayload(IBufferWriter<byte> writer, string db, string rp, IReadOnlyList<Point> points)
+    {
+        WriteUtf8(writer, db);
+        WriteUtf8(writer, "\t");
+        WriteUtf8(writer, rp);
+        WriteUtf8(writer, "\t");
+        for (var i = 0; i < points.Count; i++)
+            AppendLineProtocolUtf8(writer, points[i]);
     }
 
     private WalPosition WriteRecord(ReadOnlySpan<byte> payload, uint crc)
@@ -154,28 +160,53 @@ public sealed class WalManager : IDisposable
 
     private static int EstimatePayloadSize(string db, string rp, IReadOnlyList<Point> points)
     {
-        // Conservative estimate: db + rp + 2 tabs + per-point overhead.
-        // UTF8 max expansion for ASCII is 1:1; for non-ASCII we overestimate slightly.
         var size = (db.Length + rp.Length + 2) * 2 + points.Count * 96;
         return size;
     }
 
     /// <summary>
-    /// Format WAL record directly into a byte buffer, avoiding StringBuilder→string→byte[] double copy.
-    /// Returns the actual number of bytes written.
+    /// Pool-backed <see cref="IBufferWriter{T}"/>: rents from <see cref="ArrayPool{T}.Shared"/>,
+    /// grows by re-renting (copying only on underestimate), and returns the array on dispose.
+    /// Lets the WAL format records straight into their final buffer with no intermediate copy.
     /// </summary>
-    private static int FormatRecordUtf8(byte[] buffer, string db, string rp, IReadOnlyList<Point> points)
+    private sealed class PooledBufferWriter(int initialCapacity) : IBufferWriter<byte>, IDisposable
     {
-        var writer = new ArrayBufferWriter<byte>();
-        WriteUtf8(writer, db);
-        WriteUtf8(writer, "\t");
-        WriteUtf8(writer, rp);
-        WriteUtf8(writer, "\t");
-        for (var i = 0; i < points.Count; i++)
-            AppendLineProtocolUtf8(writer, points[i]);
-        var written = writer.WrittenCount;
-        writer.WrittenSpan.CopyTo(buffer);
-        return written;
+        private byte[] _buffer = ArrayPool<byte>.Shared.Rent(Math.Max(initialCapacity, 64));
+        private int _written;
+
+        public int WrittenCount => _written;
+        public ReadOnlySpan<byte> WrittenSpan => _buffer.AsSpan(0, _written);
+
+        public void Advance(int count)
+        {
+            if (count < 0 || _written + count > _buffer.Length)
+                throw new ArgumentOutOfRangeException(nameof(count));
+            _written += count;
+        }
+
+        public Memory<byte> GetMemory(int sizeHint = 0)
+        {
+            Ensure(sizeHint);
+            return _buffer.AsMemory(_written);
+        }
+
+        public Span<byte> GetSpan(int sizeHint = 0) => Ensure(sizeHint);
+
+        private Span<byte> Ensure(int sizeHint)
+        {
+            var required = _written + Math.Max(sizeHint, 1);
+            if (required <= _buffer.Length)
+                return _buffer.AsSpan(_written);
+
+            var newSize = Math.Max(required, _buffer.Length * 2);
+            var newBuffer = ArrayPool<byte>.Shared.Rent(newSize);
+            Buffer.BlockCopy(_buffer, 0, newBuffer, 0, _written);
+            ArrayPool<byte>.Shared.Return(_buffer);
+            _buffer = newBuffer;
+            return _buffer.AsSpan(_written);
+        }
+
+        public void Dispose() => ArrayPool<byte>.Shared.Return(_buffer);
     }
 
     private static void WriteUtf8(IBufferWriter<byte> writer, string? s)
@@ -207,8 +238,17 @@ public sealed class WalManager : IDisposable
             AppendFieldValueUtf8(writer, field.Value);
         }
         WriteUtf8(writer, " ");
-        WriteUtf8(writer, p.TimestampNs.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        WriteInt64(writer, p.TimestampNs);
         WriteUtf8(writer, "\n");
+    }
+
+    private static void WriteInt64(IBufferWriter<byte> writer, long value)
+    {
+        // Utf8Formatter writes the invariant decimal representation straight into the payload
+        // span — no intermediate string allocation per point.
+        var span = writer.GetSpan(20);
+        System.Buffers.Text.Utf8Formatter.TryFormat(value, span, out var written);
+        writer.Advance(written);
     }
 
     private static void AppendFieldValueUtf8(IBufferWriter<byte> writer, FieldValue v)
@@ -216,12 +256,18 @@ public sealed class WalManager : IDisposable
         switch (v.Kind)
         {
             case FieldKind.Integer:
-                WriteUtf8(writer, v.Integer.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                WriteInt64(writer, v.Integer);
                 WriteUtf8(writer, "i");
                 break;
             case FieldKind.Float:
-                WriteUtf8(writer, v.Float.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            {
+                // 'G' for double is shortest-round-trippable on .NET (same text ToString()
+                // produces), so WAL replay parses back the identical value.
+                var span = writer.GetSpan(32);
+                System.Buffers.Text.Utf8Formatter.TryFormat(v.Float, span, out var written);
+                writer.Advance(written);
                 break;
+            }
             case FieldKind.Boolean:
                 WriteUtf8(writer, v.Boolean ? "true" : "false");
                 break;

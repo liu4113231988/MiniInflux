@@ -41,6 +41,16 @@ public sealed class ShardManager
     /// </summary>
     public (int ShardId, string ShardDir) GetOrCreateShard(string db, string rp, long timestampNs)
     {
+        var (shardId, shardDir, _, _) = GetOrCreateShardWithRange(db, rp, timestampNs);
+        return (shardId, shardDir);
+    }
+
+    /// <summary>
+    /// Get or create a shard, also returning its time range so callers routing many points can
+    /// cache the last-resolved shard instead of re-scanning the manifest per point.
+    /// </summary>
+    public (int ShardId, string ShardDir, long StartTimeNs, long EndTimeNs) GetOrCreateShardWithRange(string db, string rp, long timestampNs)
+    {
         // Look for existing shard that covers this timestamp
         var shards = _manifest.GetShards(db, rp);
         foreach (var s in shards)
@@ -49,7 +59,7 @@ public sealed class ShardManager
             {
                 var dir = ShardDir(db, rp, s.Id);
                 Directory.CreateDirectory(dir);
-                return (s.Id, dir);
+                return (s.Id, dir, s.StartTimeNs, s.EndTimeNs);
             }
         }
 
@@ -69,7 +79,7 @@ public sealed class ShardManager
 
         var shardDir = ShardDir(db, rp, id);
         Directory.CreateDirectory(shardDir);
-        return (id, shardDir);
+        return (id, shardDir, shardStart, shardEnd);
     }
 
     /// <summary>
@@ -85,7 +95,10 @@ public sealed class ShardManager
     public IReadOnlyList<(string SegPath, ShardGroupInfo Shard)> ListSegments(
         string db, string rp, long? minTimeNs = null, long? maxTimeNs = null)
     {
-        var result = new List<(string, ShardGroupInfo)>();
+        // Precompute the sort keys once per segment. The previous LINQ chain re-parsed the file name
+        // (GetFileName / IndexOf / long.TryParse) inside the comparator, so parsing ran O(n log n)
+        // times per query instead of O(n).
+        var keyed = new List<(int Level, long Sequence, string SegPath, ShardGroupInfo Shard)>();
         var shards = _manifest.GetShards(db, rp, minTimeNs, maxTimeNs);
         foreach (var shard in shards)
         {
@@ -95,15 +108,23 @@ public sealed class ShardManager
             foreach (var file in shard.SegmentFiles)
             {
                 var seg = Path.Combine(dir, file);
-                if (File.Exists(seg))
-                    result.Add((seg, shard));
+                keyed.Add((InferSegmentLevel(seg), InferSegmentSequence(seg), seg, shard));
             }
         }
-        return result
-            .OrderByDescending(x => InferSegmentLevel(x.Item1))
-            .ThenBy(x => SafeWriteTime(x.Item1))
-            .ThenBy(x => x.Item1, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+
+        keyed.Sort(static (a, b) =>
+        {
+            var cmp = b.Level.CompareTo(a.Level); // level descending
+            if (cmp != 0) return cmp;
+            cmp = a.Sequence.CompareTo(b.Sequence); // sequence ascending
+            if (cmp != 0) return cmp;
+            return string.Compare(a.SegPath, b.SegPath, StringComparison.OrdinalIgnoreCase);
+        });
+
+        var result = new List<(string SegPath, ShardGroupInfo Shard)>(keyed.Count);
+        foreach (var item in keyed)
+            result.Add((item.SegPath, item.Shard));
+        return result;
     }
 
     /// <summary>
@@ -142,6 +163,7 @@ public sealed class ShardManager
     private long GetShardDurationNs(string db, string rp)
     {
         var rpInfo = _manifest.GetRp(db, rp);
+        if (rpInfo?.ShardDurationNs > 0) return rpInfo.ShardDurationNs;
         var rpDuration = rpInfo?.DurationNs ?? 0;
 
         if (rpDuration <= 0) return 604_800_000_000_000L;          // infinite RP -> 7d shards
@@ -165,9 +187,13 @@ public sealed class ShardManager
         return 0;
     }
 
-    private static DateTime SafeWriteTime(string path)
+    private static long InferSegmentSequence(string segmentPath)
     {
-        try { return File.GetLastWriteTimeUtc(path); }
-        catch { return DateTime.MinValue; }
+        var name = Path.GetFileNameWithoutExtension(segmentPath);
+        var start = name.StartsWith('l') ? name.IndexOf('-') + 1 : 0;
+        var end = name.IndexOf('-', start);
+        return end > start && long.TryParse(name.AsSpan(start, end - start), out var sequence)
+            ? sequence
+            : long.MinValue;
     }
 }

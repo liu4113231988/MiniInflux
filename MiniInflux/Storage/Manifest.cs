@@ -11,6 +11,7 @@ public sealed class RetentionPolicyInfo
 {
     public string Name { get; set; } = "";
     public long DurationNs { get; set; } // 0 = infinite
+    public long ShardDurationNs { get; set; } // 0 = derived from retention duration
     public int Replication { get; set; } = 1;
     public bool IsDefault { get; set; }
     public List<ShardGroupInfo> ShardGroups { get; set; } = [];
@@ -146,7 +147,7 @@ public sealed class Manifest
         }
     }
 
-    public void EnsureRpWithDuration(string db, string rpName, long durationNs, int replication, bool isDefault)
+    public void EnsureRpWithDuration(string db, string rpName, long durationNs, long shardDurationNs, int replication, bool isDefault)
     {
         lock (_lock)
         {
@@ -154,10 +155,13 @@ public sealed class Manifest
             var dbInfo = _data.Databases[db];
             if (!dbInfo.RetentionPolicies.ContainsKey(rpName))
             {
+                if (isDefault)
+                    foreach (var rp in dbInfo.RetentionPolicies.Values) rp.IsDefault = false;
                 dbInfo.RetentionPolicies[rpName] = new RetentionPolicyInfo
                 {
                     Name = rpName,
                     DurationNs = durationNs,
+                    ShardDurationNs = shardDurationNs,
                     Replication = replication,
                     IsDefault = isDefault
                 };
@@ -459,7 +463,7 @@ public sealed class Manifest
                     changed |= tagValueSeries.Add(tagsCanon);
                 }
             }
-            if (changed) _dirty = true;
+            // Index mutations are in-memory only; nothing to persist (see DatabaseInfo notes).
         }
     }
 
@@ -633,7 +637,7 @@ public sealed class Manifest
             dbInfo.SeriesIndex.Remove(measurement);
             dbInfo.TagIndex.Remove(measurement);
             dbInfo.TagSeriesIndex.Remove(measurement);
-            Save();
+            // Indexes are in-memory only; nothing to persist.
         }
     }
 
@@ -651,7 +655,6 @@ public sealed class Manifest
             if (!dbInfo.SeriesIndex.TryGetValue(measurement, out var remaining) || remaining.Count == 0)
             {
                 dbInfo.SeriesIndex.Remove(measurement);
-                Save();
                 return;
             }
 
@@ -674,7 +677,6 @@ public sealed class Manifest
             }
             dbInfo.TagIndex[measurement] = tagMap;
             dbInfo.TagSeriesIndex[measurement] = tagSeriesMap;
-            Save();
         }
     }
 
@@ -757,8 +759,16 @@ internal sealed class DatabaseInfo
 {
     public Dictionary<string, RetentionPolicyInfo> RetentionPolicies { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, ContinuousQueryInfo> ContinuousQueries { get; set; } = new(StringComparer.Ordinal);
+
+    // ponytail: the series/tag indexes are in-memory only. Recovery rebuilds them from segment
+    // metadata anyway (TsdbEngine.Recover phase 2), so persisting them used to make every Save()
+    // O(all series of all databases) — the dominant write amplification on high-cardinality
+    // workloads — while the data itself was redundant on load.
+    [JsonIgnore]
     public Dictionary<string, HashSet<string>> SeriesIndex { get; set; } = new(StringComparer.Ordinal);
+    [JsonIgnore]
     public Dictionary<string, Dictionary<string, HashSet<string>>> TagIndex { get; set; } = new(StringComparer.Ordinal);
+    [JsonIgnore]
     public Dictionary<string, Dictionary<string, Dictionary<string, HashSet<string>>>> TagSeriesIndex { get; set; } = new(StringComparer.Ordinal);
 }
 

@@ -206,6 +206,9 @@ public static class ManagementCli
             return WriteError(error, $"manifest is invalid: {manifestError}");
 
         var databases = manifestData!.Databases.OrderBy(kv => kv.Key, StringComparer.Ordinal).ToList();
+        // Series/tag indexes are no longer persisted inside manifest.json (recovery rebuilds them
+        // from segment metadata), so the report reconstructs them from the segments on disk.
+        RebuildIndexesFromSegments(dataPath, manifestData);
         var rpCount = databases.Sum(kv => kv.Value.RetentionPolicies.Count);
         var shardCount = databases.Sum(kv => kv.Value.RetentionPolicies.Values.Sum(rp => rp.ShardGroups.Count));
         var segmentCount = databases.Sum(kv => kv.Value.RetentionPolicies.Values.Sum(rp => rp.ShardGroups.Sum(shard => shard.SegmentFiles.Count)));
@@ -969,6 +972,50 @@ public static class ManagementCli
 
         value = string.Empty;
         return false;
+    }
+
+    /// <summary>
+    /// Rebuild per-database series/tag index summaries from segment footer metadata so
+    /// `inspect manifest` reports the series actually stored, independent of persistence format.
+    /// </summary>
+    private static void RebuildIndexesFromSegments(string dataPath, ManifestData manifestData)
+    {
+        foreach (var (dbName, dbInfo) in manifestData.Databases)
+        {
+            var seriesIndex = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+            var tagIndex = new Dictionary<string, Dictionary<string, HashSet<string>>>(StringComparer.Ordinal);
+            foreach (var rp in dbInfo.RetentionPolicies.Values)
+            foreach (var shard in rp.ShardGroups)
+            {
+                var shardDir = Path.Combine(dataPath, "db", dbName, rp.Name, "shards", shard.Id.ToString("D6"));
+                if (!Directory.Exists(shardDir)) continue;
+                foreach (var segFile in Directory.GetFiles(shardDir, "*.seg"))
+                {
+                    List<SegmentColumnMeta> metas;
+                    try { metas = SegmentReader.ReadMetadata(segFile); }
+                    catch { continue; }
+                    foreach (var meta in metas)
+                    {
+                        if (!seriesIndex.TryGetValue(meta.Measurement, out var seriesSet))
+                            seriesIndex[meta.Measurement] = seriesSet = new(StringComparer.Ordinal);
+                        seriesSet.Add(meta.TagsCanonical);
+
+                        if (!tagIndex.TryGetValue(meta.Measurement, out var tagMap))
+                            tagIndex[meta.Measurement] = tagMap = new(StringComparer.Ordinal);
+                        foreach (var part in meta.TagsCanonical.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            var i = part.IndexOf('=');
+                            if (i <= 0) continue;
+                            if (!tagMap.TryGetValue(part[..i], out var valueSet))
+                                tagMap[part[..i]] = valueSet = new(StringComparer.Ordinal);
+                            valueSet.Add(part[(i + 1)..]);
+                        }
+                    }
+                }
+            }
+            dbInfo.SeriesIndex = seriesIndex;
+            dbInfo.TagIndex = tagIndex;
+        }
     }
 
     private static bool TryReadManifestData(string manifestPath, out ManifestData? data, out string error)
