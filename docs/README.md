@@ -12,7 +12,7 @@ MiniInflux.Net10 is a small single-node time-series database built with .NET 10 
 - InfluxQL subset: `CREATE DATABASE`, `SHOW ...`, `SELECT` (incl. `AS` aliases), `GROUP BY time(...)`, `fill(...)`, `SELECT ... INTO ...`, `DELETE`, `DROP SERIES`, `CREATE|SHOW|DROP CONTINUOUS QUERY`; `format=csv` server-side CSV output on both query endpoints
 - Parameterized queries: `$name` placeholders in WHERE predicates bound per request on `/query` and `/api/v3/query_influxql` (no SQL text concatenation, parse-tree cached)
 - Storage path: write queue, WAL recovery, segment compaction, schema registry, manifest/index metadata
-- Operations: admin UI at `/admin`, CLI commands for `benchmark`, `inspect`, `validate`, `repair`, `compact`, `backup`, `restore`
+- Operations: admin UI at `/admin`; the separately published `miniinfluxctl` provides `benchmark`, `inspect`, `validate`, `repair`, `compact`, `backup`, and `restore`
 - AOT-friendly: `PublishAot`, trimmed publish, source-generated JSON metadata
 
 ### Quick Start
@@ -22,6 +22,15 @@ dotnet run -c Release --project .\MiniInflux\MiniInflux.csproj
 ```
 
 Default HTTP listen address is `http://0.0.0.0:8086`.
+
+Build the standalone Native AOT management CLI:
+
+```bash
+dotnet publish .\MiniInflux.Cli\MiniInflux.Cli.csproj -c Release -r win-x64
+miniinfluxctl inspect manifest --data ./data
+```
+
+`miniinfluxctl` takes an exclusive data-directory lock for all commands other than help. Stop the server before using it, so offline maintenance never races WAL or segment writes.
 
 The checked-in [`appsettings.json`](../MiniInflux/appsettings.json) contains no credentials and leaves authentication disabled for local development. When authentication or TLS is disabled, MiniInflux logs a startup warning; enable them with environment variables or a secret file before exposing the service publicly.
 
@@ -135,7 +144,7 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
   - 部分过期：compaction 合并时丢弃早于 `now - duration` 的点（有界 RP），shard 内数据不再陪跑到整 shard 老化
   - 损坏段隔离：结构校验失败的 segment 进入 quarantine，不再被查询反复读取，`/debug/stats` 报告计数
   - 缓存上限：CRC 校验缓存与 Last Value Cache 均有逐出上限（`LastValueCacheMaxEntries`），超限回退全扫保证正确性
-- 管理 CLI：`benchmark`、`inspect`、`validate`、`repair`、`compact`、`backup`、`restore`
+- 独立管理 CLI `miniinfluxctl`：`benchmark`、`inspect`、`validate`、`repair`、`compact`、`backup`、`restore`
 - Native AOT 友好：无动态代理、JSON Source Generator
 
 ## 运行
@@ -145,6 +154,15 @@ dotnet run -c Release --project .\MiniInflux\MiniInflux.csproj
 ```
 
 默认监听 `http://0.0.0.0:8086`。当前配置同时兼容旧版 `MiniInflux:DataPath`，也支持更接近 InfluxDB 1.x 风格的 `Data`、`Http`、`Logging` 段。
+
+独立 CLI 的 AOT 发布与使用：
+
+```bash
+dotnet publish .\MiniInflux.Cli\MiniInflux.Cli.csproj -c Release -r win-x64
+miniinfluxctl inspect manifest --data ./data
+```
+
+除 `help` 外，CLI 会独占锁定数据目录；执行离线检查、修复、压缩、备份或恢复前应先停止服务端，避免与 WAL 或段文件写入并发。
 
 仓库内提交的 [`appsettings.json`](../MiniInflux/appsettings.json) 不含可用密码，且默认关闭认证；认证或 TLS 关闭时启动会输出 Warning。对外暴露前请通过环境变量或 secret 文件启用认证与 TLS。
 

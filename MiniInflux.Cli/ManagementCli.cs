@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using MiniInflux.Net10;
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Storage;
 
@@ -118,7 +119,7 @@ public static class ManagementCli
                     })
                     .ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectSegmentResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectSegmentResult));
             return 0;
         }
 
@@ -179,7 +180,7 @@ public static class ManagementCli
                     Bytes = file.Length
                 }).ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectWalResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectWalResult));
             return 0;
         }
 
@@ -294,7 +295,7 @@ public static class ManagementCli
                     };
                 }).ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectManifestResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectManifestResult));
             return 0;
         }
 
@@ -394,7 +395,7 @@ public static class ManagementCli
                     Kind = ((FieldKind)entry.Kind).ToString()
                 }).ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectSchemaResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectSchemaResult));
             return 0;
         }
 
@@ -472,7 +473,7 @@ public static class ManagementCli
                     })
                     .ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectTombstoneResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectTombstoneResult));
             return 0;
         }
 
@@ -604,7 +605,7 @@ public static class ManagementCli
                 IssueEntries = issues.Select(issue => new CliValidationMessage { Code = issue.Code, Message = issue.Message }).ToList(),
                 WarningEntries = warnings.Select(warning => new CliValidationMessage { Code = warning.Code, Message = warning.Message }).ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliValidateDataDirResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliValidateDataDirResult));
             return issues.Count == 0 ? 0 : 1;
         }
 
@@ -653,7 +654,7 @@ public static class ManagementCli
                     SegmentsCorrupted = result.SegmentsCorrupted,
                     SchemaConflictsSkipped = result.SchemaConflictsSkipped
                 };
-                output.WriteLine(JsonSerializer.Serialize(jsonResult, AppJsonContext.Default.CliRepairResult));
+                output.WriteLine(JsonSerializer.Serialize(jsonResult, CliJsonContext.Default.CliRepairResult));
                 return 0;
             }
 
@@ -708,7 +709,7 @@ public static class ManagementCli
                     CompactionRunsTotal = stats.TotalRuns,
                     SegmentsMergedTotal = stats.TotalSegmentsMerged
                 };
-                output.WriteLine(JsonSerializer.Serialize(jsonResult, AppJsonContext.Default.CliCompactResult));
+                output.WriteLine(JsonSerializer.Serialize(jsonResult, CliJsonContext.Default.CliCompactResult));
                 return 0;
             }
 
@@ -750,7 +751,7 @@ public static class ManagementCli
         if (string.Equals(ParseTextOrJsonFormat(args), "json", StringComparison.OrdinalIgnoreCase))
         {
             var result = new CliBackupCreateResult { BackupCreated = Path.GetFullPath(backupPath) };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliBackupCreateResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliBackupCreateResult));
             return 0;
         }
 
@@ -796,7 +797,7 @@ public static class ManagementCli
                 Files = metadata.Files.Count,
                 Verified = true
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliBackupVerifyResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliBackupVerifyResult));
             return 0;
         }
 
@@ -842,7 +843,7 @@ public static class ManagementCli
                     ChangesApplied = false,
                     RestartRequired = false
                 };
-                output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliRestoreResult));
+                output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliRestoreResult));
                 return 0;
             }
 
@@ -869,7 +870,7 @@ public static class ManagementCli
                 ChangesApplied = true,
                 RestartRequired = true
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliRestoreResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliRestoreResult));
             return 0;
         }
 
@@ -880,18 +881,18 @@ public static class ManagementCli
 
     private static int ShowHelp(TextWriter output)
     {
-        output.WriteLine("mini-influx benchmark [--points N] [--concurrency N] [--format text|json|prometheus] [--data PATH]");
-        output.WriteLine("mini-influx inspect segment --path FILE [--format text|json]");
-        output.WriteLine("mini-influx inspect wal [--path DIR] [--data PATH] [--format text|json]");
-        output.WriteLine("mini-influx inspect manifest [--data PATH] [--format text|json]");
-        output.WriteLine("mini-influx inspect schema [--data PATH] [--db NAME] [--measurement NAME] [--format text|json]");
-        output.WriteLine("mini-influx inspect tombstone [--data PATH] [--db NAME] [--format text|json]");
-        output.WriteLine("mini-influx validate data-dir [--data PATH] [--format text|json]");
-        output.WriteLine("mini-influx repair [--data PATH] [--dry-run] [--format text|json]");
-        output.WriteLine("mini-influx compact [--data PATH] [--dry-run] [--format text|json]");
-        output.WriteLine("mini-influx backup --path DIR [--data PATH] [--format text|json]");
-        output.WriteLine("mini-influx backup verify --path DIR [--format text|json]");
-        output.WriteLine("mini-influx restore --path DIR [--data PATH] [--dry-run] [--format text|json]");
+        output.WriteLine("miniinfluxctl benchmark [--points N] [--concurrency N] [--format text|json|prometheus] [--data PATH]");
+        output.WriteLine("miniinfluxctl inspect segment --path FILE [--format text|json]");
+        output.WriteLine("miniinfluxctl inspect wal [--path DIR] [--data PATH] [--format text|json]");
+        output.WriteLine("miniinfluxctl inspect manifest [--data PATH] [--format text|json]");
+        output.WriteLine("miniinfluxctl inspect schema [--data PATH] [--db NAME] [--measurement NAME] [--format text|json]");
+        output.WriteLine("miniinfluxctl inspect tombstone [--data PATH] [--db NAME] [--format text|json]");
+        output.WriteLine("miniinfluxctl validate data-dir [--data PATH] [--format text|json]");
+        output.WriteLine("miniinfluxctl repair [--data PATH] [--dry-run] [--format text|json]");
+        output.WriteLine("miniinfluxctl compact [--data PATH] [--dry-run] [--format text|json]");
+        output.WriteLine("miniinfluxctl backup --path DIR [--data PATH] [--format text|json]");
+        output.WriteLine("miniinfluxctl backup verify --path DIR [--data PATH] [--format text|json]");
+        output.WriteLine("miniinfluxctl restore --path DIR [--data PATH] [--dry-run] [--format text|json]");
         return 0;
     }
 
@@ -1091,7 +1092,7 @@ public static class ManagementCli
     {
         try
         {
-            metadata = JsonSerializer.Deserialize(File.ReadAllText(metadataPath), AppJsonContext.Default.BackupMetadata) as BackupMetadata;
+            metadata = JsonSerializer.Deserialize(File.ReadAllText(metadataPath), EngineJsonContext.Default.BackupMetadata) as BackupMetadata;
             if (metadata == null)
             {
                 error = "backup metadata content is empty";

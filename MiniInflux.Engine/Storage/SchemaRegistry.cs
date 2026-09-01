@@ -228,4 +228,4 @@ public sealed class FieldConflictException : Exception
 }
 
 [JsonSerializable(typeof(List<SchemaEntry>))]
-internal partial class SchemaJsonContext : JsonSerializerContext { }
+public partial class SchemaJsonContext : JsonSerializerContext { }

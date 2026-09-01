@@ -9,6 +9,21 @@
     <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
     </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="..\MiniInflux.Engine\MiniInflux.Engine.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="MiniInfluxOptions.cs" />
+    <Compile Remove="ManagementCli.cs" />
+    <Compile Remove="ManagementCliModels.cs" />
+    <Compile Remove="Model\**\*.cs" />
+    <Compile Remove="Protocol\**\*.cs" />
+    <Compile Remove="Query\**\*.cs" />
+    <Compile Remove="Storage\**\*.cs" />
+    <Compile Include="Storage\ContinuousQueryRunner.cs" />
+    <Compile Include="Storage\FileLoggerProvider.cs" />
+    <Compile Include="Storage\HttpLoggingSupport.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <Content Remove="wwwroot\**\*" />
     <EmbeddedResource Include="wwwroot\**\*" LogicalName="wwwroot/%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
