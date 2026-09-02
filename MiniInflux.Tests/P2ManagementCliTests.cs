@@ -187,6 +187,46 @@ public sealed class P2ManagementCliTests : IDisposable
     }
 
     [Fact]
+    public void CommandLineOptions_Parse_UsesOfflineEngineSettingsAndDataPath()
+    {
+        var options = CommandLineOptions.Parse(
+        [
+            "compact",
+            "--data", "D:\\miniinflux-data",
+            "--flush-threshold", "123",
+            "--wal-fsync", "false",
+            "--wal-fsync-interval-ms", "456",
+            "--wal-max-file-bytes", "789",
+            "--storage-max-series-per-database", "321",
+            "--storage-max-fields-per-measurement", "654",
+            "--storage-max-buffer-points", "987",
+            "--storage-max-buffer-bytes", "111"
+        ]);
+
+        Assert.Equal("D:\\miniinflux-data", options.DataPath);
+        Assert.Equal(options.DataPath, options.Data.Dir);
+        Assert.Equal(123, options.FlushThreshold);
+        Assert.False(options.Wal.Fsync);
+        Assert.Equal(456, options.Wal.FsyncIntervalMs);
+        Assert.Equal(789, options.Wal.MaxWalFileBytes);
+        Assert.Equal(321, options.Storage.MaxSeriesPerDatabase);
+        Assert.Equal(654, options.Storage.MaxFieldsPerMeasurement);
+        Assert.Equal(987, options.Storage.MaxBufferPoints);
+        Assert.Equal(111, options.Storage.MaxBufferBytes);
+    }
+
+    [Theory]
+    [InlineData("--wal-fsync", "sometimes")]
+    [InlineData("--flush-threshold", "many")]
+    [InlineData("--data", "")]
+    public void CommandLineOptions_Parse_InvalidValue_ThrowsHelpfulError(string name, string value)
+    {
+        var exception = Assert.Throws<ArgumentException>(() => CommandLineOptions.Parse(["compact", name, value]));
+
+        Assert.Contains(name, exception.Message);
+    }
+
+    [Fact]
     public void TombstoneStore_CreatesDirectoryOnlyWhenDeleteIsRecorded()
     {
         var dataPath = Path.Combine(_testDir, "data");

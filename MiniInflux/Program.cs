@@ -20,14 +20,8 @@ var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
 });
 builder.Host.UseConsoleLifetime();
 var options = MiniInfluxOptions.Load(builder.Configuration);
+using var dataDirectoryLock = DataDirectoryLock.Acquire(options.DataPath);
 BackupManager.ApplyPendingRestore(options.DataPath);
-
-var cliExitCode = ManagementCli.TryRun(args, options, Console.Out, Console.Error);
-if (cliExitCode.HasValue)
-{
-    Environment.ExitCode = cliExitCode.Value;
-    return;
-}
 
 builder.Logging.ClearProviders();
 var appLevel = ParseLogLevel(options.Logging.Level);

@@ -755,7 +755,7 @@ public sealed class Manifest
     #endregion
 }
 
-internal sealed class DatabaseInfo
+public sealed class DatabaseInfo
 {
     public Dictionary<string, RetentionPolicyInfo> RetentionPolicies { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, ContinuousQueryInfo> ContinuousQueries { get; set; } = new(StringComparer.Ordinal);
@@ -772,7 +772,7 @@ internal sealed class DatabaseInfo
     public Dictionary<string, Dictionary<string, Dictionary<string, HashSet<string>>>> TagSeriesIndex { get; set; } = new(StringComparer.Ordinal);
 }
 
-internal sealed class ManifestData
+public sealed class ManifestData
 {
     public Dictionary<string, DatabaseInfo> Databases { get; set; } = new(StringComparer.Ordinal);
 }
@@ -791,4 +791,4 @@ internal sealed class ManifestData
 [JsonSerializable(typeof(Dictionary<string, Dictionary<string, HashSet<string>>>))]
 [JsonSerializable(typeof(Dictionary<string, Dictionary<string, Dictionary<string, HashSet<string>>>>))]
 [JsonSerializable(typeof(HashSet<string>))]
-internal partial class ManifestJsonContext : JsonSerializerContext { }
+public partial class ManifestJsonContext : JsonSerializerContext { }

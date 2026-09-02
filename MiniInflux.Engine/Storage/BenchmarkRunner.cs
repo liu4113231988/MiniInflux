@@ -200,7 +200,7 @@ public static class BenchmarkRunner
         return sb.ToString();
     }
 
-    public static string FormatJson(BenchmarkRunResult result) => JsonSerializer.Serialize(result, AppJsonContext.Default.BenchmarkRunResult);
+    public static string FormatJson(BenchmarkRunResult result) => JsonSerializer.Serialize(result, EngineJsonContext.Default.BenchmarkRunResult);
 
     private static List<Point> CreatePoints(int worker, int concurrency, int totalPointCount)
     {

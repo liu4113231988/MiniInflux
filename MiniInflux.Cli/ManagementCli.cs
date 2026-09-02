@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using MiniInflux.Net10;
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Storage;
 
@@ -118,7 +119,7 @@ public static class ManagementCli
                     })
                     .ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectSegmentResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectSegmentResult));
             return 0;
         }
 
@@ -179,7 +180,7 @@ public static class ManagementCli
                     Bytes = file.Length
                 }).ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectWalResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectWalResult));
             return 0;
         }
 
@@ -294,7 +295,7 @@ public static class ManagementCli
                     };
                 }).ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectManifestResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectManifestResult));
             return 0;
         }
 
@@ -394,7 +395,7 @@ public static class ManagementCli
                     Kind = ((FieldKind)entry.Kind).ToString()
                 }).ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectSchemaResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectSchemaResult));
             return 0;
         }
 
@@ -472,7 +473,7 @@ public static class ManagementCli
                     })
                     .ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliInspectTombstoneResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliInspectTombstoneResult));
             return 0;
         }
 
@@ -604,7 +605,7 @@ public static class ManagementCli
                 IssueEntries = issues.Select(issue => new CliValidationMessage { Code = issue.Code, Message = issue.Message }).ToList(),
                 WarningEntries = warnings.Select(warning => new CliValidationMessage { Code = warning.Code, Message = warning.Message }).ToList()
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliValidateDataDirResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliValidateDataDirResult));
             return issues.Count == 0 ? 0 : 1;
         }
 
@@ -653,7 +654,7 @@ public static class ManagementCli
                     SegmentsCorrupted = result.SegmentsCorrupted,
                     SchemaConflictsSkipped = result.SchemaConflictsSkipped
                 };
-                output.WriteLine(JsonSerializer.Serialize(jsonResult, AppJsonContext.Default.CliRepairResult));
+                output.WriteLine(JsonSerializer.Serialize(jsonResult, CliJsonContext.Default.CliRepairResult));
                 return 0;
             }
 
@@ -708,7 +709,7 @@ public static class ManagementCli
                     CompactionRunsTotal = stats.TotalRuns,
                     SegmentsMergedTotal = stats.TotalSegmentsMerged
                 };
-                output.WriteLine(JsonSerializer.Serialize(jsonResult, AppJsonContext.Default.CliCompactResult));
+                output.WriteLine(JsonSerializer.Serialize(jsonResult, CliJsonContext.Default.CliCompactResult));
                 return 0;
             }
 
@@ -750,7 +751,7 @@ public static class ManagementCli
         if (string.Equals(ParseTextOrJsonFormat(args), "json", StringComparison.OrdinalIgnoreCase))
         {
             var result = new CliBackupCreateResult { BackupCreated = Path.GetFullPath(backupPath) };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliBackupCreateResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliBackupCreateResult));
             return 0;
         }
 
@@ -796,7 +797,7 @@ public static class ManagementCli
                 Files = metadata.Files.Count,
                 Verified = true
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliBackupVerifyResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliBackupVerifyResult));
             return 0;
         }
 
@@ -842,7 +843,7 @@ public static class ManagementCli
                     ChangesApplied = false,
                     RestartRequired = false
                 };
-                output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliRestoreResult));
+                output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliRestoreResult));
                 return 0;
             }
 
@@ -869,7 +870,7 @@ public static class ManagementCli
                 ChangesApplied = true,
                 RestartRequired = true
             };
-            output.WriteLine(JsonSerializer.Serialize(result, AppJsonContext.Default.CliRestoreResult));
+            output.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.CliRestoreResult));
             return 0;
         }
 
@@ -880,18 +881,69 @@ public static class ManagementCli
 
     private static int ShowHelp(TextWriter output)
     {
-        output.WriteLine("mini-influx benchmark [--points N] [--concurrency N] [--format text|json|prometheus] [--data PATH]");
-        output.WriteLine("mini-influx inspect segment --path FILE [--format text|json]");
-        output.WriteLine("mini-influx inspect wal [--path DIR] [--data PATH] [--format text|json]");
-        output.WriteLine("mini-influx inspect manifest [--data PATH] [--format text|json]");
-        output.WriteLine("mini-influx inspect schema [--data PATH] [--db NAME] [--measurement NAME] [--format text|json]");
-        output.WriteLine("mini-influx inspect tombstone [--data PATH] [--db NAME] [--format text|json]");
-        output.WriteLine("mini-influx validate data-dir [--data PATH] [--format text|json]");
-        output.WriteLine("mini-influx repair [--data PATH] [--dry-run] [--format text|json]");
-        output.WriteLine("mini-influx compact [--data PATH] [--dry-run] [--format text|json]");
-        output.WriteLine("mini-influx backup --path DIR [--data PATH] [--format text|json]");
-        output.WriteLine("mini-influx backup verify --path DIR [--format text|json]");
-        output.WriteLine("mini-influx restore --path DIR [--data PATH] [--dry-run] [--format text|json]");
+        output.WriteLine("Usage: miniinfluxctl <command> [options]");
+        output.WriteLine();
+        output.WriteLine("Commands:");
+        output.WriteLine();
+        output.WriteLine("  benchmark     Run a local write/query benchmark against the data directory.");
+        output.WriteLine("  inspect       Inspect internal storage files (segment, wal, manifest, schema, tombstone).");
+        output.WriteLine("  validate      Validate data directory integrity.");
+        output.WriteLine("  repair        Recover from WAL and scan segments for corruption.");
+        output.WriteLine("  compact       Run full compaction across all shards.");
+        output.WriteLine("  backup        Create or verify a backup.");
+        output.WriteLine("  restore       Prepare a backup for restore (requires restart).");
+        output.WriteLine("  help          Show this help.");
+        output.WriteLine();
+        output.WriteLine("Common Options:");
+        output.WriteLine("  --data PATH   Path to the data directory (default: ./data).");
+        output.WriteLine("  --format FMT  Output format: text (default) or json.");
+        output.WriteLine("  --flush-threshold N                 Points buffered before a flush (default: 50000).");
+        output.WriteLine("  --wal-fsync true|false              Flush WAL records to disk (default: true).");
+        output.WriteLine("  --wal-fsync-interval-ms N           WAL fsync interval in milliseconds (default: 1000).");
+        output.WriteLine("  --wal-max-file-bytes N              Maximum WAL file size in bytes (default: 16777216).");
+        output.WriteLine("  --storage-max-series-per-database N Maximum series per database (default: 10000000).");
+        output.WriteLine("  --storage-max-fields-per-measurement N Maximum fields per measurement (default: 1024).");
+        output.WriteLine("  --storage-max-buffer-points N       Maximum buffered points (default: 1000000).");
+        output.WriteLine("  --storage-max-buffer-bytes N        Maximum buffered bytes; 0 disables the cap (default: 0).");
+        output.WriteLine();
+        output.WriteLine("Commands in detail:");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl benchmark [--points N] [--concurrency N] [--format text|json|prometheus] [--data PATH]");
+        output.WriteLine("    Run a self-contained benchmark. Default: 10,000 points, concurrency 1.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl inspect segment --path FILE [--format text|json]");
+        output.WriteLine("    Print metadata for a single .seg file.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl inspect wal [--path DIR] [--data PATH] [--format text|json]");
+        output.WriteLine("    Print WAL replay summary. --path overrides the default wal/ subdirectory.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl inspect manifest [--data PATH] [--format text|json]");
+        output.WriteLine("    Print manifest summary (databases, retention policies, shards, series).");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl inspect schema [--data PATH] [--db NAME] [--measurement NAME] [--format text|json]");
+        output.WriteLine("    Print field schema entries. Optionally filter by --db or --measurement.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl inspect tombstone [--data PATH] [--db NAME] [--format text|json]");
+        output.WriteLine("    Print tombstone entries. Optionally filter by --db.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl validate data-dir [--data PATH] [--format text|json]");
+        output.WriteLine("    Check manifest, schema, tombstone files, and segment/manifest cross-references.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl repair [--data PATH] [--dry-run] [--format text|json]");
+        output.WriteLine("    Replay WAL and scan segments. --dry-run clones data to a temp dir first.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl compact [--data PATH] [--dry-run] [--format text|json]");
+        output.WriteLine("    Flush buffer and merge segments across all shards. --dry-run clones data first.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl backup --path DIR [--data PATH] [--format text|json]");
+        output.WriteLine("    Create a consistent backup to DIR.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl backup verify --path DIR [--format text|json]");
+        output.WriteLine("    Verify the integrity of an existing backup at DIR.");
+        output.WriteLine();
+        output.WriteLine("  miniinfluxctl restore --path DIR [--data PATH] [--dry-run] [--format text|json]");
+        output.WriteLine("    Prepare a backup at DIR for restore. The server must be restarted to apply.");
+        output.WriteLine("    --dry-run validates the backup without preparing the restore.");
         return 0;
     }
 
@@ -1091,7 +1143,7 @@ public static class ManagementCli
     {
         try
         {
-            metadata = JsonSerializer.Deserialize(File.ReadAllText(metadataPath), AppJsonContext.Default.BackupMetadata) as BackupMetadata;
+            metadata = JsonSerializer.Deserialize(File.ReadAllText(metadataPath), EngineJsonContext.Default.BackupMetadata) as BackupMetadata;
             if (metadata == null)
             {
                 error = "backup metadata content is empty";

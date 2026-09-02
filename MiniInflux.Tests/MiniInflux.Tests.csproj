@@ -19,6 +19,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\MiniInflux.Cli\MiniInflux.Cli.csproj" />
+    <ProjectReference Include="..\MiniInflux.Engine\MiniInflux.Engine.csproj" />
     <ProjectReference Include="..\MiniInflux\MiniInflux.csproj" />
   </ItemGroup>
 

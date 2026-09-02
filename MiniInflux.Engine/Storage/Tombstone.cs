@@ -449,4 +449,4 @@ public sealed class TombstoneStore
 }
 
 [JsonSerializable(typeof(List<Tombstone>))]
-internal partial class TombstoneJsonContext : JsonSerializerContext { }
+public partial class TombstoneJsonContext : JsonSerializerContext { }

@@ -20,7 +20,7 @@ public static class BackupManager
         // the shard-file fixup runs after the manifest copy so every referenced segment is present.
         CopyMissingShardFiles(source, staging);
         var metadata = BuildMetadata(staging, source);
-        File.WriteAllText(Path.Combine(staging, MetadataFileName), JsonSerializer.Serialize(metadata, AppJsonContext.Default.BackupMetadata));
+        File.WriteAllText(Path.Combine(staging, MetadataFileName), JsonSerializer.Serialize(metadata, EngineJsonContext.Default.BackupMetadata));
 
         if (Directory.Exists(destination)) Directory.Delete(destination, recursive: true);
         Directory.Move(staging, destination);
@@ -71,7 +71,7 @@ public static class BackupManager
         if (!File.Exists(metadataPath))
             return;
 
-        var metadata = JsonSerializer.Deserialize(File.ReadAllText(metadataPath), AppJsonContext.Default.BackupMetadata)
+        var metadata = JsonSerializer.Deserialize(File.ReadAllText(metadataPath), EngineJsonContext.Default.BackupMetadata)
             as BackupMetadata
             ?? throw new InvalidDataException("backup metadata is invalid");
 

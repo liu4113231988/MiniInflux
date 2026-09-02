@@ -178,7 +178,7 @@ public static class QueryParamBinder
         if (string.IsNullOrWhiteSpace(json)) return false;
         try
         {
-            var dict = JsonSerializer.Deserialize(json, AppJsonContext.Default.DictionaryStringJsonElement);
+            var dict = JsonSerializer.Deserialize(json, EngineJsonContext.Default.DictionaryStringJsonElement);
             if (dict == null) return false;
             map = dict;
             return true;
