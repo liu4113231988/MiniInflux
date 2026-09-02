@@ -537,6 +537,7 @@ dotnet run -- restore --data ./data --path ./backup
 - `backup verify` 会离线校验备份元数据、文件长度和 SHA256。
 - `backup` / `restore` 使用带元数据校验的备份恢复流程。
 - 除 `benchmark` 支持 `text/json/prometheus` 外，其余管理 CLI 也已支持稳定的 `--format json` 输出，便于脚本消费；所有顶层 JSON 结果当前都带 `SchemaVersion=1`；`repair`、`compact`、`restore` 同时支持 `--dry-run`。
+- CLI 不读取 `appsettings.json` 或环境变量。通过 `--data PATH` 指定目标数据目录；`repair` 与 `compact` 如需匹配服务端的离线引擎设置，可传入 `--flush-threshold`、`--wal-fsync`、`--wal-fsync-interval-ms`、`--wal-max-file-bytes`、`--storage-max-series-per-database`、`--storage-max-fields-per-measurement`、`--storage-max-buffer-points` 和 `--storage-max-buffer-bytes`。CLI 会先锁定 `--data` 指定的目录，再执行命令。
 
 ## Benchmark 输出重点
 

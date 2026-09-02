@@ -15,7 +15,4 @@
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <ProjectReference Include="..\MiniInflux.Engine\MiniInflux.Engine.csproj" />
   </ItemGroup>
-  <ItemGroup>
-    <None Include="..\MiniInflux\appsettings.json" Link="appsettings.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-  </ItemGroup>
 </Project>
