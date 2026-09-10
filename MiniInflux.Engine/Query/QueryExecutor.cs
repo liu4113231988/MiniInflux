@@ -150,6 +150,7 @@ public sealed class QueryExecutor
             var token = linkedCts.Token;
 
             Req(q.SourceDatabase ?? db);
+            using var segmentRead = e.AcquireSegmentRead(token);
             var sourceDb = q.SourceDatabase ?? db!;
             var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);
             var requestedFields = BuildRequestedFields(q);
@@ -297,6 +298,7 @@ public sealed class QueryExecutor
             var token = linkedCts.Token;
 
             var parsed = ParseAndBind(q, queryParams);
+            using var segmentRead = parsed.Kind == QueryKind.Select ? e.AcquireSegmentRead(token) : null;
             QueryResponse response;
             if (CanStreamRawSelectResponse(e, db, parsed))
             {
@@ -456,6 +458,7 @@ public sealed class QueryExecutor
 
     IEnumerable<QueryResponse> StreamRawSelectChunks(TsdbEngine e, string? db, ParsedQuery q, int chunkSize, QueryExecutionReport report, CancellationToken cancellationToken)
     {
+        using var segmentRead = e.AcquireSegmentRead(cancellationToken);
         Req(q.SourceDatabase ?? db);
         var sourceDb = q.SourceDatabase ?? db!;
         var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);

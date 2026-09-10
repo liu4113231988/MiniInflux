@@ -15,6 +15,77 @@ public sealed class LastValueCacheTests : IDisposable
         => new() { Measurement = m, Tags = new Dictionary<string,string>{ ["host"]=host }, Fields = new Dictionary<string, FieldValue>{ ["value"]=FieldValue.FromDouble(v) }, TimestampNs = ts, TagsCanonical = $"host={host}" };
 
     [Fact]
+    public void UpdateMany_OutOfOrderAndEqualTimestamps_MatchesSequentialUpdatesWithoutMutatingInputs()
+    {
+        static Point WithField(string host, string field, double value, long timestamp) => new()
+        {
+            Measurement = "cpu", Tags = new() { ["host"] = host },
+            Fields = new() { [field] = FieldValue.FromDouble(value) }, TimestampNs = timestamp
+        };
+        var sequential = new LastValueCache();
+        var batched = new LastValueCache();
+        var seed = WithField("a", "seed", 1, 300);
+        sequential.Update("db", "rp", seed);
+        batched.Update("db", "rp", seed);
+        Point[] points =
+        [
+            WithField("a", "value", 2, 200), WithField("b", "old", 3, 100),
+            WithField("a", "value", 4, 300), WithField("a", "extra", 5, 300),
+            WithField("b", "value", 6, 400), WithField("a", "value", 7, 300),
+            WithField("b", "stale", 8, 200)
+        ];
+        foreach (var point in points) sequential.Update("db", "rp", point);
+        batched.UpdateMany("db", "rp", points);
+
+        foreach (var expected in sequential.GetAll("db", "rp"))
+        {
+            Assert.True(batched.TryGet("db", "rp", SeriesKey.From(expected), out var actual));
+            Assert.Equal(expected.TimestampNs, actual.TimestampNs);
+            Assert.Equal(expected.TagsCanonical, actual.TagsCanonical);
+            Assert.Equal(expected.Fields.Count, actual.Fields.Count);
+            foreach (var field in expected.Fields)
+                Assert.Equal(field.Value.AsDouble(), actual.Fields[field.Key].AsDouble());
+        }
+        Assert.All(points, point => Assert.Single(point.Fields));
+        Assert.Single(seed.Fields);
+        Assert.True(batched.TryGet("db", "rp", "cpu", "host=a", out var latest));
+        Assert.Equal(7, latest.Fields["value"].AsDouble());
+        Assert.Equal(3, latest.Fields.Count);
+    }
+
+    [Fact]
+    public void UpdateMany_HighCardinalityAndSeparateDatabases_PreservesCapAndIsolation()
+    {
+        var cache = new LastValueCache(maxEntriesPerDbRp: 4);
+        cache.UpdateMany("db", "rp", Enumerable.Range(0, 200).Select(i => P("cpu", $"h{i}", i, i)));
+        Assert.InRange(cache.Count, 1, 68);
+        cache.UpdateMany("other", "rp", [P("cpu", "h0", 999, 1000)]);
+        Assert.True(cache.TryGet("other", "rp", "cpu", "host=h0", out var other));
+        Assert.Equal(999, other.Fields["value"].AsDouble());
+        Assert.All(cache.GetAll("db", "rp"), p => Assert.NotEqual(999, p.Fields["value"].AsDouble()));
+    }
+
+    [Fact]
+    public void UpdateMany_CrossesAggregationLimit_KeepsAllSeriesAndMergesLaterDuplicate()
+    {
+        var cache = new LastValueCache();
+        var points = Enumerable.Range(0, 100).Select(i => P("cpu", $"h{i}", i, 100)).ToList();
+        points.Add(new Point
+        {
+            Measurement = "cpu", Tags = new() { ["host"] = "h0" }, TimestampNs = 100,
+            Fields = new() { ["extra"] = FieldValue.FromDouble(999) }
+        });
+        cache.UpdateMany("db", "rp", points);
+        Assert.Equal(100, cache.Count);
+        Assert.True(cache.TryGet("db", "rp", "cpu", "host=h0", out var merged));
+        Assert.Equal(0, merged.Fields["value"].AsDouble());
+        Assert.Equal(999, merged.Fields["extra"].AsDouble());
+        Assert.Single(points[0].Fields);
+        Assert.True(cache.TryGet("db", "rp", "cpu", "host=h99", out var last));
+        Assert.Equal(99, last.Fields["value"].AsDouble());
+    }
+
+    [Fact]
     public void Update_OverCap_EvictsButStaysCorrect()
     {
         var cache = new LastValueCache(maxEntriesPerDbRp: 4);
@@ -52,7 +123,7 @@ public sealed class LastValueCacheTests : IDisposable
         var raw = exec.ExecuteWithReport(engine, "db", "SELECT * FROM cpu WHERE host='a' ORDER BY time DESC LIMIT 1");
         Assert.True(raw.Report.UsedLastValueCache);
         var rawSeries = Assert.Single(raw.Response.Results[0].Series!);
-        Assert.Equal(1, rawSeries.Values.Count);
+        Assert.Single(rawSeries.Values);
     }
 
     [Fact]

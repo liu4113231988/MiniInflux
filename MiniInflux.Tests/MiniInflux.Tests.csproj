@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <Compile Include="..\scripts\HttpWriteBenchmark.cs" Link="HttpWriteBenchmark.cs" />
   </ItemGroup>
 
   <ItemGroup>

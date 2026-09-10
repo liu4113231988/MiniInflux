@@ -30,6 +30,8 @@ public sealed class Compactor
     private long _throttleWindowStartTicks;
     private long _throttleWindowBytes;
     private readonly object _compactionLock = new();
+    private readonly Func<IDisposable>? _beginPublish;
+    private readonly Action? _segmentsPublished;
     private long _totalRuns;
     private long _totalTasks;
     private long _totalSegmentsMerged;
@@ -42,9 +44,12 @@ public sealed class Compactor
         long maxL0Bytes = 512 * 1024 * 1024, long maxL1Bytes = 512 * 1024 * 1024,
         int minFilesPerCompaction = 2, int maxPassesPerRun = 8, StorageHealth? health = null,
         long maxSegmentFileBytes = 0, double segmentFillRatio = 0.5,
-        long maxWriteBytesPerSecond = 0, Func<string, long>? inFlightFlushMinTs = null)
+        long maxWriteBytesPerSecond = 0, Func<string, long>? inFlightFlushMinTs = null,
+        Func<IDisposable>? beginPublish = null, Action? segmentsPublished = null)
     {
         _manifest = manifest;
+        _beginPublish = beginPublish;
+        _segmentsPublished = segmentsPublished;
         _shardManager = shardManager;
         _tombstones = tombstones;
         _schema = schema;
@@ -714,6 +719,7 @@ public sealed class Compactor
 
     private bool FinalizeCompaction(string db, string rp, int shardId, List<FileCandidate> sourceFiles, List<string> mergedPaths)
     {
+        using var publication = _beginPublish?.Invoke();
         try
         {
             _manifest.ReplaceSegmentsInShard(
@@ -731,6 +737,7 @@ public sealed class Compactor
             return false;
         }
 
+        _segmentsPublished?.Invoke();
         foreach (var source in sourceFiles)
             TryDelete(source.Path);
 

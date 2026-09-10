@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using MiniInflux.Net10.Model;
 
 namespace MiniInflux.Net10.Storage;
@@ -31,59 +32,73 @@ public sealed class LastValueCache
         if ((Interlocked.Increment(ref _updateCounter) & 0x3F) != 0) return;
         while (inner.Count > _maxEntriesPerDbRp)
         {
-            var victim = inner.Keys.FirstOrDefault();
-            if (victim == default || !inner.ContainsKey(victim)) break;
-            inner.TryRemove(victim, out _);
+            using var entries = inner.GetEnumerator();
+            if (!entries.MoveNext()) break;
+            inner.TryRemove(entries.Current.Key, out _);
         }
     }
 
     private static string K(string db, string rp) => db + "|" + rp;
 
-    // ponytail: points are stored by reference. Invariant: once a Point leaves the write path its
-    // Tags/Fields dictionaries are never mutated in place — the write-path dedup clones before
-    // merging fields (DeduplicateWritePoints), the query-path dedup only touches its own clones,
-    // and the parser's tag-dictionary reuse shares one dictionary per identical tag set that no
-    // code path mutates. Cloning Tags+Fields on every update used to allocate two dictionaries
-    // per written point (and the flush path ran a second update per point on top).
+    // Cached points may also be visible in the engine buffer. Merges must copy Fields;
+    // callers must not mutate a point after passing it to the cache.
     /// <summary>Insert or merge a single point into cache (LWW on same timestamp).</summary>
     public void Update(string db, string rp, Point point)
     {
-        var outer = _store.GetOrAdd(K(db, rp), _ => new ConcurrentDictionary<SeriesKey, Point>());
+        var outer = _store.GetOrAdd(K(db, rp), static _ => new ConcurrentDictionary<SeriesKey, Point>());
+        Update(outer, SeriesKey.From(point), point);
+    }
+
+    private void Update(ConcurrentDictionary<SeriesKey, Point> outer, SeriesKey sk, Point point)
+    {
         if (_maxEntriesPerDbRp > 0) EnforceCapOnSample(outer);
-        var sk = SeriesKey.From(point);
         // normalize TagsCanonical for stable identity — Point is init-only, so create normalized copy if missing
         var toStore = point;
-        if (string.IsNullOrEmpty(point.TagsCanonical))
+        if (point.TagsCanonical == null)
             toStore = new Point { Measurement = point.Measurement, Tags = point.Tags, Fields = point.Fields, TimestampNs = point.TimestampNs, TagsCanonical = sk.TagsCanonical };
-        outer.AddOrUpdate(sk,
-            _ => toStore,
-            (_, existing) =>
-            {
-                if (toStore.TimestampNs > existing.TimestampNs)
-                    return toStore;
-                if (toStore.TimestampNs == existing.TimestampNs)
-                {
-                    // merge fields: new overwrites old on same timestamp (duplicates LWW)
-                    var merged = new Dictionary<string, FieldValue>(existing.Fields, StringComparer.Ordinal);
-                    foreach (var kv in toStore.Fields) merged[kv.Key] = kv.Value;
-                    // same series: measurement/tags identity is fixed by the SeriesKey, so the
-                    // existing dictionary references can be reused
-                    return new Point
-                    {
-                        Measurement = existing.Measurement,
-                        Tags = existing.Tags,
-                        Fields = merged,
-                        TimestampNs = existing.TimestampNs,
-                        TagsCanonical = existing.TagsCanonical
-                    };
-                }
-                return existing;
-            });
+        outer.AddOrUpdate(sk, static (_, incoming) => incoming,
+            static (_, existing, incoming) => MergeLatest(existing, incoming), toStore);
+    }
+
+    private static Point MergeLatest(Point existing, Point incoming)
+    {
+        if (incoming.TimestampNs > existing.TimestampNs) return incoming;
+        if (incoming.TimestampNs < existing.TimestampNs) return existing;
+
+        // Same timestamp: preserve fields not overwritten by the later point, without
+        // mutating either input (both may also be visible in the engine's buffer).
+        var merged = new Dictionary<string, FieldValue>(existing.Fields, StringComparer.Ordinal);
+        foreach (var field in incoming.Fields) merged[field.Key] = field.Value;
+        return new Point
+        {
+            Measurement = existing.Measurement, Tags = existing.Tags, Fields = merged,
+            TimestampNs = existing.TimestampNs, TagsCanonical = existing.TagsCanonical
+        };
     }
 
     public void UpdateMany(string db, string rp, IEnumerable<Point> points)
     {
-        foreach (var p in points) Update(db, rp, p);
+        // Keep the scratch map bounded. A batch with many distinct series gets little
+        // benefit from grouping; after the first 64, update the shared cache directly.
+        var latest = new Dictionary<SeriesKey, Point>();
+        using var iterator = points.GetEnumerator();
+        while (iterator.MoveNext())
+        {
+            var point = iterator.Current;
+            var key = SeriesKey.From(point);
+            ref var existing = ref CollectionsMarshal.GetValueRefOrAddDefault(latest, key, out var found);
+            existing = found ? MergeLatest(existing!, point) : point;
+            if (latest.Count == 64) break;
+        }
+        if (latest.Count == 0) return;
+
+        var outer = _store.GetOrAdd(K(db, rp), static _ => new ConcurrentDictionary<SeriesKey, Point>());
+        foreach (var entry in latest) Update(outer, entry.Key, entry.Value);
+        while (iterator.MoveNext())
+        {
+            var point = iterator.Current;
+            Update(outer, SeriesKey.From(point), point);
+        }
     }
 
     public bool TryGet(string db, string rp, SeriesKey key, out Point point)

@@ -33,6 +33,11 @@ public sealed class TsdbEngine : IDisposable
     // ponytail: global concurrency gate for slow read paths. Without it, N concurrent slow queries each
     // spawn up to 8 reader threads, exhausting the thread pool so *every* query times out together.
     private readonly SemaphoreSlim _queryGate;
+    private readonly SegmentPublicationGate _segmentPublication = new();
+
+    /// <summary>Keep compaction inputs and metadata stable until the read is disposed.</summary>
+    public IDisposable AcquireSegmentRead(CancellationToken cancellationToken = default) =>
+        _segmentPublication.Read(cancellationToken);
     // ponytail: per-query materialization budget. ReadAllPoints enforces this *while* reading segments
     // (not just after, as the QueryExecutor layer does) so a huge LIMIT-less query cannot blow up the
     // process heap before the executor's post-hoc memory check ever runs.
@@ -122,7 +127,9 @@ public sealed class TsdbEngine : IDisposable
             maxSegmentFileBytes: _maxSegmentFileBytes,
             segmentFillRatio: _segmentFillRatio,
             maxWriteBytesPerSecond: compactionMaxWriteBytesPerSecond,
-            inFlightFlushMinTs: GetInFlightFlushMinTs);
+            inFlightFlushMinTs: GetInFlightFlushMinTs,
+            beginPublish: _segmentPublication.Publish,
+            segmentsPublished: InvalidateSegmentMetadataIndex);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
         if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => RunCompaction(), null, compactionIntervalMs, compactionIntervalMs);
         if (flushIntervalMs > 0) _flushTimer = new Timer(_ => PeriodicFlush(), null, flushIntervalMs, flushIntervalMs);
@@ -257,20 +264,22 @@ public sealed class TsdbEngine : IDisposable
         // _locks is a ConcurrentDictionary and _seriesKeys/_bufferedPointCount are updated under the per-key lock.
         var key = K(db, rp);
         var lk = GetLock(key);
-        lk.EnterWriteLock();
+        using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.WriteLockWait))
+            lk.EnterWriteLock();
         try
         {
+            using var writeTiming = WriteDiagnostics.Measure(WriteDiagnostics.Stage.WriteLocked);
             // Cardinality check inside the write lock to avoid a TOCTOU race.
             CheckCardinalityLocked(db, pending);
             // CheckBufferLimit inside the lock to prevent concurrent writes from exceeding limits.
             CheckBufferLimit(writePoints);
             
             // 优化的写入批处理：更大的写入批次减少WAL开销
-            var walPositions = _wal.Append(db, rp, writePoints);
+            var walPosition = _wal.AppendBatch(db, rp, writePoints);
             if (!_buf.TryGetValue(key, out var list)) { list = []; _buf[key] = list; }
             
             // 批量添加写入点，减少锁持有时间内的操作
-            AddWrittenPoints(db, key, list, pending, walPositions);
+            AddWrittenPoints(db, key, list, pending, walPosition);
             _lastBufferWriteTicks[key] = DateTime.UtcNow.Ticks;
             UpdateBufferReplayFloor(key, list);
             
@@ -564,6 +573,7 @@ public sealed class TsdbEngine : IDisposable
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, List<FieldFilter>? fieldFilters = null,
         CancellationToken cancellationToken = default, int? limit = null)
     {
+        using var segmentRead = AcquireSegmentRead(cancellationToken);
         // ponytail: throttle concurrent slow queries to protect the thread pool.
         _queryGate.Wait(cancellationToken);
         try
@@ -789,6 +799,7 @@ public sealed class TsdbEngine : IDisposable
     public DescendingSeriesReadResult? TryReadSeriesDescending(string db, string rp, string measurement, string tagsCanonical,
         long? min, long? max, HashSet<string>? requestedFields = null, int? limit = null, CancellationToken cancellationToken = default)
     {
+        using var segmentRead = AcquireSegmentRead(cancellationToken);
         var result = new Dictionary<long, Point>();
         var buffered = TryReadBufferedSeriesDescending(db, rp, measurement, tagsCanonical, min, max, requestedFields, limit, cancellationToken);
         if (buffered == null) return null;
@@ -846,6 +857,7 @@ public sealed class TsdbEngine : IDisposable
     public DescendingFieldReadResult? TryReadFlushedFieldDescending(string db, string rp, string measurement, string tagsCanonical,
         string field, long? min, long? max, int? limit = null, CancellationToken cancellationToken = default)
     {
+        using var segmentRead = AcquireSegmentRead(cancellationToken);
         var key = K(db, rp);
         var seriesKey = new SeriesKey(measurement, tagsCanonical);
         var lk = GetLock(key);
@@ -915,6 +927,7 @@ public sealed class TsdbEngine : IDisposable
     public DescendingFieldsReadResult? TryReadFlushedFieldsDescending(string db, string rp, string measurement, string tagsCanonical,
         IReadOnlyList<string> fields, long? min, long? max, int? limit = null, CancellationToken cancellationToken = default)
     {
+        using var segmentRead = AcquireSegmentRead(cancellationToken);
         if (fields.Count == 0) return null;
         var key = K(db, rp);
         var seriesKey = new SeriesKey(measurement, tagsCanonical);
@@ -1008,6 +1021,7 @@ public sealed class TsdbEngine : IDisposable
         HashSet<string>? requestedFields, HashSet<string>? allowedTagsCanonical,
         int? limit, CancellationToken cancellationToken)
     {
+        using var segmentRead = AcquireSegmentRead(cancellationToken);
         if (!limit.HasValue || limit.Value <= 0)
             return null;
 
@@ -1112,6 +1126,7 @@ public sealed class TsdbEngine : IDisposable
         HashSet<string>? requestedFields, HashSet<string>? allowedTagsCanonical,
         int? limit, CancellationToken cancellationToken)
     {
+        using var segmentRead = AcquireSegmentRead(cancellationToken);
         if (!limit.HasValue || limit.Value <= 0)
             return null;
 
@@ -1333,6 +1348,7 @@ public sealed class TsdbEngine : IDisposable
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, List<FieldFilter>? fieldFilters = null,
         CancellationToken cancellationToken = default)
     {
+        using var segmentRead = AcquireSegmentRead(cancellationToken);
         // Streaming k-way merge across the write buffer and segment column iterators, replacing
         // the old ReadAllPoints materialization. Peak memory is the buffer snapshot plus the
         // decoded columns of segments overlapping the consumed time window — not the whole
@@ -1774,6 +1790,7 @@ return Interlocked.Read(ref _bufferedByteCount);
     public SegmentMetadataQueryResult ReadSegmentMetadataWithStats(string db, string rp, string? meas, long? min, long? max,
         HashSet<string>? requestedFields = null, HashSet<string>? allowedTagsCanonical = null, CancellationToken cancellationToken = default)
     {
+        using var segmentRead = AcquireSegmentRead(cancellationToken);
         if (meas != null && allowedTagsCanonical != null)
         {
             var indexed = new Dictionary<string, IndexedSegmentMetadata>(StringComparer.OrdinalIgnoreCase);
@@ -1833,6 +1850,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         HashSet<string>? requestedFields, HashSet<string>? allowedTagsCanonical,
         CancellationToken cancellationToken)
     {
+        using var segmentRead = AcquireSegmentRead(cancellationToken);
         var hasTombstones = _tombstones.HasTombstones(db);
         var segments = ListReadableSegments(db, rp, min, max);
 
@@ -1942,9 +1960,7 @@ return Interlocked.Read(ref _bufferedByteCount);
     public StorageHealth Health => _health;
     public int CompactNow()
     {
-        var merged = _compactor.CompactAll();
-        if (merged > 0) InvalidateSegmentMetadataIndex();
-        return merged;
+        return _compactor.CompactAll();
     }
 
     private void RunCompaction()
@@ -1952,7 +1968,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         if (IsBackupInProgress()) return; // a compaction during backup would delete/rename copied segments
         try
         {
-            if (_compactor.CompactAll() > 0) InvalidateSegmentMetadataIndex();
+            _compactor.CompactAll();
         }
         catch (Exception ex) { _health.RecordFailure("compaction", ex); }
     }
@@ -2504,6 +2520,7 @@ return Interlocked.Read(ref _bufferedByteCount);
     /// </summary>
     private void FlushPointsToSegments(string db, string rp, IReadOnlyList<BufferedPoint> pointsToFlush)
     {
+        using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.FlushEncode);
         // 优化的shard分组，使用预分配列表减少内存分配
         // Cursor cache: nearly all points in a flush fall into the same (current) shard, so
         // resolve the shard once and only re-query the manifest when a point falls outside the
@@ -2582,6 +2599,7 @@ return Interlocked.Read(ref _bufferedByteCount);
             return;
         }
 
+        using var snapshotTiming = WriteDiagnostics.Measure(WriteDiagnostics.Stage.FlushSnapshot);
         var snapshot = list.ToArray();
         var maxSeq = snapshot[^1].Seq; // seq is assigned in append order, so the last one is max
         long snapshotMinTs = long.MaxValue;
@@ -2603,9 +2621,11 @@ return Interlocked.Read(ref _bufferedByteCount);
             ValidateLastValueCacheFromFooter(db, rp, snapshot);
 
             var lk = GetLock(key);
-            lk.EnterWriteLock();
+            using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.FlushCleanupWait))
+                lk.EnterWriteLock();
             try
             {
+                using var cleanupTiming = WriteDiagnostics.Measure(WriteDiagnostics.Stage.FlushCleanup);
                 if (_buf.TryGetValue(key, out var list))
                 {
                     // Remove exactly the snapshot points by sequence. DROP SERIES/MEASUREMENT may
@@ -2967,8 +2987,9 @@ return Interlocked.Read(ref _bufferedByteCount);
         }
     }
 
-    private void AddWrittenPoints(string db, string key, List<BufferedPoint> list, List<PendingPoint> points, IReadOnlyList<WalPosition> positions)
+    private void AddWrittenPoints(string db, string key, List<BufferedPoint> list, List<PendingPoint> points, WalPosition position)
     {
+        using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.BufferAppend);
         if (!_bufBySeries.TryGetValue(key, out var bySeries))
         {
             bySeries = new();
@@ -2982,7 +3003,7 @@ return Interlocked.Read(ref _bufferedByteCount);
         for (var i = 0; i < points.Count; i++)
         {
             var pending = points[i];
-            var buffered = new BufferedPoint(pending.Point, positions[i], pending.SeriesKey, Interlocked.Increment(ref _bufferSeq));
+            var buffered = new BufferedPoint(pending.Point, position, pending.SeriesKey, Interlocked.Increment(ref _bufferSeq));
             list.Add(buffered);
             if (!bySeries.TryGetValue(pending.SeriesKey, out var seriesPoints))
             {
@@ -3007,8 +3028,7 @@ return Interlocked.Read(ref _bufferedByteCount);
 
         // write-path last-value cache update (flush later validates via segment footer maxTime)
         var rp = key.Length > db.Length + 1 ? key[(db.Length + 1)..] : "autogen";
-        for (var i = 0; i < points.Count; i++)
-            _lastValueCache.Update(db, rp, points[i].Point);
+        _lastValueCache.UpdateMany(db, rp, points.Select(static p => p.Point));
     }
 
     private IEnumerable<BufferedPoint> BufferedCandidates(string key, List<BufferedPoint> list, string? measurement, HashSet<string>? allowedTagsCanonical)
