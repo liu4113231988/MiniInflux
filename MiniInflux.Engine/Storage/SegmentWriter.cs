@@ -23,6 +23,7 @@ public static class SegmentWriter
 
     internal static List<SegmentColumn> BuildColumns(IEnumerable<(Point Point, SeriesKey SeriesKey)> points)
     {
+        using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.SegmentColumns);
         var builders = new Dictionary<(string Measurement, string TagsCanonical, string Field), ColumnBuilder>();
         foreach (var (point, series) in points)
         {
@@ -65,18 +66,26 @@ public static class SegmentWriter
 
         public SegmentColumn ToColumn()
         {
-            if (!_sorted)
+            if (!_sorted && HasManyDuplicateTimestamps())
             {
-                var latest = new SortedDictionary<long, FieldValue>();
+                // Deduplicate in append order before sorting unique timestamps. This avoids
+                // tree-node allocation and sorting every occurrence in duplicate-heavy input.
+                var latest = new Dictionary<long, FieldValue>();
                 for (var i = 0; i < _timestamps.Count; i++)
                     latest[_timestamps[i]] = _values[i];
+                var timestamps = latest.Keys.ToArray();
+                Array.Sort(timestamps);
                 _timestamps.Clear();
                 _values.Clear();
-                foreach (var pair in latest)
+                foreach (var timestamp in timestamps)
                 {
-                    _timestamps.Add(pair.Key);
-                    _values.Add(pair.Value);
+                    _timestamps.Add(timestamp);
+                    _values.Add(latest[timestamp]);
                 }
+            }
+            else if (!_sorted)
+            {
+                SortByOriginalIndex();
             }
 
             return new SegmentColumn(
@@ -88,6 +97,62 @@ public static class SegmentWriter
                 _timestamps[^1],
                 _timestamps,
                 _values);
+        }
+
+        private bool HasManyDuplicateTimestamps()
+        {
+            // A bounded, evenly spaced sample only selects the algorithm. Both algorithms
+            // fully deduplicate and preserve append order for ties, regardless of this estimate.
+            var count = Math.Min(128, _timestamps.Count);
+            var sample = new HashSet<long>(count);
+            for (var i = 0; i < count; i++)
+                sample.Add(_timestamps[(int)((long)i * _timestamps.Count / count)]);
+            return sample.Count < count * 3 / 4;
+        }
+
+        private void SortByOriginalIndex()
+        {
+            var order = new int[_timestamps.Count];
+            for (var i = 0; i < order.Length; i++) order[i] = i;
+            Array.Sort(order, (left, right) =>
+            {
+                var comparison = _timestamps[left].CompareTo(_timestamps[right]);
+                return comparison != 0 ? comparison : left.CompareTo(right);
+            });
+
+            // Apply permutation cycles to the existing lists, using only the index array.
+            for (var i = 0; i < order.Length; i++)
+            {
+                if (order[i] == i) continue;
+                var timestamp = _timestamps[i];
+                var value = _values[i];
+                var current = i;
+                while (order[current] != i)
+                {
+                    var next = order[current];
+                    _timestamps[current] = _timestamps[next];
+                    _values[current] = _values[next];
+                    order[current] = current;
+                    current = next;
+                }
+                _timestamps[current] = timestamp;
+                _values[current] = value;
+                order[current] = current;
+            }
+
+            var written = 0;
+            for (var i = 0; i < _timestamps.Count; i++)
+            {
+                if (written > 0 && _timestamps[i] == _timestamps[written - 1])
+                    _values[written - 1] = _values[i];
+                else
+                {
+                    _timestamps[written] = _timestamps[i];
+                    _values[written++] = _values[i];
+                }
+            }
+            _timestamps.RemoveRange(written, _timestamps.Count - written);
+            _values.RemoveRange(written, _values.Count - written);
         }
     }
 
@@ -114,8 +179,12 @@ public static class SegmentWriter
                     var kind = column.Kind;
                     var ts = column.Timestamps;
                     var vals = column.Values;
-                    var timestampBlock = CompressionCodec.EncodeTimestampsAdaptive(ts);
-                    var valueBlock = CompressionCodec.EncodeValuesAdaptive(kind, vals);
+                    TimestampEncodedBlock timestampBlock;
+                    using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.TimestampEncode))
+                        timestampBlock = CompressionCodec.EncodeTimestampsAdaptive(ts);
+                    ValueEncodedBlock valueBlock;
+                    using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.ValueEncode))
+                        valueBlock = CompressionCodec.EncodeValuesAdaptive(kind, vals);
                     WriteString(bw, column.Measurement);
                     WriteString(bw, column.TagsCanonical);
                     WriteString(bw, column.Field);
@@ -148,6 +217,7 @@ public static class SegmentWriter
             }
             // Write the MemoryStream's backing buffer directly: ToArray() would copy the whole
             // segment a second time (a large LOH allocation for big flushes).
+            using var persistTiming = WriteDiagnostics.Measure(WriteDiagnostics.Stage.SegmentPersist);
             var buffer = ms.GetBuffer();
             var length = checked((int)ms.Length);
             fs.Write(buffer, 0, length);

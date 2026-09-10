@@ -92,6 +92,7 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
 ## 功能
 
 - `GET /ping`
+- `GET /debug/stats`：设置启动环境变量 `MiniInflux__WriteDiagnostics=true` 可启用写入/flush 分阶段累计计时，返回 `WriteDiagnosticsEnabled`、`WritePhaseMilliseconds` 和 `WritePhaseCounts`。默认关闭；计数为进程级，重启清零，阶段可能嵌套或并行，不能相加当成总耗时或 CPU 占比。该开关仅从环境变量读取。
 - `POST /write?db=metrics&precision=ns|u|ms|s|m|h`
 - `POST /api/v2/write?bucket=metrics&org=&precision=...`（v2 兼容写入，`bucket` 支持 `db/rp` 形式，接受 `Authorization: Token xxx`）
 - `GET|POST /query?db=metrics&q=...&format=csv`（`format=csv` 返回服务器端 CSV）
@@ -136,6 +137,7 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
   - 配置文件中的单一超级管理员账号
   - 不支持运行时创建用户、改密或按 db 授权
 - WAL + Segment 存储
+  - 查询保留 compaction 旧段直到读取结束；合并编码可并行，发布、元数据缓存失效与旧段删除在读取完成后进行。长时间查询或未释放的流式枚举会延后合并发布；这不提供与并发写入、删除之间的完整事务快照。
 - Segment v3 列编码：时间戳 `delta-of-delta/Gorilla`、浮点 `legacy XOR/Gorilla`、整数 delta、bool bit-pack、string 字典
 - 自适应浮点压缩策略：在 `legacy_raw`、`legacy_brotli`、`gorilla_raw` 之间按体积/速度折中选择
 - 存储健壮性
@@ -294,8 +296,8 @@ miniinfluxctl inspect manifest --data ./data
 - `Storage.MinFreeDiskBytes`：健康检查要求的数据卷最小剩余空间；Production 必须设置为非零值
 - `Storage.FlushColdDurationMs`：低于 `FlushThreshold` 的缓冲数据连续无写入多久后生成 segment；默认 10 分钟，期间数据已由 WAL 持久化且查询可见
 - `Storage.CompactionTargetBytes`：分层压缩每批目标大小；默认 512 MiB，用于减少小 segment 数量，并受单个 shard 实际数据量限制
-- `Wal.Fsync`：启用 WAL 定时组提交刷盘。写入确认不等待 fsync 完成：进程崩溃（kill -9）不会丢失已确认写入，但**断电/操作系统崩溃可能丢失最近一个 `Wal.FsyncIntervalMs` 窗口内已确认的写入**。这是与 InfluxDB 1.x cache/WAL 模型类似的持久性取舍；需要更强持久性时调小 `FsyncIntervalMs`，可接受更高吞吐损失时调大或设为 `0`
-- `Wal.FsyncIntervalMs`：WAL fsync 定时器周期，默认 `1000`；设为 `0` 时仅在 WAL 文件轮转与 checkpoint 时刷盘，断电丢失窗口进一步扩大
+- `Wal.Fsync`：启用 WAL 定时刷盘。写入确认不等待 fsync；小记录可能仍在 FileStream 的进程缓冲中，因此进程崩溃也可能丢失已确认写入，断电/系统崩溃还可能丢失操作系统缓存中的数据。本实现不提供 durable ACK；缩短周期只能减少通常的暴露时间，不能保证每次确认已持久化。
+- `Wal.FsyncIntervalMs`：WAL fsync 定时器周期，默认 `1000`；定时器调度不是严格的数据丢失时间上限。设为 `0` 会停用定时刷盘，只在轮转（包括回收当前 WAL 的 checkpoint）及正常关闭时刷盘。
 - `Wal.MaxWalFileBytes`：单个 WAL 文件轮转阈值，默认 16 MiB；checkpoint 之前的旧 WAL 文件会被删除
 
 环境变量兼容：

@@ -118,6 +118,9 @@ public sealed class MetricsCollector
 
         return new DebugStats
         {
+            WriteDiagnosticsEnabled = WriteDiagnostics.Enabled,
+            WritePhaseMilliseconds = WriteDiagnostics.Enabled ? WriteDiagnostics.Milliseconds() : null,
+            WritePhaseCounts = WriteDiagnostics.Enabled ? WriteDiagnostics.Counts() : null,
             WritePointsTotal = WritePointsTotal,
             QueryTotal = QueryTotal,
             QueryErrorTotal = QueryErrorTotal,
@@ -346,6 +349,9 @@ public sealed class MetricsCollector
 
 public sealed class DebugStats
 {
+    public bool WriteDiagnosticsEnabled { get; set; }
+    public Dictionary<string, double>? WritePhaseMilliseconds { get; set; }
+    public Dictionary<string, long>? WritePhaseCounts { get; set; }
     public long WritePointsTotal { get; set; }
     public long QueryTotal { get; set; }
     public long QueryErrorTotal { get; set; }

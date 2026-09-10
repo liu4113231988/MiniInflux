@@ -1318,7 +1318,7 @@ static async Task<(byte[] Buffer, int Length)> ReadRequestBodyBytesAsync(HttpReq
     }
 
     var backing = ms.GetBuffer();
-    return backing.Length == ms.Length ? (backing, (int)ms.Length) : (ms.ToArray(), (int)ms.Length);
+    return (backing, (int)ms.Length);
 }
 
 static int? ParseChunkSize(string? value) =>

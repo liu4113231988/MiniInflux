@@ -100,23 +100,39 @@ public sealed class WalManager : IDisposable
     {
         var pointList = points as IReadOnlyList<Point> ?? points.ToList();
         if (pointList.Count == 0) return [];
+        var position = AppendBatch(db, rp, pointList);
+        var positions = new WalPosition[pointList.Count];
+        Array.Fill(positions, position);
+        return positions;
+    }
 
-        var positions = new List<WalPosition>(pointList.Count);
+    /// <summary>
+    /// Append one record and return its shared replay position without a per-point array.
+    /// An empty batch writes nothing and returns WalPosition.Start.
+    /// </summary>
+    public WalPosition AppendBatch(string db, string rp, IReadOnlyList<Point> pointList)
+    {
+        using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalAppend);
+        if (pointList.Count == 0) return WalPosition.Start;
         // Format the record *and* compute its CRC outside the lock: both are O(payload) work over
         // immutable data with no shared state, so the global WAL lock only covers the file write.
         using var writer = new PooledBufferWriter(EstimatePayloadSize(db, rp, pointList));
-        WriteRecordPayload(writer, db, rp, pointList);
+        using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalEncode))
+            WriteRecordPayload(writer, db, rp, pointList);
         var payloadSpan = writer.WrittenSpan;
-        var crc = Crc32.Compute(payloadSpan);
-        lock (_lock)
+        uint crc;
+        using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalCrc))
+            crc = Crc32.Compute(payloadSpan);
+        using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalLockWait))
+            Monitor.Enter(_lock);
+        WalPosition position;
+        try
         {
             try
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
 
-                var position = WriteRecord(payloadSpan, crc);
-                for (var i = 0; i < pointList.Count; i++)
-                    positions.Add(position);
+                position = WriteRecord(payloadSpan, crc);
 
                 if (_currentFileSize >= _maxFileBytes)
                     RotateLocked();
@@ -132,21 +148,23 @@ public sealed class WalManager : IDisposable
                 throw;
             }
         }
-        return positions;
+        finally { Monitor.Exit(_lock); }
+        return position;
     }
 
-    private static void WriteRecordPayload(IBufferWriter<byte> writer, string db, string rp, IReadOnlyList<Point> points)
+    private static void WriteRecordPayload(PooledBufferWriter writer, string db, string rp, IReadOnlyList<Point> points)
     {
         WriteUtf8(writer, db);
-        WriteUtf8(writer, "\t");
+        writer.WriteByte((byte)'\t');
         WriteUtf8(writer, rp);
-        WriteUtf8(writer, "\t");
+        writer.WriteByte((byte)'\t');
         for (var i = 0; i < points.Count; i++)
             AppendLineProtocolUtf8(writer, points[i]);
     }
 
     private WalPosition WriteRecord(ReadOnlySpan<byte> payload, uint crc)
     {
+        using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalFileWrite);
         if (_currentStream == null) return CurrentPosition;
         var recordStart = _currentFileSize;
         Span<byte> header = stackalloc byte[8];
@@ -176,6 +194,23 @@ public sealed class WalManager : IDisposable
 
         public int WrittenCount => _written;
         public ReadOnlySpan<byte> WrittenSpan => _buffer.AsSpan(0, _written);
+
+        public void WriteByte(byte value)
+        {
+            Ensure(1)[0] = value;
+            _written++;
+        }
+
+        public void WriteUtf8(string value)
+        {
+            _written += Encoding.UTF8.GetBytes(value, Ensure(value.Length * 3));
+        }
+
+        public void WriteBytes(ReadOnlySpan<byte> value)
+        {
+            value.CopyTo(Ensure(value.Length));
+            _written += value.Length;
+        }
 
         public void Advance(int count)
         {
@@ -209,40 +244,38 @@ public sealed class WalManager : IDisposable
         public void Dispose() => ArrayPool<byte>.Shared.Return(_buffer);
     }
 
-    private static void WriteUtf8(IBufferWriter<byte> writer, string? s)
+    private static void WriteUtf8(PooledBufferWriter writer, string? s)
     {
         if (string.IsNullOrEmpty(s)) return;
-        var span = writer.GetSpan(s.Length * 3);
-        var bytes = Encoding.UTF8.GetBytes(s, span);
-        writer.Advance(bytes);
+        writer.WriteUtf8(s);
     }
 
-    private static void AppendLineProtocolUtf8(IBufferWriter<byte> writer, Point p)
+    private static void AppendLineProtocolUtf8(PooledBufferWriter writer, Point p)
     {
         WriteUtf8(writer, p.Measurement);
         foreach (var tag in p.Tags)
         {
-            WriteUtf8(writer, ",");
+            writer.WriteByte((byte)',');
             WriteUtf8(writer, tag.Key);
-            WriteUtf8(writer, "=");
+            writer.WriteByte((byte)'=');
             WriteUtf8(writer, tag.Value);
         }
-        WriteUtf8(writer, " ");
+        writer.WriteByte((byte)' ');
         var first = true;
         foreach (var field in p.Fields)
         {
-            if (!first) WriteUtf8(writer, ",");
+            if (!first) writer.WriteByte((byte)',');
             first = false;
             WriteUtf8(writer, field.Key);
-            WriteUtf8(writer, "=");
+            writer.WriteByte((byte)'=');
             AppendFieldValueUtf8(writer, field.Value);
         }
-        WriteUtf8(writer, " ");
+        writer.WriteByte((byte)' ');
         WriteInt64(writer, p.TimestampNs);
-        WriteUtf8(writer, "\n");
+        writer.WriteByte((byte)'\n');
     }
 
-    private static void WriteInt64(IBufferWriter<byte> writer, long value)
+    private static void WriteInt64(PooledBufferWriter writer, long value)
     {
         // Utf8Formatter writes the invariant decimal representation straight into the payload
         // span — no intermediate string allocation per point.
@@ -251,13 +284,13 @@ public sealed class WalManager : IDisposable
         writer.Advance(written);
     }
 
-    private static void AppendFieldValueUtf8(IBufferWriter<byte> writer, FieldValue v)
+    private static void AppendFieldValueUtf8(PooledBufferWriter writer, FieldValue v)
     {
         switch (v.Kind)
         {
             case FieldKind.Integer:
                 WriteInt64(writer, v.Integer);
-                WriteUtf8(writer, "i");
+                writer.WriteByte((byte)'i');
                 break;
             case FieldKind.Float:
             {
@@ -269,12 +302,12 @@ public sealed class WalManager : IDisposable
                 break;
             }
             case FieldKind.Boolean:
-                WriteUtf8(writer, v.Boolean ? "true" : "false");
+                writer.WriteBytes(v.Boolean ? "true"u8 : "false"u8);
                 break;
             case FieldKind.String:
-                WriteUtf8(writer, "\"");
+                writer.WriteByte((byte)'"');
                 WriteUtf8(writer, v.String);
-                WriteUtf8(writer, "\"");
+                writer.WriteByte((byte)'"');
                 break;
         }
     }
@@ -318,7 +351,8 @@ public sealed class WalManager : IDisposable
 
     private void RotateLocked()
     {
-        _currentStream?.Flush(true);
+        using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalRotate);
+        FlushCurrentToDisk();
         _currentStream?.Dispose();
         _currentFileId++;
         _currentStream = new FileStream(GetWalFilePath(_currentFileId), FileMode.Create, FileAccess.Write, FileShare.Read);
@@ -332,7 +366,7 @@ public sealed class WalManager : IDisposable
             if (_disposed) return;
             try
             {
-                _currentStream?.Flush(true);
+                FlushCurrentToDisk();
                 _health.RecordWriteSuccess();
             }
             catch (Exception ex)
@@ -340,6 +374,13 @@ public sealed class WalManager : IDisposable
                 _health.RecordFailure("wal_fsync", ex, blocksWrites: true);
             }
         }
+    }
+
+    // Caller holds _lock. Shared timing covers rotation, the timer, and final disposal.
+    private void FlushCurrentToDisk()
+    {
+        using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalFsync);
+        _currentStream?.Flush(true);
     }
 
     /// <summary>
@@ -489,7 +530,7 @@ public sealed class WalManager : IDisposable
         {
             _disposed = true;
             _fsyncTimer?.Dispose();
-            _currentStream?.Flush(true);
+            FlushCurrentToDisk();
             _currentStream?.Dispose();
         }
     }

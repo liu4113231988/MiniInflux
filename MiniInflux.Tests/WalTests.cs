@@ -20,6 +20,51 @@ public class WalTests : IDisposable
     }
 
     [Fact]
+    public void AppendBatch_Empty_DoesNotAdvancePosition()
+    {
+        using var wal = new WalManager(Path.Combine(_testDir, "empty"));
+        var before = wal.CurrentPosition;
+        Assert.Equal(WalPosition.Start, wal.AppendBatch("db", "rp", []));
+        Assert.Equal(before, wal.CurrentPosition);
+    }
+
+    [Fact]
+    public void AppendBatch_UnicodeAndBufferGrowth_PreservesPayloadAndReplayPosition()
+    {
+        var dir = Path.Combine(_testDir, "unicode");
+        var value = new string('中', 2000) + "😀";
+        var point = new Point
+        {
+            Measurement = "温度",
+            Tags = new() { ["位置"] = "北京" },
+            Fields = new()
+            {
+                ["文本"] = FieldValue.FromString(value),
+                ["整数"] = FieldValue.FromInteger(long.MinValue),
+                ["浮点"] = FieldValue.FromDouble(1.25),
+                ["开"] = FieldValue.FromBoolean(true),
+                ["关"] = FieldValue.FromBoolean(false)
+            },
+            TimestampNs = 123
+        };
+        WalPosition position;
+        using (var wal = new WalManager(dir, maxFileBytes: 100))
+            position = wal.AppendBatch("数据库", "保留", [point, point]);
+        var bytes = File.ReadAllBytes(Path.Combine(dir, "000001.wal"));
+        var line = $"温度,位置=北京 文本=\"{value}\",整数=-9223372036854775808i,浮点=1.25,开=true,关=false 123\n";
+        Assert.Equal("数据库\t保留\t" + line + line, System.Text.Encoding.UTF8.GetString(bytes.AsSpan(8)));
+        using var reopened = new WalManager(dir);
+        var replay = reopened.ReplayWithPositions();
+        Assert.Equal(2, replay.Count);
+        Assert.All(replay, record =>
+        {
+            Assert.Equal(position, record.Position);
+            Assert.Equal(value, record.Point.Fields["文本"].String);
+            Assert.Equal(long.MinValue, record.Point.Fields["整数"].Integer);
+        });
+    }
+
+    [Fact]
     public void Append_SinglePoint_WritesToWal()
     {
         var walDir = Path.Combine(_testDir, "wal");

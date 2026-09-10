@@ -6,6 +6,37 @@ namespace MiniInflux.Tests;
 public class CompressionCodecTests
 {
     [Fact]
+    public void EncodeValuesAdaptive_RepresentativeFloatPatterns_MatchesOriginalCandidateSelection()
+    {
+        var random = new Random(17);
+        var patterns = new[]
+        {
+            Array.Empty<double>(), new[] { -0.0, 0.0, double.PositiveInfinity, double.NegativeInfinity, double.NaN },
+            Enumerable.Repeat(42.5, 4096).ToArray(),
+            Enumerable.Range(0, 4096).Select(i => i * 0.1).ToArray(),
+            Enumerable.Range(0, 4096).Select(_ => random.NextDouble() * 10000).ToArray()
+        };
+        foreach (var pattern in patterns)
+        {
+            var values = pattern.Select(FieldValue.FromDouble).ToArray();
+            var candidates = new[]
+            {
+                CompressionCodec.EncodeValuesBlock(FieldKind.Float, ValueCodecKind.Legacy, BlockCompressionKind.None, values),
+                CompressionCodec.EncodeValuesBlock(FieldKind.Float, ValueCodecKind.Legacy, BlockCompressionKind.Brotli, values),
+                CompressionCodec.EncodeValuesBlock(FieldKind.Float, ValueCodecKind.Gorilla, BlockCompressionKind.None, values)
+            };
+            var min = Math.Max(1, candidates.Min(candidate => candidate.Payload.Length));
+            var expected = candidates.OrderBy(candidate => candidate.Payload.Length / (double)min * 2.5
+                + (candidate.Compression == BlockCompressionKind.Brotli ? 5 : candidate.Codec == ValueCodecKind.Gorilla ? 1.15 : 1))
+                .ThenBy(candidate => candidate.Payload.Length).First();
+            var actual = CompressionCodec.EncodeValuesAdaptive(FieldKind.Float, values);
+            Assert.Equal(expected.Codec, actual.Codec);
+            Assert.Equal(expected.Compression, actual.Compression);
+            Assert.Equal(expected.Payload, actual.Payload);
+        }
+    }
+
+    [Fact]
     public void Timestamps_Roundtrip_PreservesValues()
     {
         var timestamps = new List<long> { 1000, 2000, 3000, 4000, 5000 };

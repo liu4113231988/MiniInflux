@@ -165,10 +165,12 @@ public static class CompressionCodec
 
     private static ValueEncodedBlock ChooseAdaptiveFloatBlock(IReadOnlyList<FieldValue> values)
     {
+        // Both legacy candidates use identical encoded bytes; only their compression differs.
+        var legacy = EncodeValuesLegacy(FieldKind.Float, values);
         var candidates = new[]
         {
-            EncodeValuesBlock(FieldKind.Float, ValueCodecKind.Legacy, BlockCompressionKind.None, values),
-            EncodeValuesBlock(FieldKind.Float, ValueCodecKind.Legacy, BlockCompressionKind.Brotli, values),
+            new ValueEncodedBlock(ValueCodecKind.Legacy, BlockCompressionKind.None, legacy),
+            new ValueEncodedBlock(ValueCodecKind.Legacy, BlockCompressionKind.Brotli, CompressBrotli(legacy)),
             EncodeValuesBlock(FieldKind.Float, ValueCodecKind.Gorilla, BlockCompressionKind.None, values)
         };
 

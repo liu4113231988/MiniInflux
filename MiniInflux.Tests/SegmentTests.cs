@@ -7,6 +7,38 @@ namespace MiniInflux.Tests;
 
 public class SegmentTests : IDisposable
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void WriteSegment_OutOfOrderTimestamps_PreservesLastFieldValues(bool manyDuplicates)
+    {
+        var random = new Random(42);
+        var points = new List<Point>();
+        var expected = new SortedDictionary<long, Dictionary<string, long>>();
+        for (var i = 0; i < 5000; i++)
+        {
+            var timestamp = i == 0 ? long.MaxValue : i == 1 ? long.MinValue
+                : manyDuplicates ? random.Next(-100, 100) : i * 3571 % 5000;
+            var field = i % 3 == 0 ? "a" : "b";
+            points.Add(new Point { Measurement = "cpu", Tags = [], TimestampNs = timestamp,
+                Fields = new() { [field] = FieldValue.FromInteger(i) } });
+            if (!expected.TryGetValue(timestamp, out var fields)) expected[timestamp] = fields = [];
+            fields[field] = i;
+        }
+
+        var path = Path.Combine(_testDir, "unordered.seg");
+        SegmentWriter.WriteSegment(path, points);
+        var columns = SegmentReader.ReadSegment(path);
+        Assert.Equal(2, columns.Count);
+        foreach (var column in columns)
+        {
+            var matching = expected.Where(pair => pair.Value.ContainsKey(column.Field)).ToArray();
+            Assert.Equal(matching.Select(pair => pair.Key), column.Timestamps);
+            Assert.Equal(matching.Select(pair => pair.Value[column.Field]), column.Values.Select(value => value.Integer));
+        }
+        Assert.All(points, point => Assert.Single(point.Fields));
+    }
+
     private readonly string _testDir;
 
     public SegmentTests()

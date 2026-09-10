@@ -43,6 +43,13 @@ public class PartialRetentionTests : IDisposable
         var oldTs = nowNs - 120_000_000_000L; // 120s old: past retention
         var freshTs = nowNs - 1_000_000_000L; // 1s old: within retention
 
+        // This tests partial expiry within one shard. Near an hour boundary, automatic
+        // routing puts these timestamps in different shards and neither reaches maxL0=2.
+        engine.Meta.AddShardGroup("testdb", "short", new ShardGroupInfo
+        {
+            Id = 1, StartTimeNs = oldTs - 1_000_000_000L, EndTimeNs = nowNs + 3_600_000_000_000L
+        });
+
         await engine.WriteAsync("testdb", "short", [PointAt(1, oldTs)]);
         engine.FlushAll();
         await engine.WriteAsync("testdb", "short", [PointAt(2, freshTs)]);
