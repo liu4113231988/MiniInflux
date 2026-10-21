@@ -15,7 +15,7 @@ public sealed class ShardManager
 {
     private readonly string _dataPath;
     private readonly Manifest _manifest;
-    private int _nextShardId;
+    private long _minimumNextShardId;
 
     public ShardManager(string dataPath, Manifest manifest)
     {
@@ -45,7 +45,7 @@ public sealed class ShardManager
                         max = id;
             }
         }
-        _nextShardId = max + 1;
+        _minimumNextShardId = (long)max + 1;
     }
 
     /// <summary>
@@ -80,7 +80,7 @@ public sealed class ShardManager
         var shardDurationNs = GetShardDurationNs(db, rp);
         var shardStart = timestampNs / shardDurationNs * shardDurationNs;
         var shardEnd = shardStart + shardDurationNs;
-        var id = Interlocked.Increment(ref _nextShardId);
+        var id = _manifest.AllocateShardId(_minimumNextShardId);
 
         var shard = new ShardGroupInfo
         {

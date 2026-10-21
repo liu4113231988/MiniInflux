@@ -299,6 +299,45 @@ public class P2TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task ContinuousQueryRunner_ConcurrentCycleIsSkippedWhileAnotherCycleIsRunning()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        var executor = new QueryExecutor();
+        await executor.ExecuteAsync(
+            engine,
+            "testdb",
+            "CREATE CONTINUOUS QUERY cq_cpu ON testdb BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(1s),host END");
+
+        using var loggerFactory = LoggerFactory.Create(builder => { });
+        using var enteredTimeProvider = new ManualResetEventSlim();
+        using var releaseTimeProvider = new ManualResetEventSlim();
+        var now = DateTimeOffset.UtcNow;
+        var runner = new ContinuousQueryRunner(
+            engine,
+            executor,
+            new MiniInfluxOptions
+            {
+                ContinuousQuery = new ContinuousQueryOptions
+                {
+                    Enabled = true,
+                    MaxCatchUpRunsPerCycle = 1,
+                    InitialBackfillDurationNs = 1_000_000_000L
+                }
+            },
+            new MetricsCollector(engine),
+            loggerFactory.CreateLogger<ContinuousQueryRunner>(),
+            new BlockingTimeProvider(now, enteredTimeProvider, releaseTimeProvider));
+
+        var firstRun = Task.Run(() => runner.ExecuteDueQueriesAsync());
+        Assert.True(enteredTimeProvider.Wait(TimeSpan.FromSeconds(5)));
+        Assert.True(runner.IsRunning);
+        Assert.Equal(0, await runner.ExecuteDueQueriesAsync());
+
+        releaseTimeProvider.Set();
+        Assert.Equal(1, await firstRun);
+    }
+
+    [Fact]
     public async Task ContinuousQueryRunner_GroupByAllTags_PreservesTagsInRollup()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
@@ -815,5 +854,19 @@ public class P2TodoTests : IDisposable
     private sealed class FixedTimeProvider(DateTimeOffset utcNow) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => utcNow;
+    }
+
+    private sealed class BlockingTimeProvider(
+        DateTimeOffset utcNow,
+        ManualResetEventSlim entered,
+        ManualResetEventSlim release) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow()
+        {
+            entered.Set();
+            if (!release.Wait(TimeSpan.FromSeconds(10)))
+                throw new TimeoutException("test did not release the continuous-query runner");
+            return utcNow;
+        }
     }
 }

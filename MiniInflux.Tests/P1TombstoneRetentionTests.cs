@@ -61,6 +61,22 @@ public class P1TombstoneRetentionTests : IDisposable
     }
 
     [Fact]
+    public void DropRetentionPolicy_RemovesOnlyScopedTombstones_AndPersistsTheChange()
+    {
+        var store = new TombstoneStore(_testDir);
+        store.AddMeasurementDelete("db1", "cpu", 1, 10, retentionPolicy: "short");
+        store.AddMeasurementDelete("db1", "cpu", 20, 30, retentionPolicy: "long");
+        store.AddMeasurementDelete("db1", "cpu", 40, 50);
+
+        store.DropRetentionPolicy("db1", "short");
+
+        var reloaded = new TombstoneStore(_testDir);
+        Assert.False(reloaded.IsColumnDeleted("db1", "cpu", "host=server01", 1, 10, "short"));
+        Assert.True(reloaded.IsColumnDeleted("db1", "cpu", "host=server01", 20, 30, "long"));
+        Assert.True(reloaded.IsColumnDeleted("db1", "cpu", "host=server01", 40, 50, "short"));
+    }
+
+    [Fact]
     public void TombstoneRetentionPolicy_RoundTripsThroughPersistence()
     {
         var store = new TombstoneStore(_testDir);

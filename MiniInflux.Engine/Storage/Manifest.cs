@@ -327,7 +327,27 @@ public sealed class Manifest
         {
             EnsureRp(db, rp);
             _data.Databases[db].RetentionPolicies[rp].ShardGroups.Add(shard);
+            _data.NextShardId = Math.Max(_data.NextShardId, (long)shard.Id + 1);
             Save();
+        }
+    }
+
+    public int AllocateShardId(long minimumNextId = 1)
+    {
+        lock (_lock)
+        {
+            var nextId = Math.Max(_data.NextShardId, minimumNextId);
+            foreach (var database in _data.Databases.Values)
+            foreach (var retentionPolicy in database.RetentionPolicies.Values)
+            foreach (var shard in retentionPolicy.ShardGroups)
+                nextId = Math.Max(nextId, (long)shard.Id + 1);
+
+            if (nextId <= 0 || nextId > int.MaxValue)
+                throw new InvalidOperationException("shard id space is exhausted");
+
+            _data.NextShardId = nextId + 1;
+            Save();
+            return (int)nextId;
         }
     }
 
@@ -934,6 +954,7 @@ public sealed class DatabaseInfo
 public sealed class ManifestData
 {
     public Dictionary<string, DatabaseInfo> Databases { get; set; } = new(StringComparer.Ordinal);
+    public long NextShardId { get; set; } = 1;
 }
 
 [JsonSerializable(typeof(ManifestData))]

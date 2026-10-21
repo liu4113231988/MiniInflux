@@ -111,6 +111,7 @@ public class P1AdminAndStorageTests : IDisposable
 
         engine.DropMeasurement("testdb", "cpu");
         Assert.Equal(0, engine.GetSeriesCardinality("testdb"));
+        Assert.DoesNotContain("cpu", engine.Schema.ListMeasurements("testdb"));
 
         await engine.WriteAsync("testdb", "autogen", [PointAt("cpu", 2, "server01", 2_000_000_000L)]);
 
@@ -118,6 +119,45 @@ public class P1AdminAndStorageTests : IDisposable
         Assert.Null(shown.Results[0].Error);
         Assert.Contains(shown.Results[0].Series![0].Values, row => Convert.ToString(row[0]) == "cpu,host=server01");
         Assert.Equal(1, engine.GetSeriesCardinality("testdb"));
+    }
+
+    [Fact]
+    public async Task Recover_RebuildsSchemaFromSegmentsWhenSchemaFileIsMissing()
+    {
+        var schemaPath = Path.Combine(_testDir, "meta", "schema.json");
+        using (var engine = new TsdbEngine(_testDir, flushThreshold: 1000))
+        {
+            await engine.WriteAsync("testdb", "autogen", [PointAt("cpu", 1, "server01", 1_000_000_000L)]);
+            engine.FlushAll();
+        }
+
+        File.Delete(schemaPath);
+        using var recovered = new TsdbEngine(_testDir, flushThreshold: 1000);
+        recovered.Recover();
+
+        Assert.Equal(FieldKind.Float, recovered.Schema.GetFieldType("testdb", "cpu", "value"));
+        Assert.Contains("cpu", recovered.Schema.ListMeasurements("testdb"));
+    }
+
+    [Fact]
+    public async Task Recover_IndexesSeriesPresentOnlyInWalBeforeFlush()
+    {
+        var walPath = Path.Combine(_testDir, "wal");
+        var manifest = new Manifest(_testDir);
+        manifest.EnsureDatabase("testdb");
+        manifest.EnsureRp("testdb", "customrp");
+        using (var wal = new WalManager(walPath, fsync: false))
+            wal.AppendBatch("testdb", "customrp", [PointAt("cpu", 1, "server01", 1_000_000_000L)]);
+
+        using var recovered = new TsdbEngine(_testDir, flushThreshold: 1000);
+        recovered.Recover();
+
+        var shown = await new QueryExecutor().ExecuteAsync(recovered, "testdb", "SHOW SERIES FROM cpu");
+        Assert.Null(shown.Results[0].Error);
+        Assert.Contains(
+            shown.Results[0].Series![0].Values,
+            row => Convert.ToString(row[0]) == "cpu,host=server01");
+        Assert.Contains("cpu", recovered.ListMeasurements("testdb"));
     }
 
     [Fact]
@@ -141,6 +181,26 @@ public class P1AdminAndStorageTests : IDisposable
         var shown = await new QueryExecutor().ExecuteAsync(engine, "testdb", "SHOW SERIES FROM cpu");
         Assert.Contains(shown.Results[0].Series![0].Values, row => Convert.ToString(row[0]) == "cpu,host=server01");
         Assert.Equal(2, engine.GetSeriesCardinality("testdb"));
+    }
+
+    [Fact]
+    public async Task ConcurrentWritesAcrossRetentionPolicies_TrackSeriesKeysWithoutLoss()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        engine.CreateDatabase("testdb");
+        engine.Meta.CreateRetentionPolicy("testdb", "rp1", durationNs: 0, isDefault: false);
+        engine.Meta.CreateRetentionPolicy("testdb", "rp2", durationNs: 0, isDefault: false);
+
+        static List<Point> MakePoints(string rp) =>
+            Enumerable.Range(0, 100).Select(i => PointAt("cpu", i, $"{rp}-{i}", i + 1)).ToList();
+
+        await Task.WhenAll(
+            Task.Run(() => engine.WriteAsync("testdb", "rp1", MakePoints("rp1"))),
+            Task.Run(() => engine.WriteAsync("testdb", "rp2", MakePoints("rp2"))));
+
+        Assert.Equal(200, engine.GetSeriesCardinality("testdb"));
+        engine.FlushAll();
+        Assert.Equal(200, engine.GetSeriesCardinality("testdb"));
     }
 
     // ---- P1-11 DROP SHARD / DROP RETENTION POLICY ----
@@ -191,6 +251,7 @@ public class P1AdminAndStorageTests : IDisposable
         ]);
         engine.FlushAll();
         await engine.WriteAsync("archivedb", "short", [PointAt("cpu", 3, "server01", 3_000_000_000L)]);
+        engine.DeleteFromMeasurement("archivedb", "short", "cpu", null, null);
 
         var rpDir = Path.Combine(_testDir, "db", "archivedb", "short");
         Assert.True(Directory.Exists(rpDir));
@@ -203,6 +264,12 @@ public class P1AdminAndStorageTests : IDisposable
         Assert.Empty(engine.ReadAllPoints("archivedb", "short", "cpu", null, null));
         Assert.Null(engine.Meta.GetRp("archivedb", "short"));
         Assert.Equal(0, engine.GetSeriesCardinality("archivedb"));
+        Assert.False(engine.Tombstones.IsColumnDeleted("archivedb", "cpu", "host=server01", long.MinValue, long.MaxValue, "short"));
+
+        engine.Meta.CreateRetentionPolicy("archivedb", "short", durationNs: 0, isDefault: false);
+        await engine.WriteAsync("archivedb", "short", [PointAt("cpu", 4, "server01", 4_000_000_000L)]);
+        var recreatedRpPoints = engine.ReadAllPoints("archivedb", "short", "cpu", null, null);
+        Assert.Equal(4d, Assert.Single(recreatedRpPoints).Fields["value"].AsDouble());
     }
 
     [Fact]
@@ -214,6 +281,29 @@ public class P1AdminAndStorageTests : IDisposable
         var result = await new QueryExecutor().ExecuteAsync(engine, "archivedb", "DROP RETENTION POLICY \"missing\" ON archivedb");
 
         Assert.Contains("retention policy not found: missing", result.Results[0].Error);
+    }
+
+    [Fact]
+    public async Task DropRetentionPolicy_DoesNotReuseShardIdAfterRestart()
+    {
+        int droppedShardId;
+        using (var engine = new TsdbEngine(_testDir, flushThreshold: 1000))
+        {
+            engine.CreateDatabase("archivedb");
+            engine.Meta.CreateRetentionPolicy("archivedb", "short", durationNs: 0, isDefault: false);
+            await engine.WriteAsync("archivedb", "short", [PointAt("cpu", 1, "server01", 1_000_000_000L)]);
+            engine.FlushAll();
+            droppedShardId = Assert.Single(engine.Meta.GetAllShards("archivedb")).Shard.Id;
+            Assert.True(engine.DropRetentionPolicy("archivedb", "short"));
+        }
+
+        using var restarted = new TsdbEngine(_testDir, flushThreshold: 1000);
+        restarted.Meta.CreateRetentionPolicy("archivedb", "short", durationNs: 0, isDefault: false);
+        await restarted.WriteAsync("archivedb", "short", [PointAt("cpu", 2, "server01", 2_000_000_000L)]);
+        restarted.FlushAll();
+        var recreatedShardId = Assert.Single(restarted.Meta.GetAllShards("archivedb")).Shard.Id;
+
+        Assert.True(recreatedShardId > droppedShardId);
     }
 
     private static Point PointAt(string measurement, double value, string host, long timestampNs) => new()

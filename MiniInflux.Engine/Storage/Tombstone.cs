@@ -132,6 +132,46 @@ public sealed class TombstoneStore
     }
 
     /// <summary>
+    /// Remove tombstones scoped to a retention policy. Legacy tombstones with no RP scope are
+    /// retained because they still apply to every retention policy.
+    /// </summary>
+    public void DropRetentionPolicy(string db, string retentionPolicy)
+    {
+        IdentifierValidator.ValidateDatabaseName(db);
+        IdentifierValidator.ValidateRetentionPolicyName(retentionPolicy);
+        lock (_lock)
+        {
+            if (!_tombstones.TryGetValue(db, out var list)) return;
+
+            var retained = list.Where(t => t.RetentionPolicy != retentionPolicy).ToList();
+            if (retained.Count == list.Count) return;
+
+            if (retained.Count == 0)
+            {
+                var path = Path.Combine(_dir, $"{db}.json");
+                if (File.Exists(path)) File.Delete(path);
+                _tombstones.Remove(db);
+            }
+            else
+            {
+                _tombstones[db] = retained;
+                try
+                {
+                    Save(db);
+                }
+                catch
+                {
+                    _tombstones[db] = list;
+                    throw;
+                }
+            }
+
+            _version++;
+            _rangeCache = null;
+        }
+    }
+
+    /// <summary>
     /// Check if a specific column is fully covered by a tombstone (can be skipped during compaction).
     /// </summary>
     public bool IsColumnDeleted(string db, string measurement, string tagsCanonical,

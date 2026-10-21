@@ -30,6 +30,9 @@ public sealed class TsdbEngine : IDisposable
     private readonly Compactor _compactor;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ReaderWriterLockSlim> _locks = new(StringComparer.Ordinal);
     private readonly ReaderWriterLockSlim _globalLock = new();
+    // DROP retention policy pauses writes across its flush/delete/catalog sequence so no writer
+    // can append data after the RP buffer has been drained but before the RP is removed.
+    private readonly ReaderWriterLockSlim _writeCatalogGate = new();
     // Serializes WAL append + buffer-floor publication against checkpoint advancement. Writes take
     // the read side (they can proceed concurrently); checkpoint takes the write side and therefore
     // never observes a WAL record that has been appended but whose replay floor is not visible yet.
@@ -263,6 +266,19 @@ public sealed class TsdbEngine : IDisposable
     public Task WriteAsync(string db, string rp, List<Point> pts) => WriteInternalAsync(db, rp, pts);
 
     public Task WriteInternalAsync(string db, string rp, List<Point> pts)
+    {
+        _writeCatalogGate.EnterReadLock();
+        try
+        {
+            return WriteInternalCore(db, rp, pts);
+        }
+        finally
+        {
+            _writeCatalogGate.ExitReadLock();
+        }
+    }
+
+    private Task WriteInternalCore(string db, string rp, List<Point> pts)
     {
         IdentifierValidator.ValidateDatabaseName(db);
         IdentifierValidator.ValidateRetentionPolicyName(rp);
@@ -2226,58 +2242,49 @@ return Interlocked.Read(ref _bufferedByteCount);
 
     public bool DropShard(int shardId)
     {
-        foreach (var db in _manifest.ListDatabases())
-        {
-            foreach (var rp in _manifest.ListRetentionPolicies(db).Select(r => r.Name))
-            {
-                var shard = _manifest.GetShards(db, rp).FirstOrDefault(s => s.Id == shardId);
-                if (shard == null) continue;
-                var startNs = shard.StartTimeNs;
-                var endNs = shard.EndTimeNs;
-
-                // Buffered points inside the dropped shard's range would otherwise be flushed into
-                // a segment the manifest no longer tracks, so DROP SHARD appeared to be undone.
-                PurgeBufferedRange(db, rp, startNs, endNs);
-                _lastValueCache.EvictWhere(db, rp, (_, point) => point.TimestampNs >= startNs && point.TimestampNs < endNs);
-
-                var dir = _shards.ShardDir(db, rp, shardId);
-                if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
-                SegmentReader.ClearQuarantinedByPrefix(dir);
-                InvalidateSegmentMetadataIndex();
-                _manifest.RemoveShardGroup(db, rp, shardId);
-                var surviving = RebuildTrackedSeriesKeys(db);
-                SyncManifestIndexesAndSchema(db, surviving);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private void PurgeBufferedRange(string db, string rp, long startNs, long endNs)
-    {
-        var key = K(db, rp);
-        _globalLock.EnterWriteLock();
+        _writeCatalogGate.EnterWriteLock();
         try
         {
-            var lk = GetLock(key, alreadyHoldingGlobalWrite: true);
-            lk.EnterWriteLock();
+            _compactor.Pause();
             try
             {
-                if (_buf.TryGetValue(key, out var list))
+                if (!_compactor.WaitForIdle(TimeSpan.FromSeconds(60)))
+                    throw new InvalidOperationException("compaction is still running; retry dropping the shard once it finishes");
+
+                // Drain all accepted writes while the catalog gate blocks new appends. This also
+                // checkpoints their WAL records before the shard's segments are removed.
+                FlushAll();
+
+                using (_segmentPublication.Publish())
                 {
-                    var removed = list.RemoveAll(p => p.Point.TimestampNs >= startNs && p.Point.TimestampNs < endNs);
-                    if (removed > 0)
+                    foreach (var db in _manifest.ListDatabases())
                     {
-                        _bufferedPointCount -= removed;
-                        if (_maxBufferBytes > 0) RecalculateBufferedBytes();
+                        foreach (var rp in _manifest.ListRetentionPolicies(db).Select(r => r.Name))
+                        {
+                            var shard = _manifest.GetShards(db, rp).FirstOrDefault(s => s.Id == shardId);
+                            if (shard == null) continue;
+
+                            var dir = _shards.ShardDir(db, rp, shardId);
+                            if (Directory.Exists(dir))
+                                Directory.Delete(dir, recursive: true);
+                            SegmentReader.ClearQuarantinedByPrefix(dir);
+                            InvalidateSegmentMetadataIndex();
+                            _lastValueCache.EvictWhere(
+                                db,
+                                rp,
+                                (_, point) => point.TimestampNs >= shard.StartTimeNs && point.TimestampNs < shard.EndTimeNs);
+                            _manifest.RemoveShardGroup(db, rp, shardId);
+                            var surviving = RebuildTrackedSeriesKeys(db);
+                            SyncManifestIndexesAndSchema(db, surviving);
+                            return true;
+                        }
                     }
-                    RebuildBufferSeriesIndex(key, list);
-                    UpdateBufferReplayFloor(key, list, forceRecalculate: true);
                 }
+                return false;
             }
-            finally { lk.ExitWriteLock(); }
+            finally { _compactor.Resume(); }
         }
-        finally { _globalLock.ExitWriteLock(); }
+        finally { _writeCatalogGate.ExitWriteLock(); }
     }
 
     /// <summary>
@@ -2291,37 +2298,42 @@ return Interlocked.Read(ref _bufferedByteCount);
         if (_manifest.GetRp(db, rp) == null) return false;
 
         var key = K(db, rp);
-        _globalLock.EnterWriteLock();
+        _writeCatalogGate.EnterWriteLock();
         try
         {
-            var lk = GetLock(key, alreadyHoldingGlobalWrite: true);
-            lk.EnterWriteLock();
+            _compactor.Pause();
             try
             {
-                if (_buf.TryRemove(key, out var list) && list.Count > 0)
+                if (!_compactor.WaitForIdle(TimeSpan.FromSeconds(60)))
+                    throw new InvalidOperationException("compaction is still running; retry dropping the retention policy once it finishes");
+
+                // Drain every accepted WAL write before deleting this RP. With writes paused,
+                // FlushAll can safely checkpoint past the RP's records so they cannot replay
+                // into a newly-created RP with the same name after restart.
+                FlushAll();
+
+                using (_segmentPublication.Publish())
                 {
-                    _bufferedPointCount -= list.Count;
-                    if (_maxBufferBytes > 0) RecalculateBufferedBytes();
+                    var rpDir = Path.Combine(_root, "db", db, rp);
+                    if (Directory.Exists(rpDir))
+                        Directory.Delete(rpDir, recursive: true);
+
+                    SegmentReader.ClearQuarantinedByPrefix(rpDir);
+                    InvalidateSegmentMetadataIndex();
+                    _tombstones.DropRetentionPolicy(db, rp);
+                    _manifest.DropRetentionPolicy(db, rp);
+                    _manifest.SaveIfDirty();
+
+                    _lastValueCache.EvictWhere(db, rp, static (_, _) => true);
+                    _ensuredDbRp.TryRemove(key, out _);
+                    var surviving = RebuildTrackedSeriesKeys(db);
+                    SyncManifestIndexesAndSchema(db, surviving);
                 }
-                _bufBySeries.TryRemove(key, out _);
-                _bufferReplayFloors.TryRemove(key, out _);
-                _lastBufferWriteTicks.TryRemove(key, out _);
             }
-            finally { lk.ExitWriteLock(); }
+            finally { _compactor.Resume(); }
         }
-        finally { _globalLock.ExitWriteLock(); }
+        finally { _writeCatalogGate.ExitWriteLock(); }
 
-        var rpDir = Path.Combine(_root, "db", db, rp);
-        if (Directory.Exists(rpDir)) try { Directory.Delete(rpDir, true); } catch { }
-        SegmentReader.ClearQuarantinedByPrefix(rpDir);
-        InvalidateSegmentMetadataIndex();
-
-        _lastValueCache.EvictWhere(db, rp, static (_, _) => true);
-        _manifest.DropRetentionPolicy(db, rp);
-        _manifest.SaveIfDirty();
-        _ensuredDbRp.TryRemove(key, out _);
-        var surviving = RebuildTrackedSeriesKeys(db);
-        SyncManifestIndexesAndSchema(db, surviving);
         return true;
     }
 
@@ -3519,7 +3531,7 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
 
     public void Dispose()
     {
-        _rpExpiryTimer?.Dispose(); _compactionTimer?.Dispose(); _flushTimer?.Dispose(); FlushAll(); _schema.SaveIfDirty(); _manifest.SaveIfDirty(); _wal.Dispose(); _walAppendGate.Dispose(); _globalLock.Dispose();
+        _rpExpiryTimer?.Dispose(); _compactionTimer?.Dispose(); _flushTimer?.Dispose(); FlushAll(); _schema.SaveIfDirty(); _manifest.SaveIfDirty(); _wal.Dispose(); _walAppendGate.Dispose(); _writeCatalogGate.Dispose(); _globalLock.Dispose();
         foreach (var lk in _locks.Values) lk.Dispose();
     }
 
