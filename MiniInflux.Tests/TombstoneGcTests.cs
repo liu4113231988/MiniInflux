@@ -99,6 +99,110 @@ public class TombstoneGcTests : IDisposable
     }
 
     [Fact]
+    public async Task Compactor_PublishFailure_CleansEveryUnregisteredOutputAndPreservesInputs()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        var first = PointAt("cpu", 1, Ns(1));
+        first.Fields["other"] = FieldValue.FromDouble(10);
+        var second = PointAt("cpu", 2, Ns(2));
+        second.Fields["other"] = FieldValue.FromDouble(20);
+        await engine.WriteAsync("testdb", "autogen", [first]);
+        engine.FlushAll();
+        await engine.WriteAsync("testdb", "autogen", [second]);
+        engine.FlushAll();
+
+        var shard = Assert.Single(engine.Meta.GetShards("testdb", "autogen"));
+        var shardDir = Path.Combine(engine.RootPath, "db", "testdb", "autogen", "shards", shard.Id.ToString("D6"));
+        var originalFiles = shard.SegmentFiles.ToArray();
+        var outputCountAtFailure = 0;
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 2,
+            maxL1Segments: 99,
+            maxSegmentFileBytes: 1,
+            beginPublish: () =>
+            {
+                outputCountAtFailure = Directory.GetFiles(shardDir, "l1-*.seg").Length;
+                throw new IOException("injected publication failure");
+            });
+
+        Assert.Equal(0, compactor.CompactAll());
+
+        Assert.True(outputCountAtFailure > 1);
+        Assert.Equal(originalFiles.Order(StringComparer.OrdinalIgnoreCase),
+            engine.Meta.GetShards("testdb", "autogen").Single().SegmentFiles.Order(StringComparer.OrdinalIgnoreCase));
+        Assert.All(originalFiles, file => Assert.True(File.Exists(Path.Combine(shardDir, file))));
+        Assert.Empty(Directory.GetFiles(shardDir, "l1-*.seg"));
+        Assert.Equal(2, engine.ReadAllPoints("testdb", "autogen", "cpu", null, null).Count);
+    }
+
+    [Fact]
+    public async Task Compactor_FlushRegisteredAfterTaskSnapshot_PreventsTombstoneRetirement()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        await WriteTwoFlushedPointsAsync(engine);
+        engine.DeleteFromMeasurement("testdb", "cpu", Ns(0), Ns(10));
+
+        var flushInjected = false;
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 2,
+            maxL1Segments: 99,
+            maxPassesPerRun: 1,
+            inFlightFlushMinTs: _ =>
+            {
+                if (!flushInjected)
+                {
+                    flushInjected = true;
+                    engine.WriteAsync("testdb", "autogen", [PointAt("cpu", 99, Ns(5))]).GetAwaiter().GetResult();
+                    engine.FlushAll();
+                }
+
+                return long.MaxValue;
+            });
+
+        Assert.Equal(1, compactor.CompactAll());
+
+        Assert.True(flushInjected);
+        Assert.True(engine.Tombstones.HasTombstones("testdb"));
+        Assert.Empty(engine.ReadAllPoints("testdb", "autogen", "cpu", null, null));
+    }
+
+    [Fact]
+    public async Task Compactor_WhenShardIsDroppedBeforePublication_DeletesOnlyItsOutputs()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, compactionIntervalMs: 0);
+        await WriteTwoFlushedPointsAsync(engine);
+        var shard = Assert.Single(engine.Meta.GetShards("testdb", "autogen"));
+        var droppedShard = false;
+
+        var compactor = new Compactor(
+            engine.Meta,
+            new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones,
+            engine.Schema,
+            maxL0Segments: 2,
+            maxL1Segments: 99,
+            beginPublish: () =>
+            {
+                droppedShard = engine.DropShard(shard.Id);
+                return new MemoryStream();
+            });
+
+        Assert.Equal(0, compactor.CompactAll());
+
+        Assert.True(droppedShard);
+        Assert.Empty(engine.Meta.GetShards("testdb", "autogen"));
+        Assert.Empty(Directory.GetFiles(_testDir, "*.seg", SearchOption.AllDirectories));
+    }
+
+    [Fact]
     public void RemoveCoveredRange_FullyCoveredTombstone_IsDropped()
     {
         var store = new TombstoneStore(_testDir);

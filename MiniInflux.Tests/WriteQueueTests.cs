@@ -53,6 +53,35 @@ public sealed class WriteQueueTests : IDisposable
         Assert.Equal(200, engine.ReadAllPoints("db", "autogen", "cpu", null, null).Count);
     }
 
+    [Fact]
+    public async Task Dispose_WithAcceptedRequests_CompletesEveryWaiter()
+    {
+        using var engine = new TsdbEngine(_dataPath, flushIntervalMs: 0, compactionIntervalMs: 0);
+        var queue = new WriteQueue(engine, capacity: 256, batchSize: 256);
+        var requests = Enumerable.Range(1, 256)
+            .Select(timestamp => queue.EnqueueAsync("db", "autogen",
+            [
+                new Point
+                {
+                    Measurement = "cpu",
+                    Tags = [],
+                    Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromInteger(timestamp) },
+                    TimestampNs = timestamp
+                }
+            ]))
+            .ToArray();
+
+        Assert.True(SpinWait.SpinUntil(() => queue.PendingRequests == requests.Length, TimeSpan.FromSeconds(5)));
+
+        var dispose = Task.Run(queue.Dispose);
+        var results = await Task.WhenAll(requests).WaitAsync(TimeSpan.FromSeconds(10));
+        await dispose.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.All(results, Assert.True);
+        Assert.Equal(0, queue.PendingRequests);
+        Assert.Equal(256, engine.ReadAllPoints("db", "autogen", "cpu", null, null).Count);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_dataPath))

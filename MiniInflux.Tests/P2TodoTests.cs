@@ -338,6 +338,71 @@ public class P2TodoTests : IDisposable
     }
 
     [Fact]
+    public async Task ContinuousQueryRunner_FailedBucketBacksOffAndEventuallyAdvancesProgress()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        const long everyNs = 1_000_000_000L;
+        var initialTime = DateTimeOffset.UtcNow;
+        var nowNs = initialTime.ToUnixTimeMilliseconds() * 1_000_000L;
+        var latestClosedBucket = (nowNs / everyNs) * everyNs - everyNs;
+        var poisonedBucket = latestClosedBucket;
+        var backfillStartBucket = latestClosedBucket - 99 * everyNs;
+        var sourcePoints = Enumerable.Range(0, 100)
+            .Select(i => Point("cpu", "server01", 10 + i, backfillStartBucket + i * everyNs + 100_000_000L))
+            .ToList();
+        await engine.WriteAsync("testdb", "autogen", sourcePoints);
+
+        var executor = new QueryExecutor(maxQueryMemoryBytes: 1);
+        await executor.ExecuteAsync(
+            engine,
+            "testdb",
+            "CREATE CONTINUOUS QUERY cq_cpu ON testdb RESAMPLE EVERY 1s FOR 100s BEGIN SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(1s),host END");
+        engine.Meta.UpdateContinuousQueryProgress("testdb", "cq_cpu", poisonedBucket - everyNs);
+
+        using var loggerFactory = LoggerFactory.Create(builder => { });
+        var metrics = new MetricsCollector(engine);
+        var timeProvider = new MutableTimeProvider(initialTime);
+        var runner = new ContinuousQueryRunner(
+            engine,
+            executor,
+            new MiniInfluxOptions
+            {
+                ContinuousQuery = new ContinuousQueryOptions
+                {
+                    Enabled = true,
+                    MaxCatchUpRunsPerCycle = 1
+                }
+            },
+            metrics,
+            loggerFactory.CreateLogger<ContinuousQueryRunner>(),
+            timeProvider);
+
+        Assert.Equal(0, await runner.ExecuteDueQueriesAsync());
+        Assert.Equal(1, metrics.ContinuousQueryErrorsTotal);
+
+        // A retry during the one-second backoff must not execute or count the bucket again.
+        Assert.Equal(0, await runner.ExecuteDueQueriesAsync());
+        Assert.Equal(1, metrics.ContinuousQueryErrorsTotal);
+
+        for (var attempt = 2; attempt <= 5; attempt++)
+        {
+            timeProvider.Advance(TimeSpan.FromSeconds(1 << (attempt - 2)));
+            Assert.Equal(0, await runner.ExecuteDueQueriesAsync());
+            Assert.Equal(attempt, metrics.ContinuousQueryErrorsTotal);
+        }
+
+        var failedBucket = Assert.Single(metrics.CollectStats().ContinuousQueryMetrics).LastBucketStartNs;
+        Assert.NotNull(failedBucket);
+        Assert.Equal(failedBucket, engine.Meta.GetContinuousQuery("testdb", "cq_cpu")!.LastCompletedBucketStartNs);
+
+        await runner.ExecuteDueQueriesAsync();
+        var laterBucket = Assert.Single(metrics.CollectStats().ContinuousQueryMetrics).LastBucketStartNs;
+        Assert.True(laterBucket > failedBucket);
+        Assert.Equal(failedBucket, engine.Meta.GetContinuousQuery("testdb", "cq_cpu")!.LastCompletedBucketStartNs);
+        Assert.Equal(6, metrics.ContinuousQueryErrorsTotal);
+    }
+
+    [Fact]
     public async Task ContinuousQueryRunner_GroupByAllTags_PreservesTagsInRollup()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
@@ -868,5 +933,16 @@ public class P2TodoTests : IDisposable
                 throw new TimeoutException("test did not release the continuous-query runner");
             return utcNow;
         }
+    }
+
+    private sealed class MutableTimeProvider(DateTimeOffset initialTime) : TimeProvider
+    {
+        private long _unixMilliseconds = initialTime.ToUnixTimeMilliseconds();
+
+        public override DateTimeOffset GetUtcNow() =>
+            DateTimeOffset.FromUnixTimeMilliseconds(Interlocked.Read(ref _unixMilliseconds));
+
+        public void Advance(TimeSpan amount) =>
+            Interlocked.Add(ref _unixMilliseconds, (long)amount.TotalMilliseconds);
     }
 }

@@ -73,4 +73,50 @@ public class BackupConsistencyTests : IDisposable
         Assert.True(File.Exists(Path.Combine(_testDir, "backup-1", "meta", "manifest.json")));
         Assert.True(File.Exists(Path.Combine(_testDir, "backup-2", "meta", "manifest.json")));
     }
+
+    [Fact]
+    public async Task CreateConsistentBackup_WaitsForRunningCompactionBeforeCopy()
+    {
+        var dataPath = Path.Combine(_testDir, "data3");
+        var backupPath = Path.Combine(_testDir, "backup-during-compaction");
+        using var engine = NewEngine(dataPath);
+        for (var i = 1; i <= 6; i++)
+        {
+            await engine.WriteAsync("testdb", "autogen", [PointAt(i, i * 1_000_000_000L)]);
+            engine.FlushAll();
+        }
+
+        using var segmentRead = engine.AcquireSegmentRead();
+        var compaction = Task.Run(engine.CompactNow);
+        Assert.True(SpinWait.SpinUntil(
+            () => Directory.GetFiles(dataPath, "l1-*.seg", SearchOption.AllDirectories).Length > 0,
+            TimeSpan.FromSeconds(10)));
+        Assert.False(compaction.IsCompleted);
+
+        var backup = Task.Run(() => engine.CreateConsistentBackup(backupPath));
+        try
+        {
+            await Task.Delay(100);
+            Assert.False(backup.IsCompleted);
+        }
+        finally
+        {
+            segmentRead.Dispose();
+        }
+
+        Assert.True(await compaction.WaitAsync(TimeSpan.FromSeconds(10)) > 0);
+        await backup.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var restoreRoot = Path.Combine(_testDir, "restored-after-compaction");
+        BackupManager.PrepareRestore(backupPath, restoreRoot);
+        BackupManager.ApplyPendingRestore(restoreRoot);
+        using var restored = NewEngine(restoreRoot);
+        restored.Recover();
+        Assert.Equal(
+            Enumerable.Range(1, 6).Select(i => i * 1_000_000_000L),
+            restored.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+                .Select(point => point.TimestampNs)
+                .OrderBy(timestamp => timestamp)
+                .ToArray());
+    }
 }
