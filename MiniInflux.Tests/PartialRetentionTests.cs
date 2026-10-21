@@ -1,5 +1,6 @@
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
+using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
 
 namespace MiniInflux.Tests;
@@ -55,8 +56,11 @@ public class PartialRetentionTests : IDisposable
         await engine.WriteAsync("testdb", "short", [PointAt(2, freshTs)]);
         engine.FlushAll();
 
-        // Both points readable before compaction (shard-granular retention).
-        Assert.Equal(2, engine.ReadAllPoints("testdb", "short", "cpu", null, null).Count);
+        // Read-time retention: expired points are hidden immediately, without waiting for a
+        // compaction pass (P1-12). The data still exists on disk until compaction rewrites it.
+        var beforeCompaction = engine.ReadAllPoints("testdb", "short", "cpu", null, null);
+        var visible = Assert.Single(beforeCompaction);
+        Assert.Equal(freshTs, visible.TimestampNs);
 
         var compactor = new Compactor(engine.Meta, new ShardManager(engine.RootPath, engine.Meta),
             engine.Tombstones, engine.Schema, maxL0Segments: 2, maxL1Segments: 99);
@@ -67,6 +71,33 @@ public class PartialRetentionTests : IDisposable
         var single = Assert.Single(remaining);
         Assert.Equal(freshTs, single.TimestampNs);
         Assert.Equal(2.0, single.Fields["value"].AsDouble());
+    }
+
+    [Fact]
+    public async Task Queries_ApplyRetentionCutoffBeforeCompaction()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0);
+        engine.Meta.CreateRetentionPolicy("testdb", "short", 60_000_000_000L, isDefault: false);
+
+        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+        await engine.WriteAsync("testdb", "short",
+        [
+            PointAt(1, nowNs - 120_000_000_000L),
+            PointAt(2, nowNs - 1_000_000_000L)
+        ]);
+        engine.FlushAll();
+
+        var query = new QueryExecutor();
+
+        var raw = await query.ExecuteAsync(engine, "testdb", "SELECT value FROM \"short\".\"cpu\"");
+        Assert.Null(raw.Results[0].Error);
+        var rawValue = Assert.Single(Assert.Single(raw.Results[0].Series!).Values);
+        Assert.Equal(2d, Convert.ToDouble(rawValue[^1]));
+
+        var aggregate = await query.ExecuteAsync(engine, "testdb", "SELECT count(value) FROM \"short\".\"cpu\"");
+        Assert.Null(aggregate.Results[0].Error);
+        var countRow = Assert.Single(Assert.Single(aggregate.Results[0].Series!).Values);
+        Assert.Equal(1d, Convert.ToDouble(countRow[1]));
     }
 
     [Fact]

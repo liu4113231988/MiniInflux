@@ -211,6 +211,8 @@ public sealed class CliRepairResult
     public int SegmentsScanned { get; set; }
     public int SegmentsCorrupted { get; set; }
     public int SchemaConflictsSkipped { get; set; }
+    /// <summary>Human-readable notice about the cost of a dry run (empty when not a dry run).</summary>
+    public string DryRunNotice { get; set; } = "";
 }
 
 public sealed class CliCompactResult
@@ -223,6 +225,8 @@ public sealed class CliCompactResult
     public int CompactionTasksMerged { get; set; }
     public long CompactionRunsTotal { get; set; }
     public long SegmentsMergedTotal { get; set; }
+    /// <summary>Human-readable notice about the cost of a dry run (empty when not a dry run).</summary>
+    public string DryRunNotice { get; set; } = "";
 }
 
 public sealed class CliBackupCreateResult

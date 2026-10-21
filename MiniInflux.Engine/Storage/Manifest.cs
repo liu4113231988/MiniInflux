@@ -67,8 +67,10 @@ public sealed class Manifest
 
     public void EnsureDatabase(string db)
     {
+        IdentifierValidator.ValidateDatabaseName(db);
         lock (_lock)
         {
+            EnsureNoCaseInsensitiveAlias(_data.Databases.Keys, db, "database");
             if (!_data.Databases.TryGetValue(db, out _))
             {
                 _data.Databases[db] = new DatabaseInfo();
@@ -128,10 +130,13 @@ public sealed class Manifest
 
     public void EnsureRp(string db, string rpName)
     {
+        IdentifierValidator.ValidateDatabaseName(db);
+        IdentifierValidator.ValidateRetentionPolicyName(rpName);
         lock (_lock)
         {
             EnsureDatabase(db);
             var dbInfo = _data.Databases[db];
+            EnsureNoCaseInsensitiveAlias(dbInfo.RetentionPolicies.Keys, rpName, "retention policy");
             if (!dbInfo.RetentionPolicies.ContainsKey(rpName))
             {
                 var isFirst = dbInfo.RetentionPolicies.Count == 0;
@@ -149,10 +154,13 @@ public sealed class Manifest
 
     public void EnsureRpWithDuration(string db, string rpName, long durationNs, long shardDurationNs, int replication, bool isDefault)
     {
+        IdentifierValidator.ValidateDatabaseName(db);
+        IdentifierValidator.ValidateRetentionPolicyName(rpName);
         lock (_lock)
         {
             EnsureDatabase(db);
             var dbInfo = _data.Databases[db];
+            EnsureNoCaseInsensitiveAlias(dbInfo.RetentionPolicies.Keys, rpName, "retention policy");
             if (!dbInfo.RetentionPolicies.ContainsKey(rpName))
             {
                 if (isDefault)
@@ -172,10 +180,13 @@ public sealed class Manifest
 
     public void CreateRetentionPolicy(string db, string rpName, long durationNs, bool isDefault)
     {
+        IdentifierValidator.ValidateDatabaseName(db);
+        IdentifierValidator.ValidateRetentionPolicyName(rpName);
         lock (_lock)
         {
             EnsureDatabase(db);
             var dbInfo = _data.Databases[db];
+            EnsureNoCaseInsensitiveAlias(dbInfo.RetentionPolicies.Keys, rpName, "retention policy");
             if (isDefault)
                 foreach (var rp in dbInfo.RetentionPolicies.Values) rp.IsDefault = false;
 
@@ -192,6 +203,8 @@ public sealed class Manifest
 
     public void AlterRetentionPolicy(string db, string rpName, long? durationNs, bool? isDefault)
     {
+        IdentifierValidator.ValidateDatabaseName(db);
+        IdentifierValidator.ValidateRetentionPolicyName(rpName);
         lock (_lock)
         {
             if (!_data.Databases.TryGetValue(db, out var dbInfo)) return;
@@ -209,6 +222,8 @@ public sealed class Manifest
 
     public void DropRetentionPolicy(string db, string rpName)
     {
+        IdentifierValidator.ValidateDatabaseName(db);
+        IdentifierValidator.ValidateRetentionPolicyName(rpName);
         lock (_lock)
         {
             if (_data.Databases.TryGetValue(db, out var dbInfo) &&
@@ -398,14 +413,18 @@ public sealed class Manifest
         }
     }
 
-    public void ReplaceSegmentsInShard(string db, string rp, int shardId, IEnumerable<string> oldSegmentFiles, IEnumerable<string> newSegmentFiles)
+    /// <summary>
+    /// Atomically swaps a shard's segment list. Returns false when the shard no longer exists (for
+    /// example a concurrent DROP SHARD), in which case the caller must not delete its inputs.
+    /// </summary>
+    public bool ReplaceSegmentsInShard(string db, string rp, int shardId, IEnumerable<string> oldSegmentFiles, IEnumerable<string> newSegmentFiles)
     {
         lock (_lock)
         {
-            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return;
-            if (!dbInfo.RetentionPolicies.TryGetValue(rp, out var rpInfo)) return;
+            if (!_data.Databases.TryGetValue(db, out var dbInfo)) return false;
+            if (!dbInfo.RetentionPolicies.TryGetValue(rp, out var rpInfo)) return false;
             var shard = rpInfo.ShardGroups.FirstOrDefault(s => s.Id == shardId);
-            if (shard == null) return;
+            if (shard == null) return false;
 
             var removeNames = new HashSet<string>(
                 oldSegmentFiles.Select(Path.GetFileName).Where(name => !string.IsNullOrWhiteSpace(name))!,
@@ -419,6 +438,7 @@ public sealed class Manifest
             }
 
             Save();
+            return true;
         }
     }
 
@@ -707,6 +727,10 @@ public sealed class Manifest
                 foreach (var (rpName, rp) in dbInfo.RetentionPolicies)
                 {
                     if (rp.DurationNs <= 0) continue;
+                    if (!IdentifierValidator.IsValidDatabaseName(db)
+                        || !IdentifierValidator.IsValidRetentionPolicyName(rpName))
+                        continue;
+
                     var cutoff = nowNs - rp.DurationNs;
                     foreach (var shard in rp.ShardGroups.Where(s => s.EndTimeNs < cutoff))
                     {
@@ -725,22 +749,157 @@ public sealed class Manifest
 
     private void Load()
     {
-        if (!File.Exists(_path)) return;
+        var backupPath = _path + ".bak";
+
+        if (!File.Exists(_path))
+        {
+            // A missing primary is normal only for a brand-new data directory. If a backup exists,
+            // recover it instead of starting with a fresh catalog and hiding all existing segments.
+            if (File.Exists(backupPath))
+            {
+                try
+                {
+                    _data = ReadManifest(backupPath);
+                    _dirty = true;
+                    return;
+                }
+                catch (Exception backupError)
+                {
+                    throw new InvalidDataException(
+                        $"manifest.json is missing and manifest.json.bak is unreadable; refusing to start with a fresh catalog: {backupError.Message}",
+                        backupError);
+                }
+            }
+
+            var dataRoot = Path.GetDirectoryName(Path.GetDirectoryName(_path)!)!;
+            if (HasPersistedData(dataRoot))
+            {
+                throw new InvalidDataException(
+                    "manifest.json is missing and no manifest.json.bak exists, but data files are present; refusing to start with a fresh catalog");
+            }
+            return;
+        }
+
+        Exception? primaryError;
         try
         {
-            var json = File.ReadAllText(_path);
-            var data = JsonSerializer.Deserialize(json, ManifestJsonContext.Default.ManifestData);
-            if (data != null) _data = data;
+            _data = ReadManifest(_path);
+            return;
         }
-        catch { /* corrupted manifest, start fresh */ }
+        catch (Exception ex)
+        {
+            primaryError = ex;
+        }
+
+        // A torn/empty manifest used to silently reset the catalog, making every segment on disk
+        // unreachable. Try the last good copy before failing startup; never start fresh over data.
+        if (File.Exists(backupPath))
+        {
+            try
+            {
+                _data = ReadManifest(backupPath);
+            }
+            catch (Exception backupError)
+            {
+                throw new InvalidDataException(
+                    $"manifest.json and manifest.json.bak are both unreadable; refusing to start with a fresh catalog. Primary: {primaryError.Message}; backup: {backupError.Message}",
+                    primaryError);
+            }
+
+            // Preserve the damaged catalog for diagnosis before the next save heals the primary.
+            try { File.Move(_path, _path + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmssfff}"); } catch { }
+            _dirty = true; // heal the primary path on the next save
+            return;
+        }
+
+        throw new InvalidDataException(
+            $"manifest.json is unreadable and no manifest.json.bak exists; refusing to start with a fresh catalog: {primaryError.Message}",
+            primaryError);
+    }
+
+    private static bool HasPersistedData(string dataRoot)
+    {
+        try
+        {
+            var dbRoot = Path.Combine(dataRoot, "db");
+            if (Directory.Exists(dbRoot)
+                && Directory.EnumerateFiles(dbRoot, "*", SearchOption.AllDirectories).Any())
+                return true;
+
+            var walRoot = Path.Combine(dataRoot, "wal");
+            return Directory.Exists(walRoot)
+                && Directory.EnumerateFiles(walRoot, "*.wal").Any(path => new FileInfo(path).Length > 0);
+        }
+        catch
+        {
+            // If the check itself fails, fail closed rather than silently starting fresh.
+            return true;
+        }
+    }
+
+    private static ManifestData ReadManifest(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var data = JsonSerializer.Deserialize(stream, ManifestJsonContext.Default.ManifestData);
+        if (data == null)
+            throw new InvalidDataException("manifest is empty");
+
+        var databaseNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (databaseName, database) in data.Databases)
+        {
+            if (!IdentifierValidator.IsValidDatabaseName(databaseName))
+                throw new InvalidDataException($"manifest contains invalid database name: {databaseName}");
+            if (!databaseNames.Add(databaseName))
+                throw new InvalidDataException($"manifest contains database names that alias on case-insensitive file systems: {databaseName}");
+
+            var retentionPolicyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var retentionPolicyName in database.RetentionPolicies.Keys)
+            {
+                if (!IdentifierValidator.IsValidRetentionPolicyName(retentionPolicyName))
+                    throw new InvalidDataException($"manifest contains invalid retention policy name: {retentionPolicyName}");
+                if (!retentionPolicyNames.Add(retentionPolicyName))
+                    throw new InvalidDataException(
+                        $"manifest contains retention policy names that alias on case-insensitive file systems in database {databaseName}: {retentionPolicyName}");
+            }
+        }
+
+        return data;
+    }
+
+    private static void EnsureNoCaseInsensitiveAlias(IEnumerable<string> existingNames, string candidate, string kind)
+    {
+        var alias = existingNames.FirstOrDefault(name =>
+            !string.Equals(name, candidate, StringComparison.Ordinal)
+            && string.Equals(name, candidate, StringComparison.OrdinalIgnoreCase));
+        if (alias != null)
+            throw new InvalidOperationException(
+                $"{kind} name '{candidate}' aliases existing {kind} name '{alias}' on case-insensitive file systems");
     }
 
     public void Save()
     {
         var tmp = _path + ".tmp";
-        var json = JsonSerializer.Serialize(_data, ManifestJsonContext.Default.ManifestData);
-        File.WriteAllText(tmp, json);
+        using (var stream = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            JsonSerializer.Serialize(stream, _data, ManifestJsonContext.Default.ManifestData);
+            stream.Flush(true);
+        }
         File.Move(tmp, _path, overwrite: true);
+
+        // Keep one known-good copy for the next startup. Write it atomically so a crash during
+        // the copy cannot replace the last good backup with a torn file.
+        try
+        {
+            var backupTmp = _path + ".bak.tmp";
+            using (var source = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var backup = new FileStream(backupTmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                source.CopyTo(backup);
+                backup.Flush(true);
+            }
+            File.Move(backupTmp, _path + ".bak", overwrite: true);
+        }
+        catch { /* best effort: the primary manifest is already durable */ }
         _dirty = false;
     }
 

@@ -25,7 +25,11 @@ public static class HttpLoggingSupport
         var target = context.Request.Path + RedactQueryString(context.Request.Query);
         var protocol = context.Request.Protocol;
         var status = context.Response.StatusCode;
-        var length = context.Response.ContentLength ?? 0;
+        // Compressed responses have no Content-Length; the compression middleware records the
+        // actual bytes written on the context so the access log does not report 0.
+        var length = context.Response.ContentLength
+            ?? (context.Items.TryGetValue(MiniInflux.Net10.ResponseCompressionSupport.WrittenBytesItemKey, out var written)
+                && written is long bytes ? bytes : 0);
         return $"{DateTimeOffset.UtcNow:O} {remoteIp} \"{method} {target} {protocol}\" {status} {length} {elapsedMs}ms";
     }
 

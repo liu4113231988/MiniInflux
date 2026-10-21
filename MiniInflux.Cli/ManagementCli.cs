@@ -12,25 +12,93 @@ public static class ManagementCli
             return null;
 
         var command = args[0].Trim().ToLowerInvariant();
+        var commandArgs = args.Skip(1).ToArray();
+        if (!ValidateOptions(commandArgs, out var optionError))
+        {
+            error.WriteLine(optionError);
+            return 2;
+        }
+
         return command switch
         {
-            "benchmark" => RunBenchmark(args.Skip(1).ToArray(), options, output),
-            "inspect" => RunInspect(args.Skip(1).ToArray(), options, output, error),
-            "validate" => RunValidate(args.Skip(1).ToArray(), options, output, error),
-            "repair" => RunRepair(args.Skip(1).ToArray(), options, output),
-            "compact" => RunCompact(args.Skip(1).ToArray(), options, output),
-            "backup" => RunBackup(args.Skip(1).ToArray(), options, output, error),
-            "restore" => RunRestore(args.Skip(1).ToArray(), options, output, error),
+            "benchmark" => RunBenchmark(commandArgs, options, output, error),
+            "inspect" => RunInspect(commandArgs, options, output, error),
+            "validate" => RunValidate(commandArgs, options, output, error),
+            "repair" => RunRepair(commandArgs, options, output, error),
+            "compact" => RunCompact(commandArgs, options, output, error),
+            "backup" => RunBackup(commandArgs, options, output, error),
+            "restore" => RunRestore(commandArgs, options, output, error),
             "help" or "--help" or "-h" => ShowHelp(output),
             _ => null
         };
     }
 
-    private static int RunBenchmark(string[] args, MiniInfluxOptions options, TextWriter output)
+    private static readonly HashSet<string> KnownOptions = new(StringComparer.OrdinalIgnoreCase)
     {
+        "--data", "--format", "--path", "--points", "--concurrency", "--dry-run",
+        "--db", "--measurement", "--help", "-h",
+        // Global storage/WAL overrides parsed by CommandLineOptions.
+        "--flush-threshold", "--wal-fsync", "--wal-fsync-interval-ms", "--wal-max-file-bytes",
+        "--storage-max-series-per-database", "--storage-max-fields-per-measurement",
+        "--storage-max-buffer-points", "--storage-max-buffer-bytes"
+    };
+
+    private static readonly HashSet<string> FlagOptions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "--dry-run", "--help", "-h"
+    };
+
+    /// <summary>
+    /// Notice describing the cost of a dry run. It is emitted on stdout (not stderr) so that
+    /// stderr stays reserved for failures and stdout can be piped into a parser; in JSON mode it
+    /// travels in the <c>DryRunNotice</c> field so the document stays valid JSON.
+    /// </summary>
+    private const string DryRunCostNotice =
+        "data directory was copied to a temporary directory; this needs free space equal to the data directory size and may take a while";
+
+    /// <summary>
+    /// Rejects misspelled options instead of silently ignoring them (a typo used to fall back to
+    /// the default data directory) and reports options missing their value.
+    /// </summary>
+    private static bool ValidateOptions(string[] args, out string error)
+    {
+        for (var i = 0; i < args.Length; i++)
+        {
+            var arg = args[i];
+            if (!arg.StartsWith("--", StringComparison.Ordinal) && !string.Equals(arg, "-h", StringComparison.Ordinal))
+                continue;
+
+            if (!KnownOptions.Contains(arg))
+            {
+                error = $"unknown option: {arg}";
+                return false;
+            }
+
+            if (FlagOptions.Contains(arg))
+                continue;
+
+            if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+            {
+                error = $"missing value for {arg}";
+                return false;
+            }
+            i++;
+        }
+
+        error = string.Empty;
+        return true;
+    }
+
+    private static int RunBenchmark(string[] args, MiniInfluxOptions options, TextWriter output, TextWriter error)
+    {
+        if (!TryParseBenchmarkOptions(args, out var benchmarkOptions, out var optionError))
+        {
+            error.WriteLine(optionError);
+            return 2;
+        }
+
         var dataPath = ResolveDataPath(args, options);
         var benchmarkRoot = Path.Combine(dataPath, "benchmarks", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString());
-        var benchmarkOptions = ParseBenchmarkOptions(args);
         var benchmarkFormat = ParseBenchmarkFormat(args);
         var benchmark = BenchmarkRunner.Run(benchmarkRoot, benchmarkOptions);
         output.WriteLine(benchmarkFormat switch
@@ -630,17 +698,20 @@ public static class ManagementCli
         return issues.Count == 0 ? 0 : 1;
     }
 
-    private static int RunRepair(string[] args, MiniInfluxOptions options, TextWriter output)
+    private static int RunRepair(string[] args, MiniInfluxOptions options, TextWriter output, TextWriter error)
     {
         var dataPath = ResolveDataPath(args, options);
         var dryRun = HasFlag(args, "--dry-run");
         var format = ParseTextOrJsonFormat(args);
+        // Note: the dry-run clone cost is intentionally not written to stderr — stderr stays
+        // reserved for failures so callers can pipe stdout into a JSON parser without noise.
         var executionDataPath = dryRun ? CreateDryRunDataClone(dataPath) : dataPath;
         try
         {
             using var engine = OpenOfflineEngine(executionDataPath, options);
             var result = engine.Recover();
             engine.FlushAll();
+            var exitCode = result.SegmentsCorrupted > 0 ? 1 : 0;
 
             if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
             {
@@ -652,21 +723,24 @@ public static class ManagementCli
                     WalRecordsReplayed = result.WalRecordsReplayed,
                     SegmentsScanned = result.SegmentsScanned,
                     SegmentsCorrupted = result.SegmentsCorrupted,
-                    SchemaConflictsSkipped = result.SchemaConflictsSkipped
+                    SchemaConflictsSkipped = result.SchemaConflictsSkipped,
+                    DryRunNotice = dryRun ? DryRunCostNotice : ""
                 };
                 output.WriteLine(JsonSerializer.Serialize(jsonResult, CliJsonContext.Default.CliRepairResult));
-                return 0;
+                return exitCode;
             }
 
             output.WriteLine($"data_path={Path.GetFullPath(dataPath)}");
             output.WriteLine($"dry_run={dryRun.ToString().ToLowerInvariant()}");
+            if (dryRun)
+                output.WriteLine("dry_run_notice=" + DryRunCostNotice);
             output.WriteLine($"wal_records_replayed={result.WalRecordsReplayed}");
             output.WriteLine($"segments_scanned={result.SegmentsScanned}");
             output.WriteLine($"segments_corrupted={result.SegmentsCorrupted}");
             output.WriteLine($"schema_conflicts_skipped={result.SchemaConflictsSkipped}");
             if (dryRun)
                 output.WriteLine("changes_applied=false");
-            return 0;
+            return exitCode;
         }
         finally
         {
@@ -675,11 +749,13 @@ public static class ManagementCli
         }
     }
 
-    private static int RunCompact(string[] args, MiniInfluxOptions options, TextWriter output)
+    private static int RunCompact(string[] args, MiniInfluxOptions options, TextWriter output, TextWriter error)
     {
         var dataPath = ResolveDataPath(args, options);
         var dryRun = HasFlag(args, "--dry-run");
         var format = ParseTextOrJsonFormat(args);
+        // Note: the dry-run clone cost is intentionally not written to stderr — stderr stays
+        // reserved for failures so callers can pipe stdout into a JSON parser without noise.
         var executionDataPath = dryRun ? CreateDryRunDataClone(dataPath) : dataPath;
         try
         {
@@ -707,7 +783,8 @@ public static class ManagementCli
                     ChangesApplied = !dryRun,
                     CompactionTasksMerged = totalMerged,
                     CompactionRunsTotal = stats.TotalRuns,
-                    SegmentsMergedTotal = stats.TotalSegmentsMerged
+                    SegmentsMergedTotal = stats.TotalSegmentsMerged,
+                    DryRunNotice = dryRun ? DryRunCostNotice : ""
                 };
                 output.WriteLine(JsonSerializer.Serialize(jsonResult, CliJsonContext.Default.CliCompactResult));
                 return 0;
@@ -715,6 +792,8 @@ public static class ManagementCli
 
             output.WriteLine($"data_path={Path.GetFullPath(dataPath)}");
             output.WriteLine($"dry_run={dryRun.ToString().ToLowerInvariant()}");
+            if (dryRun)
+                output.WriteLine("dry_run_notice=" + DryRunCostNotice);
             output.WriteLine($"compaction_tasks_merged={totalMerged}");
             output.WriteLine($"compaction_runs_total={stats.TotalRuns}");
             output.WriteLine($"segments_merged_total={stats.TotalSegmentsMerged}");
@@ -965,25 +1044,32 @@ public static class ManagementCli
     private static string ResolveDataPath(string[] args, MiniInfluxOptions options) =>
         TryGetOption(args, "--data", out var dataPath) ? dataPath : options.DataPath;
 
-    private static BenchmarkRunOptions ParseBenchmarkOptions(string[] args)
+    private static bool TryParseBenchmarkOptions(string[] args, out BenchmarkRunOptions options, out string error)
     {
-        var points = 10_000;
-        var concurrency = 1;
-        for (int i = 0; i < args.Length; i++)
+        options = new BenchmarkRunOptions();
+        error = string.Empty;
+
+        if (TryGetOption(args, "--points", out var pointsText))
         {
-            if (string.Equals(args[i], "--points", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length && int.TryParse(args[i + 1], out var parsedPoints))
+            if (!int.TryParse(pointsText, out var points) || points <= 0)
             {
-                points = parsedPoints;
-                i++;
+                error = $"--points must be a positive integer, got '{pointsText}'";
+                return false;
             }
-            else if (string.Equals(args[i], "--concurrency", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length && int.TryParse(args[i + 1], out var parsedConcurrency))
-            {
-                concurrency = parsedConcurrency;
-                i++;
-            }
+            options = options with { PointCount = points };
         }
 
-        return new BenchmarkRunOptions(points, concurrency);
+        if (TryGetOption(args, "--concurrency", out var concurrencyText))
+        {
+            if (!int.TryParse(concurrencyText, out var concurrency) || concurrency <= 0)
+            {
+                error = $"--concurrency must be a positive integer, got '{concurrencyText}'";
+                return false;
+            }
+            options = options with { Concurrency = concurrency };
+        }
+
+        return true;
     }
 
     private static string ParseBenchmarkFormat(string[] args)

@@ -59,15 +59,9 @@ if (!options.Http.Enabled)
     return;
 }
 
-var authenticationConfigurationMissing = options.Auth.Enabled
-    && (string.IsNullOrWhiteSpace(options.Auth.Username) || string.IsNullOrEmpty(options.Auth.Password));
-if (authenticationConfigurationMissing)
-    options.Auth.Enabled = false;
-
-var tlsConfigurationMissing = options.Tls.Enabled
-    && (string.IsNullOrWhiteSpace(options.Tls.CertPath) || !File.Exists(options.Tls.CertPath));
-if (tlsConfigurationMissing)
-    options.Tls.Enabled = false;
+// Security configuration is fail-closed: if an operator explicitly enables auth or TLS but the
+// credentials/certificate are missing, refuse to start rather than silently serving without them.
+StartupSecurity.Validate(options);
 
 var authenticationGuard = new AuthenticationGuard(options.Auth);
 var tokenStore = new TokenStore(options.DataPath);
@@ -137,12 +131,8 @@ var staticAssets = Assembly.GetExecutingAssembly()
 engine.Recover();
 if (!options.Auth.Enabled)
     runtimeLogger.LogWarning("authentication is disabled; all HTTP endpoints are publicly accessible");
-if (authenticationConfigurationMissing)
-    runtimeLogger.LogWarning("authentication was requested but credentials are missing; authentication has been disabled");
 if (!options.Tls.Enabled)
     runtimeLogger.LogWarning("TLS is disabled; HTTP traffic is unencrypted");
-if (tlsConfigurationMissing)
-    runtimeLogger.LogWarning("TLS was requested but Tls.CertPath is missing or unreadable; TLS has been disabled");
 runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {BindAddress}, auth {AuthEnabled}, app log level {AppLogLevel}, system log level {SystemLogLevel}",
     Path.GetFullPath(options.DataPath), options.Http.BindAddress, options.Auth.Enabled, options.Logging.Level, options.Logging.SystemLevel);
 runtimeLogger.LogInformation("Performance tuning: adjust Write.QueueCapacity={QueueCapacity}, Write.BatchSize={BatchSize}, Storage.MaxBufferPoints={MaxBufferPoints}, Storage.MaxQueryDurationMs={MaxQueryDurationMs}, Storage.MaxQueryMemoryBytes={MaxQueryMemoryBytes}, and Wal.Fsync={WalFsync} as needed",
@@ -252,13 +242,23 @@ app.MapGet("/health", (TsdbEngine tsdbEngine) =>
     var health = tsdbEngine.Health;
     var availableDiskBytes = GetAvailableDiskBytes(options.DataPath);
     var diskHealthy = options.Storage.MinFreeDiskBytes <= 0 || availableDiskBytes >= options.Storage.MinFreeDiskBytes;
+    var healthy = health.WriteAvailable && diskHealthy;
+
+    if (options.Auth.Enabled)
+    {
+        // Probes still get a usable status code, but authenticated deployments must not leak
+        // internal failure components or timestamps to unauthenticated callers.
+        var redacted = new HealthResponse(healthy ? "ready" : "unhealthy", healthy ? "pass" : "fail", 0, null, null);
+        return Results.Json(redacted, AppJsonContext.Default.HealthResponse, statusCode: healthy ? 200 : 503);
+    }
+
     var response = new HealthResponse(
         health.WriteAvailable && diskHealthy ? "ready" : health.WriteAvailable ? "insufficient disk space" : "write path unavailable",
         health.WriteAvailable && diskHealthy ? "pass" : "fail",
         health.FailureCount,
         health.LastFailureComponent,
         health.LastFailureUtc);
-    return Results.Json(response, AppJsonContext.Default.HealthResponse, statusCode: health.WriteAvailable && diskHealthy ? 200 : 503);
+    return Results.Json(response, AppJsonContext.Default.HealthResponse, statusCode: healthy ? 200 : 503);
 });
 
 app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
@@ -281,6 +281,10 @@ app.MapPost("/write", (HttpRequest request, WriteQueue writeQueue, MetricsCollec
 {
     if (string.IsNullOrWhiteSpace(db))
         return Task.FromResult<IResult>(Results.BadRequest(new ErrorResponse("missing required parameter db")));
+    if (!IdentifierValidator.IsValidDatabaseName(db))
+        return Task.FromResult<IResult>(Results.BadRequest(new ErrorResponse($"invalid database name: {db}")));
+    if (rp != null && !IdentifierValidator.IsValidRetentionPolicyName(rp))
+        return Task.FromResult<IResult>(Results.BadRequest(new ErrorResponse($"invalid retention policy name: {rp}")));
     return WritePointsAsync(request, db, rp, precision, writeQueue, metrics);
 });
 
@@ -303,9 +307,6 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     var epoch = request.Query["epoch"].ToString();
     var chunkSize = ParseChunkSize(request.Query["chunk_size"].ToString());
     var format = request.Query["format"].ToString();
-    var isCsv = string.Equals(format, "csv", StringComparison.OrdinalIgnoreCase);
-    if (isCsv && chunked)
-        return Results.BadRequest(new ErrorResponse("format=csv is not supported with chunked=true"));
     if (string.IsNullOrWhiteSpace(q) && request.HasFormContentType)
     {
         var form = await request.ReadFormAsync();
@@ -315,13 +316,26 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
         debug = debug || TryParseBool(form["debug"].ToString());
         if (string.IsNullOrWhiteSpace(epoch))
             epoch = form["epoch"].ToString();
+        if (string.IsNullOrWhiteSpace(format))
+            format = form["format"].ToString();
         chunkSize ??= ParseChunkSize(form["chunk_size"].ToString());
     }
+
+    var isCsv = string.Equals(format, "csv", StringComparison.OrdinalIgnoreCase);
+    if (isCsv && chunked)
+        return Results.BadRequest(new ErrorResponse("format=csv is not supported with chunked=true"));
 
     if (string.IsNullOrWhiteSpace(q))
         return Results.BadRequest(new ErrorResponse("missing required parameter q"));
 
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
+    // Classify the statement before authorizing it. A read token may run SELECT/SHOW, but DDL,
+    // DELETE, DROP and SELECT ... INTO require the write tier. Parse failures still fall through
+    // to the executor below, which returns the normal query error.
+    var requiredPermission = "read";
+    try { requiredPermission = QueryPermission.RequiredPermission(InfluxQlParser.Parse(q)); }
+    catch { /* malformed query: executor returns the parse error */ }
+
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: requiredPermission))
         return authResult;
 
     // P3 参数化查询：v1 `?params={"host":"a"}`（或 form 字段）中的 `$name` 占位符由
@@ -377,12 +391,13 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
 // v3 的 v1 风格 {"results":[...]} 信封，执行错误（非超时/取消）以 400 + {"error"} 返回
 app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics) =>
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
-        return authResult;
     V3QueryRequest? body = null;
-    if (request.ContentLength > 0 && request.ContentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true)
+    if (request.ContentLength != 0
+        && (request.ContentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true
+            || request.ContentLength is null))
     {
-        try { body = await ReadJsonAsync(request, AppJsonContext.Default.V3QueryRequest); } catch { }
+        try { body = await ReadJsonAsync(request, AppJsonContext.Default.V3QueryRequest); }
+        catch (JsonException) { return Results.BadRequest(new ErrorResponse("malformed JSON body")); }
     }
     var db = body?.Db ?? body?.Database ?? request.Query["db"].ToString();
     if (string.IsNullOrWhiteSpace(db)) db = request.Query["database"].ToString();
@@ -400,6 +415,15 @@ app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor 
         return Results.BadRequest(new ErrorResponse("missing required parameter q"));
     if (string.IsNullOrWhiteSpace(db))
         return Results.BadRequest(new ErrorResponse("missing required parameter db"));
+
+    // The v3 endpoint shares the executor with /query; classify the statement before authorizing
+    // so a read token cannot run DDL/DML or SELECT ... INTO through this alias.
+    var requiredPermission = "read";
+    try { requiredPermission = QueryPermission.RequiredPermission(InfluxQlParser.Parse(q)); }
+    catch { /* malformed query: executor returns the parse error */ }
+
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: requiredPermission))
+        return authResult;
 
     var format = body?.Format ?? request.Query["format"].ToString();
     if (string.IsNullOrWhiteSpace(format)) format = "json";
@@ -462,7 +486,9 @@ app.MapPost("/admin/api/query", async (HttpRequest request, QueryExecutor execut
         return Results.BadRequest(new ErrorResponse($"parse error: {ex.Message}"));
     }
 
-    if (!IsAdminQueryAllowed(parsed.Kind))
+    if (!IsAdminQueryAllowed(parsed.Kind)
+        || !QueryPermission.IsReadOnly(parsed)
+        || !string.IsNullOrWhiteSpace(parsed.IntoTarget))
         return Results.BadRequest(new ErrorResponse($"statement type '{parsed.Kind}' is not allowed in the admin query console (read-only)"));
 
     var epoch = request.Query["epoch"].ToString();
@@ -601,9 +627,11 @@ adminApi.MapGet("/databases", (HttpRequest request) =>
         return authResult;
 
     var payload = engine.ListDatabases()
+        .Where(db => IdentifierValidator.IsValidDatabaseName(db))
         .Select(db =>
         {
             var rpSummaries = engine.Meta.ListRetentionPolicies(db)
+                .Where(rp => IdentifierValidator.IsValidRetentionPolicyName(rp.Name))
                 .OrderBy(rp => rp.Name, StringComparer.Ordinal)
                 .Select(rp =>
                 {
@@ -672,7 +700,9 @@ adminApi.MapPost("/backup", async (HttpRequest request) =>
     if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
 
-    var payload = await ReadJsonAsync(request, AppJsonContext.Default.BackupPathRequest);
+    var (jsonOk, payload) = await TryReadJsonAsync(request, AppJsonContext.Default.BackupPathRequest);
+    if (!jsonOk)
+        return Results.BadRequest(new ErrorResponse("malformed JSON body"));
     if (payload == null || !TryResolveManagedBackupPath(options, payload.Path, out var backupPath))
         return Results.BadRequest(new ErrorResponse("path must be a relative name under Data.BackupDir"));
 
@@ -694,7 +724,9 @@ adminApi.MapPost("/restore", async (HttpRequest request) =>
     if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
 
-    var payload = await ReadJsonAsync(request, AppJsonContext.Default.BackupPathRequest);
+    var (jsonOk, payload) = await TryReadJsonAsync(request, AppJsonContext.Default.BackupPathRequest);
+    if (!jsonOk)
+        return Results.BadRequest(new ErrorResponse("malformed JSON body"));
     if (payload == null || !TryResolveManagedBackupPath(options, payload.Path, out var backupPath))
         return Results.BadRequest(new ErrorResponse("path must be a relative name under Data.BackupDir"));
 
@@ -754,7 +786,9 @@ adminApi.MapPost("/maintenance/cq/run", async (HttpRequest request, ContinuousQu
     runtimeLogger.LogInformation("admin ui continuous query cycle executed={Executed}", executed);
     return Results.Json(new MaintenanceResult
     {
-        Message = "continuous query cycle completed",
+        Message = executed == 0 && runner.IsRunning
+            ? "continuous query cycle already running"
+            : "continuous query cycle completed",
         ContinuousQueriesExecuted = executed
     }, AppJsonContext.Default.MaintenanceResult);
 });
@@ -772,7 +806,9 @@ adminApi.MapPost("/tokens", async (HttpRequest request) =>
 {
     if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult))
         return authResult;
-    var body = await ReadJsonAsync(request, AppJsonContext.Default.CreateTokenRequest);
+    var (jsonOk, body) = await TryReadJsonAsync(request, AppJsonContext.Default.CreateTokenRequest);
+    if (!jsonOk)
+        return Results.BadRequest(new ErrorResponse("malformed JSON body"));
     if (body == null || string.IsNullOrWhiteSpace(body.Name))
         return Results.BadRequest(new ErrorResponse("missing required field 'name'"));
     try
@@ -1334,6 +1370,21 @@ static async Task<T?> ReadJsonAsync<T>(HttpRequest request, JsonTypeInfo<T> type
     return await JsonSerializer.DeserializeAsync(request.Body, typeInfo, request.HttpContext.RequestAborted);
 }
 
+/// <summary>Reads a JSON body and reports malformed payloads instead of throwing a 500.</summary>
+static async Task<(bool Ok, T? Value)> TryReadJsonAsync<T>(HttpRequest request, JsonTypeInfo<T> typeInfo)
+{
+    if (request.ContentLength == 0)
+        return (true, default);
+    try
+    {
+        return (true, await JsonSerializer.DeserializeAsync(request.Body, typeInfo, request.HttpContext.RequestAborted));
+    }
+    catch (JsonException)
+    {
+        return (false, default);
+    }
+}
+
 static string GetAdminAssetContentType(string path)
 {
     return Path.GetExtension(path).ToLowerInvariant() switch
@@ -1391,3 +1442,8 @@ public sealed record HealthResponse(string Message, string Status, long StorageF
 }
 
 public sealed class RequestBodyTooLargeException : Exception;
+
+// Exposed so integration tests can host the real application through
+// WebApplicationFactory<Program>. The partial declaration matches the class the compiler
+// generates for the top-level statements above.
+public partial class Program;

@@ -152,6 +152,10 @@ public sealed class MetricsCollector
         };
     }
 
+    /// <summary>Escapes a Prometheus label value (backslash, double quote, newline).</summary>
+    private static string EscapeLabelValue(string value) =>
+        value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n");
+
     private List<ContinuousQueryMetrics> GetContinuousQueryMetricsSnapshot()
     {
         lock (_continuousQueryMetricsLock)
@@ -255,22 +259,22 @@ public sealed class MetricsCollector
         sb.AppendLine("# HELP mini_influx_continuous_query_run_total Total number of continuous query executions by query.");
         sb.AppendLine("# TYPE mini_influx_continuous_query_run_total counter");
         foreach (var metric in stats.ContinuousQueryMetrics)
-            sb.AppendLine($"mini_influx_continuous_query_run_total{{db=\"{metric.Database}\",name=\"{metric.Name}\"}} {metric.RunsTotal}");
+            sb.AppendLine($"mini_influx_continuous_query_run_total{{db=\"{EscapeLabelValue(metric.Database)}\",name=\"{EscapeLabelValue(metric.Name)}\"}} {metric.RunsTotal}");
 
         sb.AppendLine("# HELP mini_influx_continuous_query_error_total Total number of failed continuous query executions by query.");
         sb.AppendLine("# TYPE mini_influx_continuous_query_error_total counter");
         foreach (var metric in stats.ContinuousQueryMetrics)
-            sb.AppendLine($"mini_influx_continuous_query_error_total{{db=\"{metric.Database}\",name=\"{metric.Name}\"}} {metric.ErrorsTotal}");
+            sb.AppendLine($"mini_influx_continuous_query_error_total{{db=\"{EscapeLabelValue(metric.Database)}\",name=\"{EscapeLabelValue(metric.Name)}\"}} {metric.ErrorsTotal}");
 
         sb.AppendLine("# HELP mini_influx_continuous_query_bucket_total Total number of processed continuous query buckets by query.");
         sb.AppendLine("# TYPE mini_influx_continuous_query_bucket_total counter");
         foreach (var metric in stats.ContinuousQueryMetrics)
-            sb.AppendLine($"mini_influx_continuous_query_bucket_total{{db=\"{metric.Database}\",name=\"{metric.Name}\"}} {metric.BucketsTotal}");
+            sb.AppendLine($"mini_influx_continuous_query_bucket_total{{db=\"{EscapeLabelValue(metric.Database)}\",name=\"{EscapeLabelValue(metric.Name)}\"}} {metric.BucketsTotal}");
 
         sb.AppendLine("# HELP mini_influx_continuous_query_recompute_bucket_total Total number of recomputed continuous query buckets by query.");
         sb.AppendLine("# TYPE mini_influx_continuous_query_recompute_bucket_total counter");
         foreach (var metric in stats.ContinuousQueryMetrics)
-            sb.AppendLine($"mini_influx_continuous_query_recompute_bucket_total{{db=\"{metric.Database}\",name=\"{metric.Name}\"}} {metric.RecomputeBucketsTotal}");
+            sb.AppendLine($"mini_influx_continuous_query_recompute_bucket_total{{db=\"{EscapeLabelValue(metric.Database)}\",name=\"{EscapeLabelValue(metric.Name)}\"}} {metric.RecomputeBucketsTotal}");
 
         sb.AppendLine("# HELP mini_influx_query_duration_ms Query duration bucket counters.");
         sb.AppendLine("# TYPE mini_influx_query_duration_ms histogram");

@@ -153,6 +153,9 @@ public sealed class QueryExecutor
             using var segmentRead = e.AcquireSegmentRead(token);
             var sourceDb = q.SourceDatabase ?? db!;
             var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);
+            var retentionMin = e.GetRetentionCutoffNs(sourceDb, sourceRp);
+            if (retentionMin.HasValue && (!q.MinTimeNs.HasValue || q.MinTimeNs.Value < retentionMin.Value))
+                q = q with { MinTimeNs = retentionMin.Value };
             var requestedFields = BuildRequestedFields(q);
             var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
             if (seriesFilter is null || seriesFilter.Count != 1)
@@ -187,7 +190,7 @@ public sealed class QueryExecutor
                     report.ScannedPoints = fieldsRead.Timestamps.Count;
                     report.EstimatedInputBytes = EstimateFieldRowsBytes(fieldsRead.Timestamps, fieldsRead.Rows);
                     var fieldCols = new List<string>(1 + fields.Count) { "time" };
-                    fieldCols.AddRange(fields);
+                    fieldCols.AddRange(MapRawColumnNames(q, fields));
                     var fieldResultBytes = EstimateRawSeriesShellBytes(resultMeasurement, fieldCols);
                     var fieldBuffer = new System.Buffers.ArrayBufferWriter<byte>();
                     using (var writer = new System.Text.Json.Utf8JsonWriter(fieldBuffer))
@@ -218,7 +221,7 @@ public sealed class QueryExecutor
             ApplyRawReadReport(report, read);
 
             var cols = new List<string>(1 + fields.Count) { "time" };
-            cols.AddRange(fields);
+            cols.AddRange(MapRawColumnNames(q, fields));
 
             var resultBytes = EstimateRawSeriesShellBytes(resultMeasurement, cols);
             report.ScannedPoints = points.Count;
@@ -462,15 +465,24 @@ public sealed class QueryExecutor
         Req(q.SourceDatabase ?? db);
         var sourceDb = q.SourceDatabase ?? db!;
         var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);
+        var retentionMin = e.GetRetentionCutoffNs(sourceDb, sourceRp);
+        if (retentionMin.HasValue && (!q.MinTimeNs.HasValue || q.MinTimeNs.Value < retentionMin.Value))
+            q = q with { MinTimeNs = retentionMin.Value };
         var resultMeasurement = ResolveResultMeasurementName(q);
         var requestedFields = BuildRequestedFields(q);
         var seriesFilter = BuildSeriesFilter(e, sourceDb, q, report);
         var fields = ResolveRawFields(e, sourceDb, q, requestedFields);
         var tags = ResolveRawTags(e, sourceDb, q.Measurement);
-        fields.RemoveAll(field => tags.Contains(field, StringComparer.Ordinal));
+        var fieldColumns = MapRawColumnNames(q, fields);
+        for (var i = fields.Count - 1; i >= 0; i--)
+        {
+            if (!tags.Contains(fields[i], StringComparer.Ordinal)) continue;
+            fields.RemoveAt(i);
+            fieldColumns.RemoveAt(i);
+        }
         var cols = new List<string> { "time" };
         cols.AddRange(tags);
-        cols.AddRange(fields);
+        cols.AddRange(fieldColumns);
 
         var offset = Math.Max(0, q.Offset ?? 0);
         var rowLimit = EffectiveRowLimit(q);
@@ -591,7 +603,15 @@ public sealed class QueryExecutor
         }
         if (HasTagFilters(q))
             measurements = measurements.Where(m => e.ListSeries(db!, m).Any(series => PassesTagFilters(ParseTagsCanonical(series), q))).ToList();
+        measurements = ApplyShowWindow(measurements, q);
         return [new() { Name = "measurements", Columns = ["name"], Values = measurements.Select(x => new List<object?> { x }).ToList() }];
+    }
+
+    static List<T> ApplyShowWindow<T>(IEnumerable<T> items, ParsedQuery q)
+    {
+        if (q.Offset.HasValue) items = items.Skip(Math.Max(0, q.Offset.Value));
+        if (q.Limit.HasValue) items = items.Take(Math.Max(0, q.Limit.Value));
+        return items.ToList();
     }
 
     List<QuerySeries>? ShowFieldKeys(TsdbEngine e, string? db, ParsedQuery q)
@@ -617,7 +637,7 @@ public sealed class QueryExecutor
             foreach (var key in e.ListTagKeys(db!, meas))
                 keys.Add(key);
         }
-        return [new() { Name = q.Measurement ?? "tagKeys", Columns = ["tagKey"], Values = keys.Select(x => new List<object?> { x }).ToList() }];
+        return [new() { Name = q.Measurement ?? "tagKeys", Columns = ["tagKey"], Values = ApplyShowWindow(keys, q).Select(x => new List<object?> { x }).ToList() }];
     }
 
     List<QuerySeries>? ShowTagValues(TsdbEngine e, string? db, ParsedQuery q)
@@ -645,7 +665,7 @@ public sealed class QueryExecutor
         {
             Name = q.Measurement ?? "tagValues",
             Columns = ["key", "value"],
-            Values = rows
+            Values = ApplyShowWindow(rows, q)
         }];
     }
 
@@ -662,7 +682,7 @@ public sealed class QueryExecutor
                 rows.Add([FormatSeriesKey(meas, series)]);
             }
         }
-        return [new() { Name = "series", Columns = ["key"], Values = rows }];
+        return [new() { Name = "series", Columns = ["key"], Values = ApplyShowWindow(rows, q) }];
     }
 
     /// <summary>
@@ -702,6 +722,7 @@ public sealed class QueryExecutor
     List<QuerySeries>? CreateRetentionPolicy(TsdbEngine e, ParsedQuery q)
     {
         Req(q.Database);
+        IdentifierValidator.ValidateRetentionPolicyName(q.RpName);
         e.CreateDatabase(q.Database!);
         e.Meta.CreateRetentionPolicy(q.Database!, q.RpName!, q.RpDurationNs ?? 0, q.RpDefault ?? false);
         return null;
@@ -717,8 +738,9 @@ public sealed class QueryExecutor
     List<QuerySeries>? DropRetentionPolicy(TsdbEngine e, ParsedQuery q)
     {
         Req(q.Database);
-        e.Meta.DropRetentionPolicy(q.Database!, q.RpName!);
-        e.InvalidateEnsuredDbRp(q.Database!, q.RpName!);
+        IdentifierValidator.ValidateRetentionPolicyName(q.RpName);
+        if (!e.DropRetentionPolicy(q.Database!, q.RpName!))
+            throw new InvalidOperationException($"retention policy not found: {q.RpName}");
         return null;
     }
 
@@ -972,7 +994,9 @@ public sealed class QueryExecutor
 
     List<QuerySeries>? DropShard(TsdbEngine e, ParsedQuery q)
     {
-        e.DropShard(q.Limit ?? 0);
+        var shardId = q.Limit ?? 0;
+        if (!e.DropShard(shardId))
+            throw new InvalidOperationException($"shard not found: {shardId}");
         return null;
     }
 
@@ -988,7 +1012,12 @@ public sealed class QueryExecutor
         Req(q.SourceDatabase ?? db);
         var sourceDb = q.SourceDatabase ?? db!;
         var sourceRp = q.SourceRpName ?? e.GetDefaultRpName(sourceDb);
+        var retentionMin = e.GetRetentionCutoffNs(sourceDb, sourceRp);
+        if (retentionMin.HasValue && (!q.MinTimeNs.HasValue || q.MinTimeNs.Value < retentionMin.Value))
+            q = q with { MinTimeNs = retentionMin.Value };
         var resultMeasurement = ResolveResultMeasurementName(q);
+        q = ExpandCountStar(e, sourceDb, q);
+        ValidateSelectSemantics(q);
         HashSet<string>? requestedFields = null;
         if (q.Select.Count > 0 && !(q.Select.Count == 1 && q.Select[0].Field == "*"))
             requestedFields = new HashSet<string>(q.Select.Select(x => x.Field), StringComparer.Ordinal);
@@ -1026,7 +1055,7 @@ public sealed class QueryExecutor
                     var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, lvcResult);
                     report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, lvcBytes + selectIntoBytes);
                     EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
-                    ExecuteSelectInto(e, sourceDb, q, lvcResult);
+                    return SelectIntoResult(e, sourceDb, q, lvcResult, report);
                 }
                 return lvcResult;
             }
@@ -1046,7 +1075,7 @@ public sealed class QueryExecutor
                         var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, pushedDown);
                         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, resultBytes + selectIntoBytes);
                         EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
-                        ExecuteSelectInto(e, sourceDb, q, pushedDown);
+                        return SelectIntoResult(e, sourceDb, q, pushedDown, report);
                     }
                     return pushedDown;
                 }
@@ -1068,7 +1097,7 @@ public sealed class QueryExecutor
                             var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, fastCount);
                             report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, resultBytes + selectIntoBytes);
                             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
-                            ExecuteSelectInto(e, sourceDb, q, fastCount);
+                            return SelectIntoResult(e, sourceDb, q, fastCount, report);
                         }
                         return fastCount;
                     }
@@ -1139,6 +1168,23 @@ public sealed class QueryExecutor
 
         if (q.GroupByNs.HasValue || q.GroupByTags.Count > 0 || q.GroupByAllTags)
         {
+            if (IsRawSelect(q))
+            {
+                var rawGrouped = RawGroupByTags(e, sourceDb, pts, q, resultMeasurement);
+                var rawGroupedBytes = EstimateQuerySeriesBytes(rawGrouped);
+                report.EstimatedResultBytes = rawGroupedBytes;
+                report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + rawGroupedBytes);
+                EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+                if (!string.IsNullOrWhiteSpace(q.IntoTarget))
+                {
+                    var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, rawGrouped);
+                    report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + rawGroupedBytes + selectIntoBytes);
+                    EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
+                    return SelectIntoResult(e, sourceDb, q, rawGrouped, report);
+                }
+                return rawGrouped;
+            }
+
             var groupingStateBytes = EstimateGroupingStateBytes(pts, q.GroupByTags, q.GroupByAllTags, q.GroupByNs);
             report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + groupingStateBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
@@ -1156,7 +1202,7 @@ public sealed class QueryExecutor
                 var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, aggregateResult);
                 report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + groupingStateBytes + report.EstimatedResultBytes + selectIntoBytes);
                 EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
-                ExecuteSelectInto(e, sourceDb, q, aggregateResult);
+                return SelectIntoResult(e, sourceDb, q, aggregateResult, report);
             }
             return aggregateResult;
         }
@@ -1176,7 +1222,7 @@ public sealed class QueryExecutor
                 var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, functionResult);
                 report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + functionStateBytes + report.EstimatedResultBytes + selectIntoBytes);
                 EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
-                ExecuteSelectInto(e, sourceDb, q, functionResult);
+                return SelectIntoResult(e, sourceDb, q, functionResult, report);
             }
             return functionResult;
         }
@@ -1190,7 +1236,8 @@ public sealed class QueryExecutor
         if (!pointsAreDescending || (q.Offset ?? 0) != 0)
             pts = pts.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
 
-        var fields = q.Select.Count == 1 && q.Select[0].Field == "*"
+        var isStar = q.Select.Count == 1 && q.Select[0].Field == "*";
+        var fields = isStar
             ? pointsAreDescending
                 ? ResolveRawFields(e, sourceDb, q, requestedFields)
                 : pts.SelectMany(p => p.Fields.Keys).Distinct().Order().ToList()
@@ -1198,10 +1245,18 @@ public sealed class QueryExecutor
         var tags = pointsAreDescending && pts.Count > 0
             ? pts[0].Tags.Keys.Order().ToList()
             : pts.SelectMany(p => p.Tags.Keys).Distinct().Order().ToList();
-        fields.RemoveAll(field => tags.Contains(field, StringComparer.Ordinal));
+        // Raw SELECT columns use the item alias ("SELECT value AS v" => column "v"); the
+        // field list stays alias-free so point lookup keeps working.
+        var fieldColumns = MapRawColumnNames(q, fields);
+        for (var i = fields.Count - 1; i >= 0; i--)
+        {
+            if (!tags.Contains(fields[i], StringComparer.Ordinal)) continue;
+            fields.RemoveAt(i);
+            fieldColumns.RemoveAt(i);
+        }
         var cols = new List<string> { "time" };
         cols.AddRange(tags);
-        cols.AddRange(fields);
+        cols.AddRange(fieldColumns);
 
         var vals = new List<List<object?>>(pts.Count);
         var rowCapacity = 1 + tags.Count + fields.Count;
@@ -1223,7 +1278,7 @@ public sealed class QueryExecutor
 
         EnsureWithinLimit(vals.Count);
 
-        List<QuerySeries> rawResult =
+        List<QuerySeries> rawResult = ApplySeriesWindow(
         [
             new()
             {
@@ -1232,7 +1287,7 @@ public sealed class QueryExecutor
                 Values = vals,
                 TagColumns = new HashSet<string>(tags, StringComparer.Ordinal)
             }
-        ];
+        ], q.SeriesOffset, q.SeriesLimit);
         report.EstimatedResultBytes = rawResultBytes;
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + report.EstimatedResultBytes);
         EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
@@ -1241,7 +1296,7 @@ public sealed class QueryExecutor
             var selectIntoBytes = EstimateSelectIntoPointBytes(e, sourceDb, q, rawResult);
             report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, filteredInputBytes + report.EstimatedResultBytes + selectIntoBytes);
             EnsureQueryMemoryLimit(report.PeakEstimatedMemoryBytes);
-            ExecuteSelectInto(e, sourceDb, q, rawResult);
+            return SelectIntoResult(e, sourceDb, q, rawResult, report);
         }
         return rawResult;
     }
@@ -1388,6 +1443,8 @@ public sealed class QueryExecutor
         if (groupedByTags)
         {
             var grouped = orderedRows.GroupBy(r => BuildGroupByTagKey(ParseTagsCanonical(r.TagsCanonical), q.GroupByTags, q.GroupByAllTags), StringComparer.Ordinal);
+            var groupedColumns = new List<string> { "time" };
+            groupedColumns.AddRange(fields);
             var result = new List<QuerySeries>();
             foreach (var group in grouped)
             {
@@ -1396,12 +1453,11 @@ public sealed class QueryExecutor
                 {
                     Name = resultMeasurement,
                     Tags = groupTagDict,
-                    Columns = columns,
-                    Values = group.Select(r => r.Row).ToList(),
-                    TagColumns = new HashSet<string>(tagKeys, StringComparer.Ordinal)
+                    Columns = groupedColumns,
+                    Values = group.Select(r => r.Row.Skip(1 + tagKeys.Count).ToList()).ToList()
                 });
             }
-            return result;
+            return ApplySeriesWindow(result, q.SeriesOffset, q.SeriesLimit);
         }
 
         return
@@ -1466,6 +1522,7 @@ public sealed class QueryExecutor
         HashSet<string>? requestedFields, HashSet<string>? seriesFilter, CancellationToken cancellationToken,
         QueryExecutionReport report, string resultMeasurement)
     {
+        if (HasUnresolvedTagPredicates(q, seriesFilter)) return null;
         var items = q.Select.Where(x => x.Func != "").ToList();
         var countStar = items.Count > 0 && items.All(i => i.Func == "count" && i.Field == "*");
         if (!string.IsNullOrWhiteSpace(q.IntoTarget)
@@ -1554,6 +1611,161 @@ public sealed class QueryExecutor
         report.RowsReturned = result.Sum(s => s.Values.Count);
         report.PeakEstimatedMemoryBytes = Math.Max(report.PeakEstimatedMemoryBytes, EstimateQuerySeriesBytes(result));
         return result;
+    }
+
+    /// <summary>
+    /// Expands COUNT(*) into one COUNT(field) per measurement field, matching InfluxDB 1.x
+    /// semantics. Every execution path (metadata pushdown, streaming aggregate, grouped rows)
+    /// then sees the same select items instead of one path emitting a single count column.
+    /// </summary>
+    static ParsedQuery ExpandCountStar(TsdbEngine e, string db, ParsedQuery q)
+    {
+        if (q.Select.Count == 0 || !q.Select.Any(s => s.Func == "count" && s.Field == "*"))
+            return q;
+        if (string.IsNullOrWhiteSpace(q.Measurement))
+            return q;
+
+        var fields = e.Schema.GetFields(db, q.Measurement)
+            .Select(field => field.FieldKey)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+        if (fields.Count == 0)
+            return q;
+
+        var expanded = new List<SelectItem>(q.Select.Count);
+        foreach (var item in q.Select)
+        {
+            if (item.Func == "count" && item.Field == "*")
+                expanded.AddRange(fields.Select(field => new SelectItem("count", field, CountStarAlias(field))));
+            else
+                expanded.Add(item);
+        }
+        return q with { Select = expanded };
+    }
+
+    /// <summary>
+    /// Rejects SELECT/GROUP BY combinations this engine cannot evaluate without silently
+    /// changing their meaning (raw fields collapsed into COUNT, mixed aggregate/raw items).
+    /// </summary>
+    static void ValidateSelectSemantics(ParsedQuery q)
+    {
+        if (q.Kind != QueryKind.Select || q.Select.Count == 0)
+            return;
+
+        var distinctCount = q.Select.Count(item => item.IsDistinct);
+        if (distinctCount > 1)
+            throw new InvalidOperationException("DISTINCT() queries must select a single field");
+
+        var hasFunction = q.Select.Any(item => item.Func != "");
+        var hasRawField = q.Select.Any(item => item.Func == "" && !item.IsDistinct);
+        if (hasFunction && hasRawField)
+            throw new InvalidOperationException("mixing aggregate and non-aggregate queries is not supported");
+
+        if (q.GroupByNs.HasValue)
+        {
+            if (distinctCount > 0)
+                throw new InvalidOperationException("DISTINCT() cannot be combined with GROUP BY time()");
+            if (!hasFunction)
+                throw new InvalidOperationException("GROUP BY requires at least one aggregate function");
+        }
+    }
+
+    static bool IsRawSelect(ParsedQuery q) =>
+        q.Select.Count > 0 && q.Select.All(item => item.Func == "");
+
+    /// <summary>
+    /// Raw (non-aggregate) SELECT with GROUP BY tag(s): one series per tag group, tags in
+    /// QuerySeries.Tags and only fields in the column list, matching InfluxDB raw grouping.
+    /// </summary>
+    List<QuerySeries> RawGroupByTags(TsdbEngine e, string db, List<Point> pts, ParsedQuery q, string resultMeasurement)
+    {
+        var tagKeys = new HashSet<string>(ResolveRawTags(e, db, q.Measurement), StringComparer.Ordinal);
+        var isStar = q.Select.Count == 1 && q.Select[0].Field == "*";
+        var columns = new List<string> { "time" };
+        var fields = new List<string>();
+        var distinctColumns = new HashSet<int>();
+
+        if (isStar)
+        {
+            foreach (var field in pts.SelectMany(p => p.Fields.Keys).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal))
+            {
+                if (tagKeys.Contains(field)) continue;
+                fields.Add(field);
+                columns.Add(field);
+            }
+        }
+        else
+        {
+            foreach (var item in q.Select)
+            {
+                if (tagKeys.Contains(item.Field)) continue;
+                fields.Add(item.Field);
+                columns.Add(item.Alias);
+                if (item.IsDistinct) distinctColumns.Add(columns.Count - 1);
+            }
+        }
+
+        var groups = new Dictionary<string, (Dictionary<string, string>? Tags, List<Point> Points)>(StringComparer.Ordinal);
+        foreach (var point in pts)
+        {
+            var key = BuildGroupByTagKey(point.Tags, q.GroupByTags, q.GroupByAllTags);
+            if (!groups.TryGetValue(key, out var entry))
+            {
+                entry = (BuildGroupByTags(key, q.GroupByTags, q.GroupByAllTags), []);
+                groups[key] = entry;
+            }
+            entry.Points.Add(point);
+        }
+
+        var offset = Math.Max(0, q.Offset ?? 0);
+        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        var seriesList = new List<QuerySeries>(groups.Count);
+        foreach (var entry in groups.Values)
+        {
+            var ordered = entry.Points.OrderBy(p => p.TimestampNs).ToList();
+            if (q.Desc) ordered.Reverse();
+
+            var seen = distinctColumns.ToDictionary(index => index, _ => new HashSet<object?>());
+            var values = new List<List<object?>>();
+            var skipped = 0;
+            foreach (var point in ordered)
+            {
+                var row = new List<object?>(columns.Count) { Time(point.TimestampNs) };
+                foreach (var field in fields)
+                    row.Add(point.Fields.TryGetValue(field, out var value) ? value.ToObject() : null);
+
+                var duplicate = false;
+                foreach (var index in distinctColumns)
+                {
+                    if (!seen[index].Add(row[index]))
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+
+                if (skipped < offset)
+                {
+                    skipped++;
+                    continue;
+                }
+                if (values.Count >= rowLimit) break;
+                values.Add(row);
+            }
+
+            if (values.Count == 0) continue;
+            seriesList.Add(new QuerySeries
+            {
+                Name = resultMeasurement,
+                Tags = entry.Tags,
+                Columns = columns,
+                Values = values
+            });
+        }
+
+        return ApplySeriesWindow(seriesList, q.SeriesOffset, q.SeriesLimit);
     }
 
     List<QuerySeries> AggGroupBy(List<Point> pts, ParsedQuery q, CancellationToken cancellationToken, string resultMeasurement)
@@ -1779,7 +1991,7 @@ public sealed class QueryExecutor
         series.Values = OrderRowsByTime(series.Values, q.Desc);
         series.Values = series.Values.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
 
-        return [series];
+        return ApplySeriesWindow([series], q.SeriesOffset, q.SeriesLimit);
     }
 
     private sealed class StreamingAggregateGroup(int itemCount)
@@ -1847,7 +2059,7 @@ public sealed class QueryExecutor
                 var pairs = PairsFor(it.Field);
                 var groupValues = pairs.Select(p => p.Value).ToList();
                 var groupTimestamps = pairs.Select(p => p.TimestampNs).ToList();
-                row.Add(Calc(groupValues, it.Func, it.Param, groupTimestamps, it.UnitNs));
+                row.Add(Calc(groupValues, it.Func, it.Param, groupTimestamps, it.UnitNs, it.IsCountDistinct));
             }
             return [row];
         }
@@ -1894,7 +2106,14 @@ public sealed class QueryExecutor
         return rows;
     }
 
-    static bool IsRowExpandingGroupFunction(SelectItem item) => item.Func is "top" or "bottom" or "sample";
+    static bool IsRowExpandingGroupFunction(SelectItem item) => item.Func is
+        "top" or "bottom" or "sample"
+        or "difference" or "non_negative_difference"
+        or "derivative" or "non_negative_derivative"
+        or "moving_average" or "cumulative_sum" or "integral" or "elapsed"
+        or "abs" or "ceil" or "floor" or "round" or "sqrt"
+        or "exp" or "log" or "log2" or "ln"
+        or "sin" or "cos" or "tan" or "atan2";
 
     HashSet<string>? BuildSeriesFilter(TsdbEngine e, string db, ParsedQuery q, QueryExecutionReport report)
     {
@@ -1939,7 +2158,10 @@ public sealed class QueryExecutor
         foreach (var filter in q.TagFilters)
         {
             var matches = GetMatchingSeries(e, db, q.Measurement, filter, fieldKeys);
-            if (matches == null) continue;
+            // If any predicate cannot be resolved against the series index, the whole filter set
+            // must be evaluated point-by-point. Returning a partial candidate set here would drop
+            // predicates without telling the caller, which produces silently wrong query results.
+            if (matches == null) return null;
             report.UsedSeriesIndexPushdown = true;
             if (filter.Op is TagOp.Regex or TagOp.NotRegex) report.UsedRegexPushdown = true;
 
@@ -1951,6 +2173,13 @@ public sealed class QueryExecutor
 
         return candidates;
     }
+
+    /// <summary>
+    /// True when the query has tag predicates that could not be fully resolved to a series set.
+    /// Fast paths must fall back to the point-by-point filter path in that case.
+    /// </summary>
+    static bool HasUnresolvedTagPredicates(ParsedQuery q, HashSet<string>? seriesFilter) =>
+        seriesFilter == null && (q.TagFilters.Count != 0 || q.HasOrFilters);
 
     /// <summary>
     /// Get matching series for a single tag filter, handling field ambiguity checks.
@@ -2003,34 +2232,51 @@ public sealed class QueryExecutor
         }
     }
 
-    void ExecuteSelectInto(TsdbEngine e, string defaultDb, ParsedQuery q, List<QuerySeries> seriesList)
+    List<QuerySeries> SelectIntoResult(TsdbEngine e, string defaultDb, ParsedQuery q, List<QuerySeries> seriesList, QueryExecutionReport report)
     {
-        var target = ParseIntoTarget(defaultDb, q.IntoTarget!, q.Measurement ?? "result");
+        var written = ExecuteSelectInto(e, defaultDb, q, seriesList);
+        // InfluxDB 1.x reports SELECT ... INTO as a single "result" series with a written count
+        // instead of echoing the source rows.
+        return [new()
+        {
+            Name = "result",
+            Columns = ["time", "written"],
+            Values = [new List<object?> { Time(0), written }]
+        }];
+    }
+
+    int ExecuteSelectInto(TsdbEngine e, string defaultDb, ParsedQuery q, List<QuerySeries> seriesList)
+    {
+        var target = ParseIntoTarget(e, defaultDb, q.IntoTarget!, q.Measurement ?? "result");
         var knownFields = new HashSet<string>(e.ListFieldKeys(q.SourceDatabase ?? defaultDb, q.Measurement).Select(f => f.Field), StringComparer.OrdinalIgnoreCase);
         var points = ConvertSeriesToPoints(target.Measurement, seriesList, q, knownFields);
         if (points.Count == 0)
-            return;
+            return 0;
         e.WriteAsync(target.Database, target.RetentionPolicy, points).GetAwaiter().GetResult();
+        return points.Count;
     }
 
     long EstimateSelectIntoPointBytes(TsdbEngine e, string defaultDb, ParsedQuery q, List<QuerySeries> seriesList)
     {
-        var target = ParseIntoTarget(defaultDb, q.IntoTarget!, q.Measurement ?? "result");
+        var target = ParseIntoTarget(e, defaultDb, q.IntoTarget!, q.Measurement ?? "result");
         var knownFields = new HashSet<string>(e.ListFieldKeys(q.SourceDatabase ?? defaultDb, q.Measurement).Select(f => f.Field), StringComparer.OrdinalIgnoreCase);
         return EstimateConvertedPointBytes(target.Measurement, seriesList, q, knownFields);
     }
 
-    static IntoTarget ParseIntoTarget(string defaultDb, string rawTarget, string fallbackMeasurement)
+    static IntoTarget ParseIntoTarget(TsdbEngine e, string defaultDb, string rawTarget, string fallbackMeasurement)
     {
         var parts = InfluxQlParser.SplitQualifiedIdentifier(rawTarget);
         return parts.Length switch
         {
-            1 => new IntoTarget(defaultDb, "autogen", parts[0]),
-            2 => new IntoTarget(parts[0], "autogen", parts[1]),
+            1 => new IntoTarget(defaultDb, DefaultRpName(e, defaultDb), parts[0]),
+            2 => new IntoTarget(parts[0], DefaultRpName(e, parts[0]), parts[1]),
             3 => new IntoTarget(parts[0], parts[1], parts[2]),
-            _ => new IntoTarget(defaultDb, "autogen", string.IsNullOrWhiteSpace(rawTarget) ? fallbackMeasurement : UnqTarget(rawTarget))
+            _ => new IntoTarget(defaultDb, DefaultRpName(e, defaultDb), string.IsNullOrWhiteSpace(rawTarget) ? fallbackMeasurement : UnqTarget(rawTarget))
         };
     }
+
+    static string DefaultRpName(TsdbEngine e, string db) =>
+        string.IsNullOrWhiteSpace(db) ? "autogen" : e.GetDefaultRpName(db);
 
     static string UnqTarget(string value)
     {
@@ -2543,7 +2789,7 @@ public sealed class QueryExecutor
                     {
                         filledRows.Add(existing);
                         for (int i = 0; i < items.Count; i++)
-                            if (existing.Count > i + 1) prevValues[i] = existing[i + 1];
+                            if (existing.Count > i + 1 && existing[i + 1] != null) prevValues[i] = existing[i + 1];
                         continue;
                     }
                 }
@@ -2553,6 +2799,7 @@ public sealed class QueryExecutor
                     row.Add(q.Fill switch
                     {
                         FillMode.Zero => 0,
+                        FillMode.Number => q.FillValue,
                         FillMode.Previous => prevValues[i],
                         FillMode.Linear => LinearFill(validByCol[i], t),
                         _ => null
@@ -2657,6 +2904,10 @@ public sealed class QueryExecutor
         // Field filters would need value inspection — fall back
         if (q.FieldFilters.Count > 0) return null;
         if (q.HasOrFilters) return null;
+        // A null seriesFilter means BuildSeriesFilter could not resolve every tag predicate (for
+        // example a predicate that is ambiguous with a string field). Never serve cached points
+        // without applying those predicates; fall back to the point-by-point scan instead.
+        if (seriesFilter == null && q.TagFilters.Count > 0) return null;
         // last() path
         var isLastFunc = q.Select.Count > 0 && q.Select.All(s => s.Func == "last");
         if (isLastFunc)
@@ -2666,7 +2917,7 @@ public sealed class QueryExecutor
             return cached;
         }
         // raw "current value" path: SELECT * or SELECT field1,field2 ORDER BY time DESC LIMIT 1
-        var isRawCurrent = q.Select.All(s => string.IsNullOrEmpty(s.Func)) && !q.GroupByNs.HasValue && q.Desc && q.Limit.HasValue && q.Limit.Value == 1 && (q.Offset ?? 0) == 0;
+        var isRawCurrent = q.Select.All(s => string.IsNullOrEmpty(s.Func) && !s.IsDistinct) && !q.GroupByNs.HasValue && q.Desc && q.Limit.HasValue && q.Limit.Value == 1 && (q.Offset ?? 0) == 0;
         if (isRawCurrent)
         {
             var raw = TryServeRawLastViaCache(e, sourceDb, sourceRp, q, seriesFilter, report);
@@ -2708,7 +2959,7 @@ public sealed class QueryExecutor
             // point lacks a requested field, an older point may be the answer, so use the normal
             // scan path instead of returning an incomplete cache result.
             if (q.Select.Any(s => !pt.Fields.ContainsKey(s.Field))) return null;
-            if (e.Tombstones.HasTombstones(db) && e.Tombstones.FilterDeleted(db, [pt]).Count == 0) return null; // tombstoned
+            if (e.Tombstones.HasTombstones(db) && e.Tombstones.FilterDeleted(db, [pt], rp).Count == 0) return null; // tombstoned
             cachedPoints.Add(pt);
         }
         // verify requested fields exist in at least one cached point, else last(field) would be null correctly but we can still answer (empty)
@@ -2768,32 +3019,47 @@ public sealed class QueryExecutor
             }
             if (q.MinTimeNs.HasValue && pt.TimestampNs < q.MinTimeNs.Value) return null;
             if (q.MaxTimeNs.HasValue && pt.TimestampNs > q.MaxTimeNs.Value) return null;
-            if (e.Tombstones.HasTombstones(db) && e.Tombstones.FilterDeleted(db, [pt]).Count == 0) return null;
+            if (e.Tombstones.HasTombstones(db) && e.Tombstones.FilterDeleted(db, [pt], rp).Count == 0) return null;
             cachedPoints.Add(pt);
         }
         var resultMeasurement = ResolveResultMeasurementName(q);
-        var requestedFields = (q.Select.Count == 1 && q.Select[0].Field == "*") ? null : new HashSet<string>(q.Select.Select(s => s.Field), StringComparer.Ordinal);
-        // Determine fields to expose in raw result
-        List<string> fields;
-        if (requestedFields == null)
-            fields = cachedPoints.SelectMany(p => p.Fields.Keys).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
-        else
-            fields = requestedFields.Order(StringComparer.Ordinal).ToList();
+        var isStar = q.Select.Count == 1 && q.Select[0].Field == "*";
+        var requestedFields = isStar ? null : new HashSet<string>(q.Select.Select(s => s.Field), StringComparer.Ordinal);
+        // Mirror the full-scan raw schema exactly: tag keys become columns, fields follow the
+        // SELECT alias, and a * query expands to the measurement's field keys.
+        var fieldList = ResolveRawFields(e, db, q, requestedFields);
+        if (isStar && fieldList.Count == 0)
+            fieldList = cachedPoints.SelectMany(p => p.Fields.Keys).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
+        var fieldColumns = isStar ? new List<string>(fieldList) : q.Select.Select(s => s.Alias).ToList();
+        var tagKeys = ResolveRawTags(e, db, measurement);
+        for (var i = fieldList.Count - 1; i >= 0; i--)
+        {
+            if (!tagKeys.Contains(fieldList[i], StringComparer.Ordinal)) continue;
+            fieldList.RemoveAt(i);
+            fieldColumns.RemoveAt(i);
+        }
+
         // GROUP BY handling for raw current value
         if (q.GroupByTags.Count == 0 && !q.GroupByAllTags)
         {
             // global raw last — single most recent point among cached
             var latest = cachedPoints.OrderByDescending(p => p.TimestampNs).FirstOrDefault();
             if (latest == null) return [new() { Name = resultMeasurement, Columns = ["time"], Values = [] }];
-            // if multiple series share same max timestamp we pick latest by tag ordering to be deterministic
             var cols = new List<string> { "time" };
-            // include tag keys in raw columns per InfluxQL raw descending path — we expose tags in series Tags, not columns for simplicity, but also include as column if query expects
-            // For SELECT * raw, columns are time + field keys; tags are in QuerySeries.Tags
-            cols.AddRange(fields);
-            var tagsDict = latest.Tags;
-            var row = new List<object?> { Time(latest.TimestampNs) };
-            foreach (var f in fields) row.Add(latest.Fields.TryGetValue(f, out var fv) ? fv.ToObject() : null);
-            return [new QuerySeries { Name = resultMeasurement, Tags = tagsDict.Count > 0 ? new Dictionary<string,string>(tagsDict, StringComparer.Ordinal) : null, Columns = cols, Values = [row] }];
+            cols.AddRange(tagKeys);
+            cols.AddRange(fieldColumns);
+            var row = new List<object?>(cols.Count) { Time(latest.TimestampNs) };
+            foreach (var tag in tagKeys)
+                row.Add(latest.Tags.TryGetValue(tag, out var tagValue) ? tagValue : null);
+            foreach (var field in fieldList)
+                row.Add(latest.Fields.TryGetValue(field, out var fv) ? fv.ToObject() : null);
+            return ApplySeriesWindow([new QuerySeries
+            {
+                Name = resultMeasurement,
+                Columns = cols,
+                Values = [row],
+                TagColumns = new HashSet<string>(tagKeys, StringComparer.Ordinal)
+            }], q.SeriesOffset, q.SeriesLimit);
         }
         var grouped = GroupPointsByTag(cachedPoints, q.GroupByTags, q.GroupByAllTags);
         var result = new List<QuerySeries>(grouped.Count);
@@ -2801,13 +3067,13 @@ public sealed class QueryExecutor
         {
             var latest = kv.Value.OrderByDescending(p => p.TimestampNs).First();
             var cols = new List<string> { "time" };
-            cols.AddRange(fields);
-            var row = new List<object?> { Time(latest.TimestampNs) };
-            foreach (var f in fields) row.Add(latest.Fields.TryGetValue(f, out var fv) ? fv.ToObject() : null);
+            cols.AddRange(fieldColumns);
+            var row = new List<object?>(cols.Count) { Time(latest.TimestampNs) };
+            foreach (var field in fieldList) row.Add(latest.Fields.TryGetValue(field, out var fv) ? fv.ToObject() : null);
             result.Add(new QuerySeries { Name = resultMeasurement, Tags = kv.Key.Count > 0 ? kv.Key : null, Columns = cols, Values = [row] });
         }
         result.Sort((a, b) => string.Compare(string.Join(",", (a.Tags ?? new()).OrderBy(k => k.Key).Select(k => k.Key + "=" + k.Value)), string.Join(",", (b.Tags ?? new()).OrderBy(k => k.Key).Select(k => k.Key + "=" + k.Value)), StringComparison.Ordinal));
-        return result;
+        return ApplySeriesWindow(result, q.SeriesOffset, q.SeriesLimit);
     }
 
     static Dictionary<Dictionary<string,string>, List<Point>> GroupPointsByTag(List<Point> points, List<string> groupByTags, bool groupByAllTags)
@@ -2891,7 +3157,7 @@ public sealed class QueryExecutor
         rows = rows.Skip(q.Offset ?? 0).Take(Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows)).ToList();
         EnsureWithinLimit(rows.Count);
         series.Values = rows;
-        return [series];
+        return ApplySeriesWindow([series], q.SeriesOffset, q.SeriesLimit);
     }
 
     static List<List<object?>> BuildFunctionRows(List<Point> pts, List<SelectItem> items, CancellationToken cancellationToken)
@@ -3036,7 +3302,8 @@ public sealed class QueryExecutor
                 AddSampledValues(result, values, item.Param);
                 break;
             case "elapsed":
-                for (int i = 1; i < values.Count; i++) result[values[i].TimestampNs] = (values[i].TimestampNs - values[i - 1].TimestampNs) / 1_000_000_000.0;
+                var elapsedUnitNs = item.UnitNs ?? 1_000_000_000L;
+                for (int i = 1; i < values.Count; i++) result[values[i].TimestampNs] = (values[i].TimestampNs - values[i - 1].TimestampNs) / (double)elapsedUnitNs;
                 break;
             default:
                 var pairs = BuildValuePairs(pts, item.Field);
@@ -3160,12 +3427,14 @@ public sealed class QueryExecutor
         }
     }
 
-    static void CancelQuery(long id)
+    static bool CancelQuery(long id)
     {
         CancellationTokenSource? cancellation;
         lock (_activeQueriesLock)
             cancellation = _activeQueries.GetValueOrDefault(id)?.Cancellation;
-        cancellation?.Cancel();
+        if (cancellation == null) return false;
+        cancellation.Cancel();
+        return true;
     }
 
     List<QuerySeries>? ShowQueries()
@@ -3191,8 +3460,8 @@ public sealed class QueryExecutor
 
     List<QuerySeries>? KillQueryResult(ParsedQuery q)
     {
-        if (q.KillQueryId.HasValue)
-            CancelQuery(q.KillQueryId.Value);
+        if (q.KillQueryId.HasValue && !CancelQuery(q.KillQueryId.Value))
+            throw new InvalidOperationException($"no such query: {q.KillQueryId.Value}");
         return null;
     }
 
@@ -3281,6 +3550,7 @@ public sealed class QueryExecutor
         CancellationToken cancellationToken,
         QueryExecutionReport report)
     {
+        if (HasUnresolvedTagPredicates(q, seriesFilter)) return null;
         var items = q.Select.Where(s => s.Func != "").ToList();
         if (items.Count == 0) return null;
         if (items.Any(item => item.IsCountDistinct)) return null;
@@ -3345,6 +3615,7 @@ public sealed class QueryExecutor
         CancellationToken cancellationToken,
         QueryExecutionReport report)
     {
+        if (HasUnresolvedTagPredicates(q, seriesFilter)) return null;
         var items = q.Select.Where(s => s.Func != "").ToList();
         if (items.Count == 0) return null;
         if (items.Any(item => item.IsCountDistinct)) return null;
@@ -3392,6 +3663,7 @@ public sealed class QueryExecutor
         QueryExecutionReport report,
         string resultMeasurement)
     {
+        if (HasUnresolvedTagPredicates(q, seriesFilter)) return null;
         if (q.GroupByTags.Count == 0 || q.GroupByNs.HasValue || q.GroupByAllTags)
             return null;
 
@@ -3979,6 +4251,16 @@ public sealed class QueryExecutor
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToList();
+
+    /// <summary>Maps raw field names to their output column names, honoring SELECT ... AS aliases.</summary>
+    static List<string> MapRawColumnNames(ParsedQuery q, List<string> fields)
+    {
+        var aliasByField = q.Select
+            .Where(item => item.Field != "*")
+            .GroupBy(item => item.Field, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First().Alias, StringComparer.Ordinal);
+        return fields.Select(field => aliasByField.TryGetValue(field, out var alias) ? alias : field).ToList();
+    }
 
     int? EffectiveRowLimit(ParsedQuery q)
     {

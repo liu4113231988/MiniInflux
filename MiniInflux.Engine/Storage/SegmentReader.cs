@@ -315,6 +315,16 @@ public static class SegmentReader
             if (tb != null)
                 CacheColumn(path, fileLength, i, timestamps, values: null);
 
+            // The column-level predicate only skips columns that are entirely outside the window;
+            // a column that straddles the window must still have its timestamps trimmed or callers
+            // (for example retention-aware counts) would see points outside the requested range.
+            if (minTimeNs.HasValue || maxTimeNs.HasValue)
+            {
+                var lo = minTimeNs ?? long.MinValue;
+                var hi = maxTimeNs ?? long.MaxValue;
+                timestamps = timestamps.FindAll(ts => ts >= lo && ts <= hi);
+            }
+
             result.Add(new SegmentTimestampColumn(m, tags, f, k, min, max, timestamps));
         }
         return result;

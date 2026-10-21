@@ -136,6 +136,68 @@ public sealed class ConfigurationAndLoggingTests : IDisposable
     }
 
     [Fact]
+    public void MiniInfluxOptions_EnvDataDirOverridesConfiguredDataDir()
+    {
+        var previous = Environment.GetEnvironmentVariable("MINI_INFLUX_DATA");
+        try
+        {
+            Environment.SetEnvironmentVariable("MINI_INFLUX_DATA", "./env-data");
+
+            var settings = new Dictionary<string, string?>
+            {
+                ["Data:Dir"] = "./config-data",
+                ["MiniInflux:DataPath"] = "./legacy-data"
+            };
+
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(settings)
+                .Build();
+
+            var options = MiniInfluxOptions.Load(configuration);
+
+            Assert.Equal("./env-data", options.DataPath);
+            Assert.Equal("./env-data", options.Data.Dir);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("MINI_INFLUX_DATA", previous);
+        }
+    }
+
+    [Fact]
+    public void MiniInfluxOptions_FallsBackToDataDirThenLegacyDataPath()
+    {
+        var previous = Environment.GetEnvironmentVariable("MINI_INFLUX_DATA");
+        try
+        {
+            Environment.SetEnvironmentVariable("MINI_INFLUX_DATA", null);
+
+            var withDataDir = MiniInfluxOptions.Load(new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Data:Dir"] = "./config-data",
+                    ["MiniInflux:DataPath"] = "./legacy-data"
+                })
+                .Build());
+
+            Assert.Equal("./config-data", withDataDir.DataPath);
+
+            var legacyOnly = MiniInfluxOptions.Load(new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["MiniInflux:DataPath"] = "./legacy-data"
+                })
+                .Build());
+
+            Assert.Equal("./legacy-data", legacyOnly.DataPath);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("MINI_INFLUX_DATA", previous);
+        }
+    }
+
+    [Fact]
     public void HttpLoggingSupport_HonorsWriteSuppression_AndStatusFilters()
     {
         var options = new HttpOptions

@@ -65,7 +65,8 @@ public class HighPriorityFixTests : IDisposable
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
         engine.CreateDatabase("testdb");
         engine.Meta.CreateRetentionPolicy("testdb", "one_week", 7 * 86_400_000_000_000L, isDefault: true);
-        await engine.WriteAsync("testdb", "one_week", [Point("cpu", "value", 1.5, "server01", 1)]);
+        var nowSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        await engine.WriteAsync("testdb", "one_week", [Point("cpu", "value", 1.5, "server01", nowSeconds)]);
 
         var response = await new QueryExecutor().ExecuteAsync(engine, "testdb", "SELECT value FROM cpu");
 

@@ -17,9 +17,11 @@ public sealed class MiniInfluxOptions
 
     public static MiniInfluxOptions Load(IConfiguration config)
     {
-        var dataDir = ReadString(config, "Data:Dir")
+        // Explicit environment override wins over appsettings.json (Docker deployments set
+        // MINI_INFLUX_DATA), then configuration, then the conventional ./data default.
+        var dataDir = Environment.GetEnvironmentVariable("MINI_INFLUX_DATA")
+            ?? ReadString(config, "Data:Dir")
             ?? config["MiniInflux:DataPath"]
-            ?? Environment.GetEnvironmentVariable("MINI_INFLUX_DATA")
             ?? "./data";
 
         var httpEnabled = ReadBool(config, true, "Http:Enabled");

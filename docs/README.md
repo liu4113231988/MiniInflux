@@ -201,19 +201,24 @@ miniinfluxctl inspect manifest --data ./data
     "WriteTracing": false
   },
   "Auth": {
-    "Enabled": true,
+    "Enabled": false,
     "Username": "admin",
-    "Password": "replace-with-a-strong-password",
+    "Password": "",
     "AuditFailures": true,
+    "AllowQueryCredentials": false,
+    "TrustedProxyAddresses": [],
     "MaxFailedAttempts": 5,
     "FailureWindowMs": 60000,
     "LockoutMs": 300000
   },
   "Logging": {
     "Level": "Information",
+    "SystemLevel": "Warning",
     "ConsoleEnabled": true,
     "FileEnabled": false,
-    "FilePath": "./logs/miniinflux.log"
+    "FilePath": "./logs/miniinflux.log",
+    "FileMaxBytes": 10485760,
+    "FileRetainedFileCount": 5
   },
   "ContinuousQuery": {
     "Enabled": true,
@@ -238,12 +243,19 @@ miniinfluxctl inspect manifest --data ./data
     "MaxFieldsPerMeasurement": 1024,
     "MaxResponseRows": 100000,
     "MaxQueryPoints": 1000000,
-    "MaxQueryDurationMs": 0,
     "MaxBufferPoints": 1000000,
+    "MaxQueryDurationMs": 30000,
+    "MaxConcurrentQueries": 0,
     "MaxBufferBytes": 0,
     "MaxQueryMemoryBytes": 536870912,
+    "MinFreeDiskBytes": 1073741824,
+    "LastValueCacheMaxEntries": 1000000,
     "FlushColdDurationMs": 600000,
-    "CompactionTargetBytes": 536870912
+    "CompactionTargetBytes": 536870912,
+    "MaxSegmentFileBytes": 536870912,
+    "MinSegmentFileBytes": 0,
+    "MinSegmentFillRatio": 0.5,
+    "CompactionMaxWriteBytesPerSecond": 0
   },
   "Tls": {
     "Enabled": false,
@@ -262,7 +274,7 @@ miniinfluxctl inspect manifest --data ./data
 
 设计参考了 InfluxDB 官方配置/日志项思路，但当前只实现了与 MiniInflux 现阶段能力匹配的子集：
 
-- `Data.Dir`：数据目录，优先于旧版 `MiniInflux:DataPath`
+- `Data.Dir`：数据目录；优先级为 `MINI_INFLUX_DATA` 环境变量 > `Data:Dir` > 旧版 `MiniInflux:DataPath` > `./data`
 - `Data.QueryLogEnabled`：是否记录查询语句
 - `Data.BackupDir`：在线管理接口允许使用的备份根目录；留空时禁用在线备份与恢复
 - `Http.Enabled`：是否启用 HTTP 服务；关闭后仍可使用管理 CLI
@@ -283,6 +295,7 @@ miniinfluxctl inspect manifest --data ./data
 - `Http.AccessLogStatusFilters`：按状态码筛选访问日志，例如 `["4xx","5xx","503"]`
 - `Http.WriteTracing`：记录 `/write` 原始请求体，便于排障，默认应关闭
 - `Logging.Level`：应用日志级别，支持 `Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`
+- `Logging.SystemLevel`：框架/系统日志级别，默认为 `Warning`，用于压制 ASP.NET Core 等框架日志噪声
 - `Logging.ConsoleEnabled`：是否输出到控制台
 - `Logging.FileEnabled`：是否输出到文件
 - `Logging.FilePath`：应用日志文件路径
@@ -294,6 +307,13 @@ miniinfluxctl inspect manifest --data ./data
 - `ContinuousQuery.RecomputeRecentBuckets`：每轮额外重算最近多少个已关闭 bucket，默认 `0` 关闭
 - `ContinuousQuery.InitialBackfillDuration`：当 CQ 未显式声明 `RESAMPLE FOR` 时，首次创建或长时间停机恢复后默认允许补跑的窗口
 - `Storage.MinFreeDiskBytes`：健康检查要求的数据卷最小剩余空间；Production 必须设置为非零值
+- `Storage.MaxQueryDurationMs`：单次查询的时间上限（毫秒）；`0` 表示不限制。仓库默认配置为 `30000`，未配置时的代码默认值为 `10000`
+- `Storage.MaxConcurrentQueries`：同时执行的查询数量上限；`0` 表示不限制
+- `Storage.MaxSegmentFileBytes`：单个 segment 文件的目标大小上限，默认 512 MiB
+- `Storage.MinSegmentFileBytes`：参与分层压缩的 segment 文件最小字节数；`0` 表示不限制
+- `Storage.MinSegmentFillRatio`：分层压缩允许的最小填充率，低于该比例的 segment 不参与合并；默认 `0.5`
+- `Storage.CompactionMaxWriteBytesPerSecond`：分层压缩的写入限速（字节/秒）；`0` 表示不限速
+- `Storage.LastValueCacheMaxEntries`：last-value 缓存的最大条目数
 - `Storage.FlushColdDurationMs`：低于 `FlushThreshold` 的缓冲数据连续无写入多久后生成 segment；默认 10 分钟，期间数据已由 WAL 持久化且查询可见
 - `Storage.CompactionTargetBytes`：分层压缩每批目标大小；默认 512 MiB，用于减少小 segment 数量，并受单个 shard 实际数据量限制
 - `Wal.Fsync`：启用 WAL 定时刷盘。写入确认不等待 fsync；小记录可能仍在 FileStream 的进程缓冲中，因此进程崩溃也可能丢失已确认写入，断电/系统崩溃还可能丢失操作系统缓存中的数据。本实现不提供 durable ACK；缩短周期只能减少通常的暴露时间，不能保证每次确认已持久化。
@@ -320,13 +340,12 @@ MiniInflux 使用配置驱动的单一超级管理员模型，不维护数据库
 }
 ```
 
-启用后，`/write`、`/query`、诊断接口和 `/admin` 管理台均使用同一账号认证。默认只支持 HTTP Basic：
+启用后，`/write`、`/query`、诊断接口和 `/admin` 管理台均使用同一账号认证。支持两种凭据形式：
 
-```bash
-curl -u admin:replace-with-a-strong-password \
-  "http://localhost:8086/query?q=SHOW%20DATABASES"
+- HTTP Basic（超级管理员账号）：`curl -u admin:replace-with-a-strong-password "http://localhost:8086/query?q=SHOW%20DATABASES"`
+- 命名 token（`Authorization: Bearer <token>` 或 `Authorization: Token <token>`）：通过 `POST /admin/api/tokens` 创建，可指定权限分级 `all`（默认）/`read`/`write`；`read` 仅可查询与只读管理，`write` 仅可写入。存量 token 缺省按 `all` 处理
 
-```
+`/ping` 与 `/health` 不要求认证：启用认证后 `/health` 只返回 `ready`/`unhealthy` 与 `pass`/`fail`，不再暴露失败组件名、失败次数与失败时间；未启用认证时返回完整诊断信息。
 
 若必须兼容旧客户端，可显式配置 `Auth.AllowQueryCredentials=true`；此模式会增加 URL 泄露风险，不建议在生产环境使用。
 

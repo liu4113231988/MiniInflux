@@ -339,7 +339,10 @@ public class P2TodoTests : IDisposable
                 {
                     Enabled = true,
                     CheckIntervalMs = 1000,
-                    MaxCatchUpRunsPerCycle = 4
+                    MaxCatchUpRunsPerCycle = 4,
+                    // Backfill a few buckets so the test does not depend on the wall clock not
+                    // crossing a second boundary between writing data and running the query.
+                    InitialBackfillDurationNs = 4_000_000_000L
                 }
             },
             new MetricsCollector(engine),
@@ -347,7 +350,7 @@ public class P2TodoTests : IDisposable
 
         var executed = await runner.ExecuteDueQueriesAsync();
 
-        Assert.Equal(1, executed);
+        Assert.True(executed >= 1, $"expected at least one executed bucket, got {executed}");
         var rollup = Assert.Single(engine.ReadAllPoints("testdb", "autogen", "cpu_rollup", null, null));
         Assert.Equal("server01", rollup.Tags["host"]);
         Assert.Equal("cn", rollup.Tags["region"]);

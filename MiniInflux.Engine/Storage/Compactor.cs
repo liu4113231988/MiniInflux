@@ -36,6 +36,7 @@ public sealed class Compactor
     private long _totalTasks;
     private long _totalSegmentsMerged;
     private int _running;
+    private int _paused;
     private int _queuedTasks;
     private DateTimeOffset? _lastRunUtc;
 
@@ -68,10 +69,13 @@ public sealed class Compactor
 
     public int CompactAll()
     {
+        if (Volatile.Read(ref _paused) == 1) return 0;
         if (!Monitor.TryEnter(_compactionLock)) return 0;
         Interlocked.Exchange(ref _running, 1);
         try
         {
+            // A backup may have paused compaction while this thread waited for the lock.
+            if (Volatile.Read(ref _paused) == 1) return 0;
             int merged = 0;
             for (int pass = 0; pass < _maxPassesPerRun; pass++)
             {
@@ -83,10 +87,20 @@ public sealed class Compactor
                 int mergedThisPass = 0;
                 foreach (var task in tasks)
                 {
-                    if (CompactShard(task.Db, task.Rp, task.Shard, task.Level, task.Files))
+                    try
                     {
-                        merged++;
-                        mergedThisPass++;
+                        if (CompactShard(task.Db, task.Rp, task.Shard, task.Level, task.Files))
+                        {
+                            merged++;
+                            mergedThisPass++;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // A failed task must not take the whole run down, and its partially written
+                        // outputs must not survive to be adopted as real segments on restart.
+                        _health?.RecordFailure("compaction_task", ex);
+                        CleanupOrphanOutputs(task.Db, task.Rp, task.Shard.Id, task.Level);
                     }
                 }
 
@@ -106,6 +120,32 @@ public sealed class Compactor
             Interlocked.Exchange(ref _queuedTasks, 0);
             Interlocked.Exchange(ref _running, 0);
             Monitor.Exit(_compactionLock);
+        }
+    }
+
+    /// <summary>
+    /// Prevents new compaction runs and waits (bounded) until the in-flight run releases the
+    /// compaction lock. Used by online backup so segment files referenced by the manifest cannot
+    /// be deleted while the backup copies them.
+    /// </summary>
+    public void Pause() => Interlocked.Exchange(ref _paused, 1);
+
+    public void Resume() => Interlocked.Exchange(ref _paused, 0);
+
+    public bool WaitForIdle(TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            if (Monitor.TryEnter(_compactionLock))
+            {
+                Monitor.Exit(_compactionLock);
+                return true;
+            }
+
+            if (DateTime.UtcNow >= deadline)
+                return false;
+            Thread.Sleep(10);
         }
     }
 
@@ -290,6 +330,20 @@ public sealed class Compactor
             catch (Exception ex) { _health?.RecordFailure("compaction_metadata", ex); return false; }
         }
 
+        // Validate every input column kind before writing any output: a conflict discovered after
+        // the first chunk was written used to leave unregistered l1/l2 files that Recover adopted.
+        try
+        {
+            _schema.ValidateFieldTypes(db, inputMetas
+                .SelectMany(x => x.Metas)
+                .Select(m => (m.Measurement, m.Field, m.Kind)));
+        }
+        catch (FieldConflictException ex)
+        {
+            _health?.RecordFailure("compaction_schema", ex);
+            return false;
+        }
+
         // Legacy v2 files store tags in a synthetic column and need whole-file materialization to
         // normalize; fall back to the original path for them (rare, old data only).
         var hasLegacyTagColumns = inputMetas.Any(x => x.Metas.Any(m =>
@@ -341,7 +395,7 @@ public sealed class Compactor
         var fillFloor = (long)(_maxSegmentFileBytes * _segmentFillRatio);
         var remaining = totalEstimate;
 
-        foreach (var col in MergeColumnsStreaming(db, inputMetas, groups, orderedGroups, retentionCutoffNs))
+        foreach (var col in MergeColumnsStreaming(db, rp, inputMetas, groups, orderedGroups, retentionCutoffNs))
         {
             var colBytes = EstimateColumnBytes(col);
             remaining -= groupEstimate[(col.Measurement, col.TagsCanonical, col.Field)];
@@ -359,7 +413,8 @@ public sealed class Compactor
             WriteMergedChunk(shardDir, outputLevel, nowMs, chunk, mergedPaths);
 
         var finalized = FinalizeCompaction(db, rp, shard.Id, orderedInputs, mergedPaths);
-        if (finalized) TryRetireTombstones(db, rp, shard, orderedInputs, gcFloor, tombstoneVersionAtRead);
+        if (finalized) TryRetireTombstones(db, rp, shard, orderedInputs, mergedPaths, gcFloor, tombstoneVersionAtRead);
+        else CleanupOrphanOutputs(db, rp, shard.Id, outputLevel);
         return finalized;
     }
 
@@ -374,6 +429,7 @@ public sealed class Compactor
     /// </summary>
     private IEnumerable<SegmentColumn> MergeColumnsStreaming(
         string db,
+        string rp,
         List<(string Path, List<SegmentColumnMeta> Metas)> inputMetas,
         Dictionary<(string Meas, string Tags, string Field), List<(int FileIdx, SegmentColumnMeta Meta)>> groups,
         List<(string Meas, string Tags, string Field)> orderedGroups,
@@ -387,18 +443,19 @@ public sealed class Compactor
             foreach (var (_, meta) in groups[group]) batchPoints += meta.PointCount;
             if (batchPoints < CompactionBatchPointBudget) continue;
 
-            foreach (var col in MergeBatch(db, batch, groups, inputMetas, retentionCutoffNs))
+            foreach (var col in MergeBatch(db, rp, batch, groups, inputMetas, retentionCutoffNs))
                 yield return col;
             batch = [];
             batchPoints = 0;
         }
         if (batch.Count > 0)
-            foreach (var col in MergeBatch(db, batch, groups, inputMetas, retentionCutoffNs))
+            foreach (var col in MergeBatch(db, rp, batch, groups, inputMetas, retentionCutoffNs))
                 yield return col;
     }
 
     private IEnumerable<SegmentColumn> MergeBatch(
         string db,
+        string rp,
         List<(string Meas, string Tags, string Field)> batch,
         Dictionary<(string Meas, string Tags, string Field), List<(int FileIdx, SegmentColumnMeta Meta)>> groups,
         List<(string Path, List<SegmentColumnMeta> Metas)> inputMetas,
@@ -434,9 +491,9 @@ public sealed class Compactor
             var filtered = new List<SegmentColumn>(cols.Count);
             foreach (var col in cols)
             {
-                if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime))
+                if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime, rp))
                     continue;
-                var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values);
+                var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values, rp);
                 if (retentionCutoffNs.HasValue)
                     (ts, vals) = ApplyRetentionCutoff(ts, vals, retentionCutoffNs.Value);
                 if (ts.Count == 0) continue;
@@ -518,7 +575,7 @@ public sealed class Compactor
         var rpInfo = _manifest.GetRp(db, rp);
         if (rpInfo == null || rpInfo.DurationNs <= 0) return null;
         var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
-        return nowNs - rpInfo.DurationNs;
+        return rpInfo.DurationNs >= nowNs ? 0 : nowNs - rpInfo.DurationNs;
     }
 
     /// <summary>Drop timestamps below the retention cutoff (sorted input; binary search the split).</summary>
@@ -564,10 +621,10 @@ public sealed class Compactor
         var filtered = new List<SegmentColumn>();
         foreach (var col in allColumns)
         {
-            if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime))
+            if (_tombstones.IsColumnDeleted(db, col.Measurement, col.TagsCanonical, col.MinTime, col.MaxTime, rp))
                 continue;
 
-            var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values);
+            var (ts, vals) = _tombstones.FilterColumnDeleted(db, col.Measurement, col.TagsCanonical, col.Timestamps, col.Values, rp);
             if (retentionCutoffNs.HasValue)
                 (ts, vals) = ApplyRetentionCutoff(ts, vals, retentionCutoffNs.Value);
             if (ts.Count == 0) continue;
@@ -580,7 +637,8 @@ public sealed class Compactor
         if (filtered.Count == 0)
         {
             var emptied = FinalizeCompaction(db, rp, shard.Id, orderedInputs, []);
-            if (emptied) TryRetireTombstones(db, rp, shard, orderedInputs, gcFloor, tombstoneVersionAtRead);
+            if (emptied) TryRetireTombstones(db, rp, shard, orderedInputs, [], gcFloor, tombstoneVersionAtRead);
+            else CleanupOrphanOutputs(db, rp, shard.Id, outputLevel);
             return emptied;
         }
 
@@ -624,7 +682,8 @@ public sealed class Compactor
             .GroupBy(c => (c.Measurement, c.TagsCanonical))
             .Select(g => (g.Key.Measurement, g.Key.TagsCanonical, ParseTags(g.Key.TagsCanonical))));
         var finalized = FinalizeCompaction(db, rp, shard.Id, orderedInputs, mergedPaths);
-        if (finalized) TryRetireTombstones(db, rp, shard, orderedInputs, gcFloor, tombstoneVersionAtRead);
+        if (finalized) TryRetireTombstones(db, rp, shard, orderedInputs, mergedPaths, gcFloor, tombstoneVersionAtRead);
+        else CleanupOrphanOutputs(db, rp, shard.Id, outputLevel);
         return finalized;
     }
 
@@ -635,10 +694,11 @@ public sealed class Compactor
     /// Coverage at or above the in-flight-flush floor is kept — that data may still land in a
     /// segment written after this task's snapshot was taken.
     /// </summary>
-    private void TryRetireTombstones(string db, string rp, ShardGroupInfo shard, List<FileCandidate> inputs, long gcFloor, long tombstoneVersionAtRead)
+    private void TryRetireTombstones(string db, string rp, ShardGroupInfo shard, List<FileCandidate> inputs,
+        List<string> mergedPaths, long gcFloor, long tombstoneVersionAtRead)
     {
         if (_tombstones.CurrentVersion != tombstoneVersionAtRead) return;
-        if (!FullyRewroteShard(db, rp, shard, inputs)) return;
+        if (!FullyRewroteShard(db, rp, shard, inputs, mergedPaths)) return;
         if (inputs.Any(f => !f.MinTimeNs.HasValue || !f.MaxTimeNs.HasValue)) return;
 
         var rewrittenMin = inputs.Min(f => f.MinTimeNs!.Value);
@@ -646,16 +706,33 @@ public sealed class Compactor
         var retireMax = Math.Min(rewrittenMax, gcFloor - 1);
         if (retireMax < rewrittenMin) return;
 
-        _tombstones.RemoveCoveredRange(db, rewrittenMin, retireMax);
+        _tombstones.RemoveCoveredRange(db, rewrittenMin, retireMax, rp);
     }
 
-    private bool FullyRewroteShard(string db, string rp, ShardGroupInfo shard, List<FileCandidate> inputs)
+    private bool FullyRewroteShard(string db, string rp, ShardGroupInfo shard, List<FileCandidate> inputs, List<string> mergedPaths)
     {
         var inputPaths = new HashSet<string>(inputs.Select(f => f.Path), StringComparer.OrdinalIgnoreCase);
+        var ownOutputs = new HashSet<string>(mergedPaths, StringComparer.OrdinalIgnoreCase);
         var shardDir = _shardManager.ShardDir(db, rp, shard.Id);
-        return shard.SegmentFiles
-            .Select(name => Path.Combine(shardDir, name))
-            .All(path => !File.Exists(path) || inputPaths.Contains(path));
+
+        // Re-read the manifest: a flush that registered a segment after this task's snapshot was
+        // taken may contain data written after the rewrite, so it must block tombstone retirement.
+        var current = _manifest.GetShards(db, rp).FirstOrDefault(s => s.Id == shard.Id);
+        if (current == null) return false;
+
+        foreach (var name in current.SegmentFiles)
+        {
+            var path = Path.Combine(shardDir, name);
+            if (inputPaths.Contains(path) || ownOutputs.Contains(path)) continue;
+            return false;
+        }
+
+        if (!Directory.Exists(shardDir)) return true;
+        foreach (var path in Directory.EnumerateFiles(shardDir, "*.seg"))
+            if (!inputPaths.Contains(path) && !ownOutputs.Contains(path))
+                return false;
+
+        return true;
     }
 
     private static long EstimateColumnBytes(SegmentColumn col)
@@ -720,9 +797,10 @@ public sealed class Compactor
     private bool FinalizeCompaction(string db, string rp, int shardId, List<FileCandidate> sourceFiles, List<string> mergedPaths)
     {
         using var publication = _beginPublish?.Invoke();
+        bool replaced;
         try
         {
-            _manifest.ReplaceSegmentsInShard(
+            replaced = _manifest.ReplaceSegmentsInShard(
                 db,
                 rp,
                 shardId,
@@ -737,6 +815,15 @@ public sealed class Compactor
             return false;
         }
 
+        if (!replaced)
+        {
+            // The shard disappeared (DROP SHARD / DROP RETENTION POLICY). Delete only our outputs;
+            // deleting the inputs here used to destroy data that was never re-registered.
+            foreach (var p in mergedPaths)
+                TryDelete(p);
+            return false;
+        }
+
         _segmentsPublished?.Invoke();
         foreach (var source in sourceFiles)
             TryDelete(source.Path);
@@ -744,6 +831,22 @@ public sealed class Compactor
         Interlocked.Increment(ref _totalTasks);
         Interlocked.Add(ref _totalSegmentsMerged, sourceFiles.Count);
         return true;
+    }
+
+    /// <summary>Deletes output-level files this task wrote but never registered.</summary>
+    private void CleanupOrphanOutputs(string db, string rp, int shardId, int outputLevel)
+    {
+        var shardDir = _shardManager.ShardDir(db, rp, shardId);
+        if (!Directory.Exists(shardDir)) return;
+
+        var registered = new HashSet<string>(
+            (_manifest.GetShards(db, rp).FirstOrDefault(s => s.Id == shardId)?.SegmentFiles ?? [])
+                .Select(name => Path.GetFileName(name)),
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var path in Directory.EnumerateFiles(shardDir, $"l{outputLevel}-*.seg"))
+            if (!registered.Contains(Path.GetFileName(path)))
+                TryDelete(path);
     }
 
     private static int InferLevel(string segmentPath)

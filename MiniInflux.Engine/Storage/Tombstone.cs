@@ -11,6 +11,8 @@ public sealed class Tombstone
 {
     public string Measurement { get; set; } = "";
     public string? TagsCanonical { get; set; } // null = all series in measurement
+    // null = every retention policy (legacy tombstone files without the property also match any RP)
+    public string? RetentionPolicy { get; set; }
     public long? MinTimeNs { get; set; }       // null = from beginning
     public long? MaxTimeNs { get; set; }       // null = to end
     public long CreatedAtNs { get; set; }
@@ -41,13 +43,15 @@ public sealed class TombstoneStore
     /// <summary>
     /// Add a measurement-level delete (all series in measurement within optional time range).
     /// </summary>
-    public void AddMeasurementDelete(string db, string measurement, long? minTime = null, long? maxTime = null)
+    public void AddMeasurementDelete(string db, string measurement, long? minTime = null, long? maxTime = null,
+        string? retentionPolicy = null)
     {
         lock (_lock)
         {
             if (AddLocked(db, new Tombstone
             {
                 Measurement = measurement,
+                RetentionPolicy = retentionPolicy,
                 MinTimeNs = minTime,
                 MaxTimeNs = maxTime,
                 CreatedAtNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000
@@ -63,7 +67,7 @@ public sealed class TombstoneStore
     /// Add a series-level delete (specific tag set within optional time range).
     /// </summary>
     public void AddSeriesDelete(string db, string measurement, string tagsCanonical,
-        long? minTime = null, long? maxTime = null)
+        long? minTime = null, long? maxTime = null, string? retentionPolicy = null)
     {
         lock (_lock)
         {
@@ -71,6 +75,7 @@ public sealed class TombstoneStore
             {
                 Measurement = measurement,
                 TagsCanonical = tagsCanonical,
+                RetentionPolicy = retentionPolicy,
                 MinTimeNs = minTime,
                 MaxTimeNs = maxTime,
                 CreatedAtNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000
@@ -82,7 +87,8 @@ public sealed class TombstoneStore
         }
     }
 
-    public void AddSeriesDeletes(string db, string measurement, IEnumerable<(string TagsCanonical, long? MinTime, long? MaxTime)> deletes)
+    public void AddSeriesDeletes(string db, string measurement, IEnumerable<(string TagsCanonical, long? MinTime, long? MaxTime)> deletes,
+        string? retentionPolicy = null)
     {
         lock (_lock)
         {
@@ -94,6 +100,7 @@ public sealed class TombstoneStore
                 {
                     Measurement = measurement,
                     TagsCanonical = delete.TagsCanonical,
+                    RetentionPolicy = retentionPolicy,
                     MinTimeNs = delete.MinTime,
                     MaxTimeNs = delete.MaxTime,
                     CreatedAtNs = createdAtNs
@@ -113,6 +120,7 @@ public sealed class TombstoneStore
     /// </summary>
     public void DropDatabase(string db)
     {
+        IdentifierValidator.ValidateDatabaseName(db);
         lock (_lock)
         {
             _tombstones.Remove(db);
@@ -127,11 +135,11 @@ public sealed class TombstoneStore
     /// Check if a specific column is fully covered by a tombstone (can be skipped during compaction).
     /// </summary>
     public bool IsColumnDeleted(string db, string measurement, string tagsCanonical,
-        long minTime, long maxTime)
+        long minTime, long maxTime, string? retentionPolicy = null)
     {
         lock (_lock)
         {
-            var ranges = GetMergedRangesLocked(db, measurement, tagsCanonical);
+            var ranges = GetMergedRangesLocked(db, measurement, tagsCanonical, retentionPolicy);
             if (ranges.Count == 0) return false;
 
             // Merged ranges are disjoint and sorted by Min, so the only candidate that can cover
@@ -169,11 +177,12 @@ public sealed class TombstoneStore
     /// Filter a list of timestamps against active tombstones, returning only non-deleted timestamps.
     /// Used by the fast count path which reads timestamps without field values.
     /// </summary>
-    public List<long> FilterTimestampsDeleted(string db, string measurement, string tagsCanonical, List<long> timestamps)
+    public List<long> FilterTimestampsDeleted(string db, string measurement, string tagsCanonical, List<long> timestamps,
+        string? retentionPolicy = null)
     {
         lock (_lock)
         {
-            var ranges = GetMergedRangesLocked(db, measurement, tagsCanonical);
+            var ranges = GetMergedRangesLocked(db, measurement, tagsCanonical, retentionPolicy);
             if (ranges.Count == 0)
                 return timestamps;
 
@@ -197,12 +206,12 @@ public sealed class TombstoneStore
     /// <summary>
     /// Filter points against active tombstones. Returns only non-deleted points.
     /// </summary>
-    public List<Point> FilterDeleted(string db, List<Point> points)
+    public List<Point> FilterDeleted(string db, List<Point> points, string? retentionPolicy = null)
     {
         lock (_lock)
         {
             if (!_tombstones.TryGetValue(db, out var list) || list.Count == 0) return points;
-            return points.Where(p => !IsDeletedLocked(p, list)).ToList();
+            return points.Where(p => !IsDeletedLocked(p, list, retentionPolicy)).ToList();
         }
     }
 
@@ -211,11 +220,11 @@ public sealed class TombstoneStore
     /// </summary>
     public (List<long> Timestamps, List<FieldValue> Values) FilterColumnDeleted(
         string db, string measurement, string tagsCanonical,
-        List<long> timestamps, List<FieldValue> values)
+        List<long> timestamps, List<FieldValue> values, string? retentionPolicy = null)
     {
         lock (_lock)
         {
-            var ranges = GetMergedRangesLocked(db, measurement, tagsCanonical);
+            var ranges = GetMergedRangesLocked(db, measurement, tagsCanonical, retentionPolicy);
             if (ranges.Count == 0)
                 return (timestamps, values);
 
@@ -246,7 +255,7 @@ public sealed class TombstoneStore
     /// on read would be dead weight. Fully covered tombstones are dropped; partially overlapping
     /// ones are split so only the still-unapplied ranges remain.
     /// </summary>
-    public void RemoveCoveredRange(string db, long minNs, long maxNs)
+    public void RemoveCoveredRange(string db, long minNs, long maxNs, string? retentionPolicy = null)
     {
         lock (_lock)
         {
@@ -256,6 +265,9 @@ public sealed class TombstoneStore
             for (var i = list.Count - 1; i >= 0; i--)
             {
                 var t = list[i];
+                // Only retire tombstones whose scope was fully rewritten. A db-wide (null RP)
+                // tombstone still applies to the other retention policies.
+                if (t.RetentionPolicy != retentionPolicy) continue;
                 var tMin = t.MinTimeNs ?? long.MinValue;
                 var tMax = t.MaxTimeNs ?? long.MaxValue;
                 if (tMax < minNs || tMin > maxNs) continue;
@@ -271,6 +283,7 @@ public sealed class TombstoneStore
                     {
                         Measurement = t.Measurement,
                         TagsCanonical = t.TagsCanonical,
+                        RetentionPolicy = t.RetentionPolicy,
                         MinTimeNs = t.MinTimeNs,
                         MaxTimeNs = coveredMin - 1,
                         CreatedAtNs = t.CreatedAtNs
@@ -280,6 +293,7 @@ public sealed class TombstoneStore
                     {
                         Measurement = t.Measurement,
                         TagsCanonical = t.TagsCanonical,
+                        RetentionPolicy = t.RetentionPolicy,
                         MinTimeNs = coveredMax + 1,
                         MaxTimeNs = t.MaxTimeNs,
                         CreatedAtNs = t.CreatedAtNs
@@ -294,20 +308,27 @@ public sealed class TombstoneStore
         }
     }
 
-    private bool IsDeletedLocked(Point p, List<Tombstone> list)
+    private bool IsDeletedLocked(Point p, List<Tombstone> list, string? retentionPolicy)
     {
         var sk = SeriesKey.From(p);
         return list.Any(t =>
             t.Measurement == p.Measurement &&
             (t.TagsCanonical == null || t.TagsCanonical == sk.TagsCanonical) &&
+            (t.RetentionPolicy == null || retentionPolicy == null || t.RetentionPolicy == retentionPolicy) &&
             (!t.MinTimeNs.HasValue || t.MinTimeNs.Value <= p.TimestampNs) &&
             (!t.MaxTimeNs.HasValue || t.MaxTimeNs.Value >= p.TimestampNs));
     }
 
-    private static List<(long Min, long Max)> BuildMergedRanges(List<Tombstone> tombstones, string measurement, string? tagsCanonical)
+    private static bool RpMatches(Tombstone tombstone, string? retentionPolicy) =>
+        tombstone.RetentionPolicy == null || retentionPolicy == null || tombstone.RetentionPolicy == retentionPolicy;
+
+    private static List<(long Min, long Max)> BuildMergedRanges(List<Tombstone> tombstones, string measurement, string? tagsCanonical,
+        string? retentionPolicy)
     {
         var ranges = tombstones
-            .Where(t => t.Measurement == measurement && (t.TagsCanonical == null || t.TagsCanonical == tagsCanonical))
+            .Where(t => t.Measurement == measurement
+                && (t.TagsCanonical == null || t.TagsCanonical == tagsCanonical)
+                && RpMatches(t, retentionPolicy))
             .Select(t => (Min: t.MinTimeNs ?? long.MinValue, Max: t.MaxTimeNs ?? long.MaxValue))
             .OrderBy(t => t.Min)
             .ToList();
@@ -331,7 +352,8 @@ public sealed class TombstoneStore
     /// Merged, sorted, disjoint ranges for one (db, measurement, tags) key, cached until the store
     /// mutates. Building per query per column is the hot read-path cost once deletes exist.
     /// </summary>
-    private List<(long Min, long Max)> GetMergedRangesLocked(string db, string measurement, string tagsCanonical)
+    private List<(long Min, long Max)> GetMergedRangesLocked(string db, string measurement, string tagsCanonical,
+        string? retentionPolicy)
     {
         if (!_tombstones.TryGetValue(db, out var list) || list.Count == 0) return [];
 
@@ -347,10 +369,10 @@ public sealed class TombstoneStore
             byKey = cache.ByKey;
         }
 
-        var key = measurement + "\n" + (tagsCanonical ?? "*");
+        var key = measurement + "\n" + (tagsCanonical ?? "*") + "\n" + (retentionPolicy ?? "*");
         if (byKey.TryGetValue(key, out var ranges)) return ranges;
 
-        ranges = BuildMergedRanges(list, measurement, tagsCanonical);
+        ranges = BuildMergedRanges(list, measurement, tagsCanonical, retentionPolicy);
         byKey[key] = ranges;
         return ranges;
     }
@@ -373,13 +395,16 @@ public sealed class TombstoneStore
 
         if (list.Any(t => t.Measurement == tombstone.Measurement
             && t.TagsCanonical == tombstone.TagsCanonical
+            && RpCovers(t, tombstone)
             && Covers(t, tombstone)))
             return false;
 
         for (var i = list.Count - 1; i >= 0; i--)
         {
             var existing = list[i];
-            if (existing.Measurement != tombstone.Measurement || existing.TagsCanonical != tombstone.TagsCanonical)
+            if (existing.Measurement != tombstone.Measurement
+                || existing.TagsCanonical != tombstone.TagsCanonical
+                || existing.RetentionPolicy != tombstone.RetentionPolicy)
                 continue;
 
             var existingMin = existing.MinTimeNs ?? long.MinValue;
@@ -398,17 +423,22 @@ public sealed class TombstoneStore
         tombstone.MaxTimeNs = max;
         if (tombstone.TagsCanonical != null && list.Any(t => t.Measurement == tombstone.Measurement
             && t.TagsCanonical == null
+            && RpCovers(t, tombstone)
             && Covers(t, tombstone)))
             return false;
 
         if (tombstone.TagsCanonical == null)
             list.RemoveAll(t => t.Measurement == tombstone.Measurement
                 && t.TagsCanonical != null
+                && RpCovers(tombstone, t)
                 && Covers(tombstone, t));
 
         list.Add(tombstone);
         return true;
     }
+
+    private static bool RpCovers(Tombstone cover, Tombstone covered) =>
+        cover.RetentionPolicy == null || cover.RetentionPolicy == covered.RetentionPolicy;
 
     private static bool Covers(Tombstone cover, Tombstone covered) =>
         (cover.MinTimeNs ?? long.MinValue) <= (covered.MinTimeNs ?? long.MinValue)
@@ -438,6 +468,7 @@ public sealed class TombstoneStore
 
     private void Save(string db)
     {
+        IdentifierValidator.ValidateDatabaseName(db);
         if (!_tombstones.TryGetValue(db, out var list)) return;
         Directory.CreateDirectory(_dir);
         var path = Path.Combine(_dir, $"{db}.json");

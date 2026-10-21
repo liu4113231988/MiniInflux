@@ -31,6 +31,19 @@ public sealed class ShardManager
         {
             foreach (var (_, shard) in _manifest.GetAllShards(db))
                 if (shard.Id > max) max = shard.Id;
+
+            // Also consider directories left behind by a catalog that no longer references them;
+            // reusing those ids would make SHOW SHARDS / DROP SHARD ambiguous.
+            var dbDir = Path.Combine(_dataPath, "db", db);
+            if (!Directory.Exists(dbDir)) continue;
+            foreach (var rpDir in Directory.GetDirectories(dbDir))
+            {
+                var shardsDir = Path.Combine(rpDir, "shards");
+                if (!Directory.Exists(shardsDir)) continue;
+                foreach (var shardDir in Directory.GetDirectories(shardsDir))
+                    if (int.TryParse(Path.GetFileName(shardDir), out var id) && id > max)
+                        max = id;
+            }
         }
         _nextShardId = max + 1;
     }
@@ -85,8 +98,12 @@ public sealed class ShardManager
     /// <summary>
     /// Get the shard directory for a given db/rp/shardId.
     /// </summary>
-    public string ShardDir(string db, string rp, int shardId) =>
-        Path.Combine(_dataPath, "db", db, rp, "shards", shardId.ToString("D6"));
+    public string ShardDir(string db, string rp, int shardId)
+    {
+        IdentifierValidator.ValidateDatabaseName(db);
+        IdentifierValidator.ValidateRetentionPolicyName(rp);
+        return Path.Combine(_dataPath, "db", db, rp, "shards", shardId.ToString("D6"));
+    }
 
     /// <summary>
     /// List all segment files across relevant shards for a db/rp, filtered by time range.
@@ -143,10 +160,13 @@ public sealed class ShardManager
     {
         var expired = _manifest.GetExpiredShards(_dataPath, nowNs);
         int count = 0;
-        foreach (var (db, rp, shardId, dir) in expired)
+        foreach (var (db, rp, shardId, _) in expired)
         {
             try
             {
+                // Rebuild the path from validated identifiers instead of trusting the manifest's
+                // serialized path; a tampered catalog must not be able to delete outside the data root.
+                var dir = ShardDir(db, rp, shardId);
                 if (Directory.Exists(dir))
                     Directory.Delete(dir, recursive: true);
                 _manifest.RemoveShardGroup(db, rp, shardId);

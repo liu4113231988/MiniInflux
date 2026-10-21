@@ -16,7 +16,7 @@ public enum QueryKind
 
 public enum TagOp { Eq, Neq, Regex, NotRegex }
 public enum FieldOp { Gt, Gte, Lt, Lte, Eq, Neq }
-public enum FillMode { None, Null, Zero, Previous, Linear }
+public enum FillMode { None, Null, Zero, Previous, Linear, Number }
 
 public sealed record SelectItem(string Func, string Field, string Alias, double Param = 0, long? UnitNs = null)
 {
@@ -49,6 +49,9 @@ public sealed record ParsedQuery
     public List<string> GroupByTags { get; init; } = [];
     public bool GroupByAllTags { get; init; }
     public FillMode Fill { get; init; } = FillMode.None;
+
+    /// <summary>Numeric fill value when <see cref="Fill"/> is <see cref="FillMode.Number"/>.</summary>
+    public double? FillValue { get; init; }
     public string? TagKey { get; init; }
 
     /// <summary>Regex form of WITH KEY =~ /.../ for SHOW TAG VALUES; matches multiple tag keys.</summary>
@@ -119,13 +122,22 @@ public static class InfluxQlParser
         if (q.StartsWith("SHOW MEASUREMENTS", StringComparison.OrdinalIgnoreCase))
             return ParseShowMeasurements(q);
         if (q.StartsWith("SHOW SERIES CARDINALITY", StringComparison.OrdinalIgnoreCase))
+        {
+            RejectCardinalityWhere(q, "SHOW SERIES CARDINALITY");
             return new() { Kind = QueryKind.ShowSeriesCardinality, Measurement = AfterFrom(q) };
+        }
         if (q.StartsWith("SHOW SERIES", StringComparison.OrdinalIgnoreCase))
             return ParseShowSeries(q);
         if (q.StartsWith("SHOW MEASUREMENT CARDINALITY", StringComparison.OrdinalIgnoreCase))
+        {
+            RejectCardinalityWhere(q, "SHOW MEASUREMENT CARDINALITY");
             return new() { Kind = QueryKind.ShowMeasurementCardinality };
+        }
         if (q.StartsWith("SHOW TAG VALUES CARDINALITY", StringComparison.OrdinalIgnoreCase))
+        {
+            RejectCardinalityWhere(q, "SHOW TAG VALUES CARDINALITY");
             return new() { Kind = QueryKind.ShowTagValuesCardinality, Measurement = AfterFrom(q), TagKey = AfterKey(q) };
+        }
         if (q.StartsWith("SHOW FIELD KEYS", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowFieldKeys, Measurement = AfterFrom(q) };
         if (q.StartsWith("SHOW TAG KEYS", StringComparison.OrdinalIgnoreCase))
@@ -133,9 +145,15 @@ public static class InfluxQlParser
         if (q.StartsWith("SHOW TAG VALUES", StringComparison.OrdinalIgnoreCase))
             return ParseShowTagValues(q);
         if (q.StartsWith("SHOW FIELD KEY CARDINALITY", StringComparison.OrdinalIgnoreCase))
+        {
+            RejectCardinalityWhere(q, "SHOW FIELD KEY CARDINALITY");
             return new() { Kind = QueryKind.ShowFieldKeyCardinality, Database = AfterOn(q), Measurement = AfterFrom(q) };
+        }
         if (q.StartsWith("SHOW TAG KEY CARDINALITY", StringComparison.OrdinalIgnoreCase))
+        {
+            RejectCardinalityWhere(q, "SHOW TAG KEY CARDINALITY");
             return new() { Kind = QueryKind.ShowTagKeyCardinality, Database = AfterOn(q), Measurement = AfterFrom(q) };
+        }
         if (q.StartsWith("SHOW SHARD GROUPS", StringComparison.OrdinalIgnoreCase))
             return new() { Kind = QueryKind.ShowShardGroups, Database = AfterOn(q) };
         if (q.StartsWith("SHOW SHARDS", StringComparison.OrdinalIgnoreCase))
@@ -430,10 +448,12 @@ public static class InfluxQlParser
             long? min, max;
             List<FieldFilter> fieldFilters = [];
             ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr, paramFilters);
+            RejectShowFieldFilters(nameof(QueryKind.ShowMeasurements), fieldFilters);
         }
 
         return new() { Kind = QueryKind.ShowMeasurements, MeasurementFilter = measurementFilter, MeasurementFilterIsRegex = measurementFilterIsRegex,
-            ShowTagFilters = tagFilters, TagFilters = tagFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
+            ShowTagFilters = tagFilters, TagFilters = tagFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr,
+            Limit = ParseShowInt(u, " LIMIT "), Offset = ParseShowInt(u, " OFFSET ") };
     }
 
     static ParsedQuery ParseShowSeries(string q)
@@ -453,10 +473,12 @@ public static class InfluxQlParser
             long? min, max;
             List<FieldFilter> fieldFilters = [];
             ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr, paramFilters);
+            RejectShowFieldFilters(nameof(QueryKind.ShowSeries), fieldFilters);
         }
         return new() { Kind = QueryKind.ShowSeries, Measurement = m,
             MeasurementFilter = measurementFilter, MeasurementFilterIsRegex = measurementFilterIsRegex,
-            ShowTagFilters = tagFilters, TagFilters = tagFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
+            ShowTagFilters = tagFilters, TagFilters = tagFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr,
+            Limit = ParseShowInt(u, " LIMIT "), Offset = ParseShowInt(u, " OFFSET ") };
     }
 
     /// <summary>
@@ -499,10 +521,12 @@ public static class InfluxQlParser
             long? min, max;
             List<FieldFilter> fieldFilters = [];
             ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr, paramFilters);
+            RejectShowFieldFilters(nameof(QueryKind.ShowTagKeys), fieldFilters);
         }
         return new() { Kind = QueryKind.ShowTagKeys, Measurement = m,
             MeasurementFilter = measurementFilter, MeasurementFilterIsRegex = measurementFilterIsRegex,
-            ShowTagFilters = tagFilters, TagFilters = tagFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
+            ShowTagFilters = tagFilters, TagFilters = tagFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr,
+            Limit = ParseShowInt(u, " LIMIT "), Offset = ParseShowInt(u, " OFFSET ") };
     }
 
     static ParsedQuery ParseShowTagValues(string q)
@@ -540,10 +564,12 @@ public static class InfluxQlParser
             long? min, max;
             List<FieldFilter> fieldFilters = [];
             ParseWhere(whereClause, out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr, paramFilters);
+            RejectShowFieldFilters(nameof(QueryKind.ShowTagValues), fieldFilters);
         }
 
         return new() { Kind = QueryKind.ShowTagValues, Measurement = m, TagKey = key, TagKeyRegex = keyRegex,
-            ShowTagFilters = tagFilters, TagFilters = tagFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr };
+            ShowTagFilters = tagFilters, TagFilters = tagFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr,
+            Limit = ParseShowInt(u, " LIMIT "), Offset = ParseShowInt(u, " OFFSET ") };
     }
 
     static ParsedQuery ParseSelect(string q)
@@ -594,14 +620,38 @@ public static class InfluxQlParser
         var tagFilters = new List<TagFilter>(); var fieldFilters = new List<FieldFilter>();
         var paramFilters = new List<ParamFilter>();
         var orGroups = new List<List<TagFilter>>(); var hasOr = false;
-        var groupByTags = new List<string>(); var groupByAllTags = false; var fill = FillMode.None;
+        var groupByTags = new List<string>(); var groupByAllTags = false; var fill = FillMode.None; double? fillValue = null;
         int wi = tu.IndexOf(" WHERE ");
         if (wi >= 0) { var end = EndClause(tu, wi + 7); ParseWhere(tail[(wi + 7)..end], out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr, paramFilters); }
         var gu = tu.IndexOf(" GROUP BY ");
         if (gu >= 0) { var gs = gu + 10; var ge = EndClause(tu, gs); ParseGroupBy(tail[gs..ge].Trim(), out gb, groupByTags, out groupByAllTags); }
-        var fu = tu.IndexOf(" FILL(");
-        if (fu >= 0) { var fe = tu.IndexOf(')', fu); if (fe >= 0) { var fv = tail[(fu + 6)..fe].Trim().ToLowerInvariant();
-            fill = fv switch { "null" => FillMode.Null, "0" => FillMode.Zero, "previous" => FillMode.Previous, "linear" => FillMode.Linear, _ => FillMode.None }; } }
+        var fu = IndexOfFill(tu, 0);
+        if (fu >= 0)
+        {
+            var open = tail.IndexOf('(', fu);
+            var close = open >= 0 ? tail.IndexOf(')', open + 1) : -1;
+            if (close > open)
+            {
+                var fv = tail[(open + 1)..close].Trim().ToLowerInvariant();
+                if (double.TryParse(fv, NumberStyles.Any, CultureInfo.InvariantCulture, out var fillNumber))
+                {
+                    fillValue = fillNumber;
+                    fill = fillNumber == 0 ? FillMode.Zero : FillMode.Number;
+                }
+                else
+                {
+                    fill = fv switch
+                    {
+                        "null" => FillMode.Null,
+                        "none" => FillMode.None,
+                        "zero" => FillMode.Zero,
+                        "previous" => FillMode.Previous,
+                        "linear" => FillMode.Linear,
+                        _ => FillMode.None
+                    };
+                }
+            }
+        }
         var lu = tu.LastIndexOf(" LIMIT ");
         if (lu >= 0) limit = int.Parse(tail[(lu + 7)..].Trim().Split(' ')[0], CultureInfo.InvariantCulture);
         var ou = tu.LastIndexOf(" OFFSET ");
@@ -613,7 +663,7 @@ public static class InfluxQlParser
         return new() { Kind = QueryKind.Select, Measurement = measurement, Subquery = subquery, SourceDatabase = sourceDb, SourceRpName = sourceRp, Select = ParseItems(fieldText),
             MinTimeNs = min, MaxTimeNs = max, Limit = limit, Desc = desc, GroupByNs = gb,
             Offset = offset, SeriesLimit = slimit, SeriesOffset = soffset,
-            GroupByTags = groupByTags, GroupByAllTags = groupByAllTags, Fill = fill, TagFilters = tagFilters, FieldFilters = fieldFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr, IntoTarget = intoTarget };
+            GroupByTags = groupByTags, GroupByAllTags = groupByAllTags, Fill = fill, FillValue = fillValue, TagFilters = tagFilters, FieldFilters = fieldFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr, IntoTarget = intoTarget };
     }
 
     static void ParseGroupBy(string text, out long? gbNs, List<string> tags, out bool groupByAllTags)
@@ -818,7 +868,47 @@ public static class InfluxQlParser
     }
 
     static string ExtractRegex(string s) { s = s.Trim(); return s.Length >= 2 && s[0] == '/' && s[^1] == '/' ? s[1..^1] : s; }
-    static int EndClause(string u, int st) => new[] { u.IndexOf(" GROUP BY ", st), u.IndexOf(" ORDER BY ", st), u.IndexOf(" LIMIT ", st), u.IndexOf(" OFFSET ", st), u.IndexOf(" SLIMIT ", st), u.IndexOf(" SOFFSET ", st), u.IndexOf(" FILL(", st) }.Where(x => x >= 0).DefaultIfEmpty(u.Length).Min();
+    static int EndClause(string u, int st) => new[] { u.IndexOf(" GROUP BY ", st), u.IndexOf(" ORDER BY ", st), u.IndexOf(" LIMIT ", st), u.IndexOf(" OFFSET ", st), u.IndexOf(" SLIMIT ", st), u.IndexOf(" SOFFSET ", st), IndexOfFill(u, st) }.Where(x => x >= 0).DefaultIfEmpty(u.Length).Min();
+
+    /// <summary>Locates a FILL clause, accepting both FILL( and FILL ( with whitespace.</summary>
+    static int IndexOfFill(string upper, int start)
+    {
+        var index = start;
+        while (index < upper.Length)
+        {
+            index = upper.IndexOf(" FILL", index, StringComparison.Ordinal);
+            if (index < 0) return -1;
+            var next = index + 5;
+            while (next < upper.Length && char.IsWhiteSpace(upper[next])) next++;
+            if (next < upper.Length && upper[next] == '(') return index;
+            index += 5;
+        }
+        return -1;
+    }
+
+    /// <summary>Reads an integer LIMIT/OFFSET value from a SHOW statement.</summary>
+    static int? ParseShowInt(string upper, string keyword)
+    {
+        var index = upper.LastIndexOf(keyword, StringComparison.Ordinal);
+        if (index < 0) return null;
+        var rest = upper[(index + keyword.Length)..].TrimStart();
+        var length = 0;
+        while (length < rest.Length && char.IsDigit(rest[length])) length++;
+        return int.TryParse(rest[..length], NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
+    }
+
+    static void RejectShowFieldFilters(string statement, List<FieldFilter> fieldFilters)
+    {
+        if (fieldFilters.Count > 0)
+            throw new NotSupportedException($"{statement} WHERE supports tag predicates only");
+    }
+
+    static void RejectCardinalityWhere(string q, string statement)
+    {
+        if (q.ToUpperInvariant().Contains(" WHERE ", StringComparison.Ordinal))
+            throw new NotSupportedException($"WHERE is not supported in {statement}");
+    }
+
     static List<SelectItem> ParseItems(string s)
     {
         if (s == "*") return [new("", "*", "*")];

@@ -465,6 +465,90 @@ public sealed class P2ManagementCliTests : IDisposable
     }
 
     [Fact]
+    public async Task Compact_DryRun_NoticeGoesToStdout_NotStderr()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 1, "server01", 1)]);
+            engine.FlushAll();
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["compact", "--data", dataPath, "--dry-run"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.Equal(0, exitCode);
+        // The dry-run cost notice belongs on stdout so stderr stays reserved for failures.
+        Assert.Contains("dry_run_notice=", stdout.ToString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task Compact_DryRun_JsonStaysValidAndCarriesNotice()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 1, "server01", 1)]);
+            engine.FlushAll();
+        }
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["compact", "--data", dataPath, "--dry-run", "--format", "json"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        using var json = JsonDocument.Parse(stdout.ToString());
+        Assert.Equal(0, exitCode);
+        Assert.False(string.IsNullOrWhiteSpace(json.RootElement.GetProperty("DryRunNotice").GetString()));
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public void UnknownOption_FailsWithNonZeroExitCode()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        Directory.CreateDirectory(dataPath);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["inspect", "manifest", "--dat", dataPath],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.NotEqual(0, exitCode);
+        Assert.Contains("unknown option", stderr.ToString());
+    }
+
+    [Fact]
+    public void Benchmark_RejectsNonPositivePoints()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        Directory.CreateDirectory(dataPath);
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["benchmark", "--data", dataPath, "--points", "0"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        Assert.NotEqual(0, exitCode);
+        Assert.Contains("--points", stderr.ToString());
+    }
+
+    [Fact]
     public async Task ValidateDataDir_ReportsHealthyDirectory()
     {
         var dataPath = Path.Combine(_testDir, "data");

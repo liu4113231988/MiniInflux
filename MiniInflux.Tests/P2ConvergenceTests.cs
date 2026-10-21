@@ -197,4 +197,24 @@ public class P2ConvergenceTests : IDisposable
         using var reader = new StreamReader(decompressed, Encoding.UTF8);
         Assert.Equal(payload, reader.ReadToEnd());
     }
+
+    [Fact]
+    public void Gzip_NoBody_RetractsContentEncodingHeader()
+    {
+        var (context, response) = NewContext("/query", "gzip");
+        var underlying = new MemoryStream();
+        response.Body = underlying;
+
+        using (var gzip = ResponseCompressionSupport.TryWrap(context.Request, response))
+        {
+            Assert.NotNull(gzip);
+            // The encoding is advertised eagerly...
+            Assert.Equal("gzip", response.Headers.ContentEncoding.ToString());
+            // ...but the endpoint writes nothing.
+        }
+
+        // An empty body must not claim a gzip encoding it does not have.
+        Assert.Equal(0, response.Headers.ContentEncoding.Count);
+        Assert.Equal(0, underlying.Length);
+    }
 }

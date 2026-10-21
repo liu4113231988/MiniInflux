@@ -108,6 +108,41 @@ public sealed class SchemaRegistry
     }
 
     /// <summary>
+    /// Validates field kinds from segment metadata and registers them. Used by compaction before
+    /// any output file is written so a late conflict cannot leave unregistered orphan segments.
+    /// </summary>
+    public void ValidateFieldTypes(string db, IEnumerable<(string Measurement, string Field, FieldKind Kind)> fields)
+    {
+        var byMeasurement = new Dictionary<string, Dictionary<string, FieldKind>>(StringComparer.Ordinal);
+        foreach (var (measurement, field, kind) in fields)
+        {
+            if (!byMeasurement.TryGetValue(measurement, out var map))
+            {
+                map = new(StringComparer.Ordinal);
+                byMeasurement[measurement] = map;
+            }
+
+            if (map.TryGetValue(field, out var existing) && existing != kind)
+                throw new FieldConflictException(
+                    $"field type conflict: {measurement}.{field} is {existing}, got {kind}");
+            map[field] = kind;
+        }
+
+        lock (_lock)
+        {
+            var changed = false;
+            foreach (var (measurement, map) in byMeasurement)
+                changed |= RegisterFieldsLocked(db, measurement, map);
+
+            if (changed)
+            {
+                _dirty = true;
+                _dirtyVol = true;
+            }
+        }
+    }
+
+    /// <summary>
     /// Get the registered field type for a specific field, or null if not registered.
     /// </summary>
     public FieldKind? GetFieldType(string db, string measurement, string fieldKey)
@@ -146,6 +181,64 @@ public sealed class SchemaRegistry
             return _schema.TryGetValue(db, out var measurements)
                 ? measurements.Keys.Order().ToArray()
                 : [];
+        }
+    }
+
+    /// <summary>
+    /// Registers schema recovered from segment metadata. Missing fields are added; existing
+    /// entries win so a stale/mismatched schema.json does not get silently rewritten.
+    /// </summary>
+    public void RecoverFromSegments(string db, string measurement, IEnumerable<(string Field, FieldKind Kind)> fields)
+    {
+        lock (_lock)
+        {
+            var map = GetFieldsMap(db, measurement);
+            var changed = false;
+            foreach (var (field, kind) in fields)
+            {
+                if (map.ContainsKey(field)) continue;
+                map[field] = kind;
+                changed = true;
+            }
+            if (!changed) return;
+            _dirty = true;
+            _dirtyVol = true;
+        }
+    }
+
+    public void RemoveMeasurement(string db, string measurement)
+    {
+        lock (_lock)
+        {
+            if (!_schema.TryGetValue(db, out var measurements) || !measurements.Remove(measurement)) return;
+            if (measurements.Count == 0) _schema.Remove(db);
+            _dirty = true;
+            _dirtyVol = true;
+        }
+    }
+
+    public void RemoveDatabase(string db)
+    {
+        lock (_lock)
+        {
+            if (!_schema.Remove(db)) return;
+            _dirty = true;
+            _dirtyVol = true;
+        }
+    }
+
+    /// <summary>Drops schema entries for measurements that no longer have any data.</summary>
+    public void PruneMeasurements(string db, IReadOnlySet<string> keep)
+    {
+        lock (_lock)
+        {
+            if (!_schema.TryGetValue(db, out var measurements)) return;
+            var removed = measurements.Keys.Where(key => !keep.Contains(key)).ToList();
+            foreach (var key in removed) measurements.Remove(key);
+            if (removed.Count == 0) return;
+            if (measurements.Count == 0) _schema.Remove(db);
+            _dirty = true;
+            _dirtyVol = true;
         }
     }
 

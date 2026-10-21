@@ -15,6 +15,24 @@ public sealed class ContinuousQueryRunner
     private readonly ILogger<ContinuousQueryRunner> _logger;
     private readonly TimeProvider _timeProvider;
 
+    // Serializes whole cycles (scheduler and the admin manual trigger share one runner) so the
+    // same bucket cannot be executed twice concurrently.
+    private int _running;
+    private readonly object _failureLock = new();
+    private readonly Dictionary<(string Database, string Name), FailureState> _failures = new();
+
+    private sealed class FailureState
+    {
+        public long BucketStartNs;
+        public int ConsecutiveFailures;
+        public long NextAttemptNs;
+    }
+
+    // A permanently failing window must not starve the query forever: after this many attempts the
+    // watermark moves past the poisoned bucket (logged) and processing continues.
+    private const int MaxFailuresPerBucket = 5;
+    private const long MaxBackoffNs = 5 * 60 * 1_000_000_000L;
+
     public ContinuousQueryRunner(
         TsdbEngine engine,
         QueryExecutor executor,
@@ -31,16 +49,31 @@ public sealed class ContinuousQueryRunner
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
+    /// <summary>True while a continuous-query cycle is executing (scheduler or manual trigger).</summary>
+    public bool IsRunning => Volatile.Read(ref _running) == 1;
+
     public Task<int> ExecuteDueQueriesAsync(CancellationToken cancellationToken = default)
     {
         if (!_options.ContinuousQuery.Enabled)
             return Task.FromResult(0);
 
-        var nowNs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds() * 1_000_000L;
-        int executed = 0;
-        foreach (var cq in _engine.Meta.ListContinuousQueries())
-            executed += ExecuteDueQuery(cq, nowNs, cancellationToken);
-        return Task.FromResult(executed);
+        // Manual trigger and the periodic scheduler share this instance; a second concurrent cycle
+        // would re-execute the same buckets and race on the progress watermark.
+        if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
+            return Task.FromResult(0);
+
+        try
+        {
+            var nowNs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds() * 1_000_000L;
+            int executed = 0;
+            foreach (var cq in _engine.Meta.ListContinuousQueries())
+                executed += ExecuteDueQuery(cq, nowNs, cancellationToken);
+            return Task.FromResult(executed);
+        }
+        finally
+        {
+            Volatile.Write(ref _running, 0);
+        }
     }
 
     private int ExecuteDueQuery(ContinuousQueryInfo cq, long nowNs, CancellationToken cancellationToken)
@@ -60,6 +93,17 @@ public sealed class ContinuousQueryRunner
         {
             _logger.LogWarning("continuous query skipped due to invalid shape name={Name} db={Database}", cq.Name, cq.Database);
             return 0;
+        }
+
+        var failureKey = (cq.Database, cq.Name);
+        lock (_failureLock)
+        {
+            if (_failures.TryGetValue(failureKey, out var failure) && failure.NextAttemptNs > nowNs)
+            {
+                _logger.LogDebug("continuous query backing off name={Name} db={Database} failures={Failures} next_attempt={NextAttemptNs}",
+                    cq.Name, cq.Database, failure.ConsecutiveFailures, failure.NextAttemptNs);
+                return 0;
+            }
         }
 
         var groupByNs = parsed.GroupByNs.Value;
@@ -117,10 +161,15 @@ public sealed class ContinuousQueryRunner
             {
                 _logger.LogWarning("continuous query execution failed name={Name} db={Database} bucket_start={BucketStart} error={Error}",
                     cq.Name, cq.Database, pending.BucketStartNs, error);
-                sw.Stop();
-                _metrics.RecordContinuousQueryRun(cq.Database, cq.Name, executed, hadError: true, wasRecompute: pending.Recompute, durationMs: sw.ElapsedMilliseconds, lastBucketStartNs: pending.BucketStartNs);
+                // The failed bucket did not produce a completed result: report zero buckets, not the
+                // cumulative count of buckets that succeeded before it in this cycle.
+                _metrics.RecordContinuousQueryRun(cq.Database, cq.Name, 0, hadError: true, wasRecompute: pending.Recompute,
+                    durationMs: outcome.Report.DurationMs, lastBucketStartNs: pending.BucketStartNs);
+                HandleFailure(cq, pending.BucketStartNs, nowNs, everyNs, error);
                 break;
             }
+
+            ClearFailures(failureKey);
 
             if (!pending.Recompute)
                 _engine.Meta.UpdateContinuousQueryProgress(cq.Database, cq.Name, pending.BucketStartNs);
@@ -132,6 +181,43 @@ public sealed class ContinuousQueryRunner
 
         sw.Stop();
         return executed;
+    }
+
+    private void ClearFailures((string Database, string Name) key)
+    {
+        lock (_failureLock)
+            _failures.Remove(key);
+    }
+
+    private void HandleFailure(ContinuousQueryInfo cq, long bucketStartNs, long nowNs, long everyNs, string error)
+    {
+        int failures;
+        lock (_failureLock)
+        {
+            var key = (cq.Database, cq.Name);
+            if (!_failures.TryGetValue(key, out var state) || state.BucketStartNs != bucketStartNs)
+                state = new FailureState { BucketStartNs = bucketStartNs };
+
+            state.ConsecutiveFailures++;
+            failures = state.ConsecutiveFailures;
+
+            // Exponential backoff capped at five minutes, never below one second.
+            var multiplier = 1L << Math.Min(failures - 1, 6);
+            var backoff = everyNs > MaxBackoffNs / multiplier ? MaxBackoffNs : everyNs * multiplier;
+            backoff = Math.Clamp(backoff, 1_000_000_000L, MaxBackoffNs);
+            state.NextAttemptNs = nowNs + backoff;
+            _failures[key] = state;
+        }
+
+        if (failures < MaxFailuresPerBucket) return;
+
+        // Permanently failing window: move the watermark past it so later buckets are not starved.
+        _logger.LogWarning(
+            "continuous query abandoning bucket after repeated failures name={Name} db={Database} bucket_start={BucketStart} failures={Failures} error={Error}",
+            cq.Name, cq.Database, bucketStartNs, failures, error);
+        _engine.Meta.UpdateContinuousQueryProgress(cq.Database, cq.Name, bucketStartNs);
+        lock (_failureLock)
+            _failures.Remove((cq.Database, cq.Name));
     }
 
     private (long StartBucketStartNs, long EndBucketStartNs) ResolveInitialExecutionRange(

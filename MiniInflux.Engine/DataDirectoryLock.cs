@@ -13,9 +13,13 @@ public sealed class DataDirectoryLock : IDisposable
 
     public static DataDirectoryLock Acquire(string dataPath)
     {
-        var root = Path.GetFullPath(dataPath);
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dataPath));
         Directory.CreateDirectory(root);
-        var lockPath = Path.Combine(root, ".miniinflux.lock");
+
+        // Keep the lock next to (not inside) the data directory. Backup/restore move or copy the
+        // data tree, and Windows refuses those operations while an open handle lives under it.
+        // The sibling path is deterministic, so the server and CLI still contend for the lock.
+        var lockPath = root + ".miniinflux.lock";
         try
         {
             var stream = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);

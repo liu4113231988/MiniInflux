@@ -45,6 +45,7 @@ public sealed class WriteQueue : IDisposable
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
 
         Interlocked.Increment(ref _pendingRequests);
+        using var registration = ct.Register(static state => ((TaskCompletionSource<bool>)state!).TrySetCanceled(), tcs);
         try
         {
             await _channel.Writer.WriteAsync(request, timeoutCts.Token);
@@ -70,23 +71,34 @@ public sealed class WriteQueue : IDisposable
     {
         var batch = new List<WriteRequest>(_batchSize);
 
-        await foreach (var request in _channel.Reader.ReadAllAsync(_cts.Token))
+        try
         {
-            batch.Add(request);
+            while (await _channel.Reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
+            {
+                while (batch.Count < _batchSize && _channel.Reader.TryRead(out var next))
+                    batch.Add(next);
+                if (batch.Count == 0) continue;
 
-            // Drain available items up to batch size
-            while (batch.Count < _batchSize && _channel.Reader.TryRead(out var next))
-                batch.Add(next);
-
-            await ProcessBatch(batch);
-            batch.Clear();
+                await ProcessBatch(batch);
+                batch.Clear();
+            }
         }
+        catch (OperationCanceledException) { /* shutdown: fall through and drain */ }
 
-        // Process remaining items
-        while (_channel.Reader.TryRead(out var remaining))
-            batch.Add(remaining);
-        if (batch.Count > 0)
-            await ProcessBatch(batch);
+        // Process remaining items and resolve every completion source; otherwise a caller that
+        // already enqueued a request would await its TCS forever after Dispose cancels the worker.
+        try
+        {
+            while (_channel.Reader.TryRead(out var remaining))
+                batch.Add(remaining);
+            if (batch.Count > 0)
+                await ProcessBatch(batch);
+        }
+        catch (Exception ex)
+        {
+            foreach (var request in batch)
+                request.Completion.TrySetException(ex);
+        }
     }
 
     private async Task ProcessBatch(List<WriteRequest> batch)
@@ -142,8 +154,11 @@ public sealed class WriteQueue : IDisposable
 
     public void Dispose()
     {
-        _cts.Cancel();
+        // Complete the channel first so the worker drains and resolves queued completions; only
+        // cancel afterwards to unblock a worker that is stuck on a slow write.
         _channel.Writer.Complete();
+        try { _worker.Wait(TimeSpan.FromSeconds(5)); } catch { /* best effort */ }
+        try { _cts.Cancel(); } catch (ObjectDisposedException) { }
         try { _worker.Wait(TimeSpan.FromSeconds(5)); } catch { /* best effort */ }
         _cts.Dispose();
     }

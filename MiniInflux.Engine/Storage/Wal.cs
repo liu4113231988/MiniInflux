@@ -38,6 +38,7 @@ public sealed class WalManager : IDisposable
         _health = health ?? new StorageHealth();
         Directory.CreateDirectory(walDir);
         LoadCheckpoint();
+        RepairTruncatedTails();
         OpenOrCreateCurrentFile();
         if (_fsync && _fsyncIntervalMs > 0)
             _fsyncTimer = new Timer(_ => FlushToDisk(), null, _fsyncIntervalMs, _fsyncIntervalMs);
@@ -63,6 +64,64 @@ public sealed class WalManager : IDisposable
             if (int.TryParse(text, out var legacyId))
                 _checkpoint = new WalPosition(legacyId, 0);
         }
+    }
+
+    /// <summary>
+    /// A crash can leave a partial record at the tail of any WAL file. Appending new records after
+    /// those bytes makes them unreachable on the next replay (replay stops at the torn record), so
+    /// truncate every file to its last complete, CRC-valid record before opening it for append.
+    /// </summary>
+    private void RepairTruncatedTails()
+    {
+        if (!Directory.Exists(_walDir)) return;
+
+        var maxFileId = 0;
+        foreach (var path in Directory.GetFiles(_walDir, "*.wal"))
+        {
+            if (!int.TryParse(Path.GetFileNameWithoutExtension(path), out var fileId) || fileId <= 0)
+                continue;
+            maxFileId = Math.Max(maxFileId, fileId);
+
+            var length = new FileInfo(path).Length;
+            var validLength = FindLastValidRecordEnd(path, length);
+            if (validLength < length)
+            {
+                using (var repair = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+                    repair.SetLength(validLength);
+            }
+
+            // A stale checkpoint beyond the repaired tail would otherwise skip all recovered
+            // records in this file. Clamp it so replay starts at the last valid offset.
+            if (fileId == _checkpoint.FileId && _checkpoint.Offset > validLength)
+                _checkpoint = new WalPosition(fileId, validLength);
+        }
+
+        // A checkpoint file that points past the newest WAL file would make replay skip every
+        // remaining record. Replaying from the newest file is safer than silently losing data.
+        if (_checkpoint.FileId > maxFileId)
+            _checkpoint = new WalPosition(maxFileId, 0);
+    }
+
+    private static long FindLastValidRecordEnd(string path, long length)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var br = new BinaryReader(fs, Encoding.UTF8);
+        long position = 0;
+        while (position + 8 <= length)
+        {
+            fs.Position = position;
+            var recordLength = br.ReadInt32();
+            var expectedCrc = br.ReadUInt32();
+            if (recordLength < 0 || position + 8 + recordLength > length)
+                break;
+
+            var payload = br.ReadBytes(recordLength);
+            if (payload.Length != recordLength || Crc32.Compute(payload) != expectedCrc)
+                break;
+
+            position += 8 + recordLength;
+        }
+        return position;
     }
 
     private void OpenOrCreateCurrentFile()

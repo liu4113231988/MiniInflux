@@ -140,3 +140,4 @@ web-admin/node_modules/
 data/
 .benchmarks/
 .history/
+.trx/

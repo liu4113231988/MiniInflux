@@ -35,6 +35,13 @@ public static class V2WriteSupport
             return false;
         }
 
+        if (!MiniInflux.Net10.Storage.IdentifierValidator.IsValidDatabaseName(db)
+            || !MiniInflux.Net10.Storage.IdentifierValidator.IsValidRetentionPolicyName(rp))
+        {
+            error = $"invalid bucket name: {bucket}";
+            return false;
+        }
+
         error = "";
         return true;
     }

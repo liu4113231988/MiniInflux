@@ -251,14 +251,15 @@ public class Phase2CompatibilityTests : IDisposable
     }
 
     [Fact]
-    public async Task Math_GroupByTime_ReturnsScalarPerBucket()
+    public async Task Math_GroupByTime_KeepsPerPointRows()
     {
-        // With GROUP BY time, math functions collapse to a per-bucket scalar using the
-        // bucket's last value — matching the existing abs/sqrt behavior.
+        // Math transforms are row-expanding: GROUP BY time partitions points into buckets but
+        // must not collapse them into a single last-value scalar.
         var result = await _executor.ExecuteAsync(_engine, "testdb",
             "SELECT exp(value) FROM cpu GROUP BY time(10s)");
         var rows = Rows(result);
-        var single = Assert.Single(rows);
-        Assert.Equal(Math.Exp(6), Convert.ToDouble(single[1]), 9);
+        Assert.Equal(6, rows.Count);
+        Assert.Equal(Math.Exp(1), Convert.ToDouble(rows[0][1]), 9);
+        Assert.Equal(Math.Exp(6), Convert.ToDouble(rows[^1][1]), 9);
     }
 }
