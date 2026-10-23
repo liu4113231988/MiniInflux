@@ -89,6 +89,36 @@ public sealed class TokenStoreTests : IDisposable
         Assert.NotNull(store2.Validate(raw));
     }
 
+    [Fact]
+    public void Load_WithCorruptFile_PreservesOriginalAndStartsEmpty()
+    {
+        var store = new TokenStore(_dir);
+        var (_, raw) = store.Create("keep-me");
+
+        // Corrupt the persisted file.
+        var file = Path.Combine(_dir, "meta", "tokens.json");
+        var corrupted = "{ this is not valid json ]";
+        File.WriteAllText(file, corrupted);
+
+        // Reload must not overwrite the corrupt file with an empty list.
+        var store2 = new TokenStore(_dir);
+        Assert.Empty(store2.List());
+
+        // The original (corrupted) bytes must be preserved under a .corrupt-* name for diagnosis,
+        // and the fresh tokens.json must not silently drop into an unmarked empty list.
+        var corruptFiles = Directory.GetFiles(Path.Combine(_dir, "meta"), "tokens.json.corrupt-*");
+        Assert.Single(corruptFiles);
+        Assert.Equal(corrupted, File.ReadAllText(corruptFiles[0]));
+
+        var fresh = File.Exists(file) ? File.ReadAllText(file) : "";
+        Assert.DoesNotContain("keep-me", fresh);
+
+        // Sanity: the lost token is no longer valid, but the store still works for new tokens.
+        Assert.Null(store2.Validate(raw));
+        var (_, raw2) = store2.Create("new-one");
+        Assert.NotNull(store2.Validate(raw2));
+    }
+
     private static HttpRequest BearerRequest(string token)
     {
         var ctx = new DefaultHttpContext();

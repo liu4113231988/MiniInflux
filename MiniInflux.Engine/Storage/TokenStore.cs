@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
 
 namespace MiniInflux.Net10.Storage;
 
@@ -29,15 +30,17 @@ public sealed class TokenStore
 {
     private readonly string _path;
     private readonly object _lock = new();
+    private readonly ILogger? _logger;
     private readonly Dictionary<string, ApiToken> _byId = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _hashToId = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _nameToId = new(StringComparer.Ordinal);
 
-    public TokenStore(string dataPath)
+    public TokenStore(string dataPath, ILogger? logger = null)
     {
         var metaDir = Path.Combine(dataPath, "meta");
         Directory.CreateDirectory(metaDir);
         _path = Path.Combine(metaDir, "tokens.json");
+        _logger = logger;
         Load();
     }
 
@@ -58,21 +61,13 @@ public sealed class TokenStore
     {
         if (string.IsNullOrEmpty(rawToken)) return null;
         var hash = ComputeHash(rawToken);
-        string? id = null;
         lock (_lock)
         {
-            // constant-time lookup emulation: iterate to avoid timing leak via hash map
-            foreach (var kv in _hashToId)
-            {
-                if (CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(kv.Key), Encoding.UTF8.GetBytes(hash)))
-                {
-                    id = kv.Value;
-                    break;
-                }
-            }
-            if (id != null && _byId.TryGetValue(id, out var token)) return token;
-            // fallback direct (fast path) if fixed-time loop missed due to base64 padding variations
-            if (_hashToId.TryGetValue(hash, out var directId) && _byId.TryGetValue(directId, out var direct)) return direct;
+            // Stored values are SHA256 hashes (irreversible and not enumerable), so a direct
+            // dictionary lookup is safe; a constant-time loop over the map is both unnecessary
+            // and not actually constant-time due to allocations and early termination.
+            if (_hashToId.TryGetValue(hash, out var id) && _byId.TryGetValue(id, out var token))
+                return token;
         }
         return null;
     }
@@ -151,7 +146,15 @@ public sealed class TokenStore
                     _nameToId[t.Name] = t.Id;
                 }
             }
-            catch { /* corrupted file -> start empty */ }
+            catch (Exception ex)
+            {
+                // Preserve the damaged file for diagnosis instead of letting the next save overwrite
+                // every token. Starting empty means existing tokens stop working, which is safer than
+                // silently discarding them.
+                try { File.Move(_path, _path + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmssfff}"); }
+                catch (Exception moveEx) { _logger?.LogWarning(moveEx, "failed to preserve corrupt tokens file"); }
+                _logger?.LogWarning(ex, "tokens.json is corrupt; starting with an empty token store");
+            }
         }
     }
 
@@ -161,7 +164,13 @@ public sealed class TokenStore
         var json = JsonSerializer.Serialize(list, TokenJsonContext.Default.ListApiToken);
         var tmp = _path + ".tmp";
         Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-        File.WriteAllText(tmp, json);
+        using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            using var writer = new StreamWriter(fs);
+            writer.Write(json);
+            writer.Flush();
+            fs.Flush(true);
+        }
         File.Move(tmp, _path, overwrite: true);
     }
 

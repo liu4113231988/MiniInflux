@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Protocol;
 
@@ -104,7 +105,8 @@ public sealed class TsdbEngine : IDisposable
         double segmentFillRatio = 0.5,
         long compactionMaxWriteBytesPerSecond = 0,
         long minFreeDiskBytes = 0,
-        int lastValueCacheMaxEntries = 0)
+        int lastValueCacheMaxEntries = 0,
+        ILogger? logger = null)
     {
         _root = rootPath; _threshold = flushThreshold; _maxSeriesPerDb = maxSeriesPerDb; _maxBufferPoints = maxBufferPoints; _maxBufferBytes = maxBufferBytes;
         _lastValueCache = new LastValueCache(lastValueCacheMaxEntries);
@@ -125,7 +127,7 @@ public sealed class TsdbEngine : IDisposable
         _flushColdTicks = TimeSpan.FromMilliseconds(Math.Max(0, flushColdDurationMs)).Ticks;
         Directory.CreateDirectory(_root);
         _wal = new WalManager(Path.Combine(_root, "wal"), maxWalFileBytes, walFsync, walFsyncIntervalMs, _health);
-        _manifest = new Manifest(_root);
+        _manifest = new Manifest(_root, logger);
         _schema = new SchemaRegistry(_root, maxFieldsPerMeasurement);
         _shards = new ShardManager(_root, _manifest);
         _tombstones = new TombstoneStore(_root, _health);
@@ -269,6 +271,11 @@ public sealed class TsdbEngine : IDisposable
 
     public Task WriteAsync(string db, string rp, List<Point> pts) => WriteInternalAsync(db, rp, pts);
 
+    // Synchronous write path for callers that already run on a worker thread (e.g. SELECT ... INTO
+    // inside the query executor). WriteInternalCore performs no real async I/O and always returns a
+    // completed task, so this avoids the sync-over-async anti-pattern without duplicating logic.
+    public void Write(string db, string rp, List<Point> pts) => WriteInternalAsync(db, rp, pts).GetAwaiter().GetResult();
+
     public Task WriteInternalAsync(string db, string rp, List<Point> pts)
     {
         _writeCatalogGate.EnterReadLock();
@@ -283,6 +290,12 @@ public sealed class TsdbEngine : IDisposable
     }
 
     private Task WriteInternalCore(string db, string rp, List<Point> pts)
+    {
+        WriteInternal(db, rp, pts);
+        return Task.CompletedTask;
+    }
+
+    private void WriteInternal(string db, string rp, List<Point> pts)
     {
         IdentifierValidator.ValidateDatabaseName(db);
         IdentifierValidator.ValidateRetentionPolicyName(rp);
@@ -301,7 +314,7 @@ public sealed class TsdbEngine : IDisposable
         
         // 提前过滤掉重复点，减少不必要的处理
         var pending = DeduplicateWritePoints(pts);
-        if (pending.Count == 0) return Task.CompletedTask;
+        if (pending.Count == 0) return;
         
         var writePoints = pending.Count == pts.Count ? pts : MaterializePendingPoints(pending);
         ValidateSchema(db, writePoints);
@@ -354,7 +367,6 @@ public sealed class TsdbEngine : IDisposable
             }
         }
         finally { lk.ExitWriteLock(); }
-        return Task.CompletedTask;
     }
 
     private static List<Point> MaterializePendingPoints(List<PendingPoint> pending)
@@ -2098,7 +2110,17 @@ return Interlocked.Read(ref _bufferedByteCount);
         IdentifierValidator.ValidateDatabaseName(db);
         FlushDatabase(db);
         var dbDir = Path.Combine(_root, "db", db);
-        if (Directory.Exists(dbDir)) try { Directory.Delete(dbDir, true); } catch { }
+        if (Directory.Exists(dbDir))
+        {
+            try { Directory.Delete(dbDir, true); }
+            catch (Exception ex)
+            {
+                // A failed delete leaves an orphan directory on disk. Manifest has already dropped the
+                // catalog entry, so the data becomes invisible but keeps occupying space; surface it
+                // so an operator can clean up manually.
+                _health.RecordFailure("drop_database_delete", ex);
+            }
+        }
         SegmentReader.ClearQuarantinedByPrefix(dbDir);
         InvalidateSegmentMetadataIndex();
         _manifest.DropDatabase(db); _manifest.SaveIfDirty(); _tombstones.DropDatabase(db);

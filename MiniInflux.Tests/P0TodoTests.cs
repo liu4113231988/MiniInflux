@@ -104,6 +104,24 @@ public class P0TodoTests : IDisposable
     }
 
     [Fact]
+    public void ChunkedQuery_WithMalformedSyntax_ReturnsErrorChunkWithoutThrowing()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+
+        // A parse error must be reported eagerly as a single error chunk so the HTTP layer can send
+        // a clean error response instead of corrupting the chunked stream mid-enumeration.
+        var outcome = new QueryExecutor()
+            .ExecuteChunkedWithReport(engine, "testdb", "SELEKT broken !! FROM cpu", chunkSize: 100);
+
+        var chunks = outcome.Responses.ToList();
+        Assert.Single(chunks);
+        var error = chunks[0].Results[0].Error;
+        Assert.NotNull(error);
+        Assert.Equal(error, outcome.Report.Error);
+        Assert.False(outcome.UsedStreamingRawSelect);
+    }
+
+    [Fact]
     public async Task RawSelect_UsesStreamingScanForNormalQuery()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);

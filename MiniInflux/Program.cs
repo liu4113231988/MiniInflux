@@ -45,6 +45,24 @@ if (options.Logging.ConsoleEnabled)
 if (options.Logging.FileEnabled)
     builder.Logging.AddProvider(new FileLoggerProvider(options.Logging.FilePath, options.Logging.FileMaxBytes, options.Logging.FileRetainedFileCount));
 
+// Build the runtime logger up front so components created before the DI container (TokenStore,
+// TsdbEngine/Manifest) can log corruption warnings. The DI container gets its own logger factory
+// configured identically via builder.Logging above.
+var runtimeLoggerFactory = LoggerFactory.Create(logging =>
+{
+    logging.SetMinimumLevel(appLevel < systemLevel ? appLevel : systemLevel);
+    logging.AddFilter("MiniInflux", appLevel);
+    logging.AddFilter("Microsoft", systemLevel);
+    logging.AddFilter("Microsoft.AspNetCore", systemLevel);
+    logging.AddFilter("Microsoft.Hosting", systemLevel);
+    logging.AddFilter("System", systemLevel);
+    if (options.Logging.ConsoleEnabled)
+        logging.AddSimpleConsole(console => { console.SingleLine = true; console.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ "; console.UseUtcTimestamp = true; });
+    if (options.Logging.FileEnabled)
+        logging.AddProvider(new FileLoggerProvider(options.Logging.FilePath, options.Logging.FileMaxBytes, options.Logging.FileRetainedFileCount));
+});
+var runtimeLogger = runtimeLoggerFactory.CreateLogger("MiniInflux.Runtime");
+
 if (!options.Http.Enabled)
 {
     var bootstrapLogger = LoggerFactory.Create(logging =>
@@ -64,7 +82,7 @@ if (!options.Http.Enabled)
 StartupSecurity.Validate(options);
 
 var authenticationGuard = new AuthenticationGuard(options.Auth);
-var tokenStore = new TokenStore(options.DataPath);
+var tokenStore = new TokenStore(options.DataPath, runtimeLogger);
 authenticationGuard.SetTokenStore(tokenStore);
 
 if (options.Tls.Enabled)
@@ -102,7 +120,8 @@ var engine = new TsdbEngine(
     segmentFillRatio: options.Storage.MinSegmentFillRatio,
     compactionMaxWriteBytesPerSecond: options.Storage.CompactionMaxWriteBytesPerSecond,
     minFreeDiskBytes: options.Storage.MinFreeDiskBytes,
-    lastValueCacheMaxEntries: options.Storage.LastValueCacheMaxEntries);
+    lastValueCacheMaxEntries: options.Storage.LastValueCacheMaxEntries,
+    logger: runtimeLogger);
 
 builder.Services.AddSingleton(engine);
 var writeQueue = new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize);
@@ -121,7 +140,6 @@ builder.Services.AddSingleton<ContinuousQueryRunner>();
 builder.Services.AddHostedService<ContinuousQueryHostedService>();
 
 var app = builder.Build();
-var runtimeLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("MiniInflux.Runtime");
 var accessLogWriter = app.Services.GetRequiredService<AccessLogWriter>();
 var staticAssets = Assembly.GetExecutingAssembly()
     .GetManifestResourceNames()
@@ -1367,12 +1385,16 @@ async Task<IResult> WritePointsAsync(HttpRequest request, string db, string? rp,
 static async Task<(byte[] Buffer, int Length)> ReadRequestBodyBytesAsync(HttpRequest request, long maxBytes, CancellationToken cancellationToken)
 {
     Stream input = request.Body;
+    Stream? gzip = null;
     if (request.Headers.ContentEncoding.ToString().Contains("gzip", StringComparison.OrdinalIgnoreCase))
-        input = new GZipStream(request.Body, CompressionMode.Decompress);
+    {
+        gzip = new GZipStream(request.Body, CompressionMode.Decompress);
+        input = gzip;
+    }
 
     var capacity = request.ContentLength is > 0 and < 4 * 1024 * 1024 ? (int)request.ContentLength.Value : 64 * 1024;
     var ms = new MemoryStream(capacity);
-    await using (input.ConfigureAwait(false))
+    try
     {
         var buffer = new byte[64 * 1024];
         int read;
@@ -1382,6 +1404,11 @@ static async Task<(byte[] Buffer, int Length)> ReadRequestBodyBytesAsync(HttpReq
                 throw new RequestBodyTooLargeException();
             ms.Write(buffer, 0, read);
         }
+    }
+    finally
+    {
+        // Only dispose the GZipStream we created; request.Body is owned by the server.
+        gzip?.Dispose();
     }
 
     var backing = ms.GetBuffer();

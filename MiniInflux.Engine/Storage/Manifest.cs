@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
 
 namespace MiniInflux.Net10.Storage;
 
@@ -61,12 +62,14 @@ public sealed class Manifest
     private readonly object _lock = new();
     private ManifestData _data = new();
     private bool _dirty;
+    private readonly ILogger? _logger;
 
-    public Manifest(string dataPath)
+    public Manifest(string dataPath, ILogger? logger = null)
     {
         var metaDir = Path.Combine(dataPath, "meta");
         Directory.CreateDirectory(metaDir);
         _path = Path.Combine(metaDir, "manifest.json");
+        _logger = logger;
         Load();
     }
 
@@ -966,7 +969,8 @@ public sealed class Manifest
             }
 
             // Preserve the damaged catalog for diagnosis before the next save heals the primary.
-            try { File.Move(_path, _path + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmssfff}"); } catch { }
+            try { File.Move(_path, _path + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmssfff}"); }
+            catch (Exception ex) { _logger?.LogWarning(ex, "failed to preserve corrupt manifest file"); }
             _dirty = true; // heal the primary path on the next save
             return;
         }

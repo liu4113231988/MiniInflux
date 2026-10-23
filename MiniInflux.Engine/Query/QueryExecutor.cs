@@ -266,8 +266,20 @@ public sealed class QueryExecutor
     {
         var report = new QueryExecutionReport();
         var safeChunkSize = Math.Max(1, chunkSize);
-        ParsedQuery? parsed = null;
-        try { parsed = ParseAndBind(q, queryParams); } catch { }
+        ParsedQuery? parsed;
+        try { parsed = ParseAndBind(q, queryParams); }
+        catch (Exception ex)
+        {
+            // Report parse errors eagerly so the caller can send a clean error response before the
+            // chunked body starts; deferring them into the lazy enumeration would corrupt the stream.
+            report.Error = ex.Message;
+            return new QueryChunkedExecutionOutcome
+            {
+                Responses = [new QueryResponse { Results = [new QueryResult { StatementId = 0, Error = ex.Message }] }],
+                Report = report,
+                UsedStreamingRawSelect = false
+            };
+        }
 
         if (parsed != null && CanStreamRawSelect(parsed))
         {
@@ -2254,7 +2266,7 @@ public sealed class QueryExecutor
         var points = ConvertSeriesToPoints(target.Measurement, seriesList, q, knownFields);
         if (points.Count == 0)
             return 0;
-        e.WriteAsync(target.Database, target.RetentionPolicy, points).GetAwaiter().GetResult();
+        e.Write(target.Database, target.RetentionPolicy, points);
         return points.Count;
     }
 
