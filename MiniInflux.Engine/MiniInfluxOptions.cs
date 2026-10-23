@@ -40,7 +40,7 @@ public sealed class MiniInfluxOptions
             {
                 Dir = dataDir,
                 BackupDir = ReadString(config, "Data:BackupDir", "")!,
-                QueryLogEnabled = ReadBool(config, true, "Data:QueryLogEnabled")
+                QueryLogEnabled = ReadBool(config, false, "Data:QueryLogEnabled")
             },
             Http = new HttpOptions
             {
@@ -222,7 +222,7 @@ public sealed class DataOptions
 {
     public string Dir { get; init; } = "./data";
     public string BackupDir { get; init; } = "";
-    public bool QueryLogEnabled { get; init; } = true;
+    public bool QueryLogEnabled { get; init; }
 }
 
 public sealed class HttpOptions

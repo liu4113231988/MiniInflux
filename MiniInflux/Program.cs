@@ -85,14 +85,17 @@ var authenticationGuard = new AuthenticationGuard(options.Auth);
 var tokenStore = new TokenStore(options.DataPath, runtimeLogger);
 authenticationGuard.SetTokenStore(tokenStore);
 
-if (options.Tls.Enabled)
+// Kestrel hard limits apply regardless of TLS. Default MaxRequestBodySize is ~30MB which is
+// close to our app-level 25MB check; set it explicitly so the two don't drift.
+builder.WebHost.ConfigureKestrel(k =>
 {
-    builder.WebHost.ConfigureKestrel(k =>
-    {
+    k.Limits.MaxRequestBodySize = options.Write.MaxRequestBodyBytes;
+
+    if (options.Tls.Enabled)
         k.ListenAnyIP(options.Tls.Port, listen => listen.UseHttps(options.Tls.CertPath!, options.Tls.Password));
-    });
-}
-else
+});
+
+if (!options.Tls.Enabled)
     builder.WebHost.UseUrls(options.Urls);
 
 builder.Services.ConfigureHttpJsonOptions(jsonOptions =>
@@ -134,7 +137,7 @@ builder.Services.AddSingleton(new QueryExecutor(
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton(tokenStore);
 builder.Services.AddSingleton(authenticationGuard);
-builder.Services.AddSingleton(new MetricsCollector(engine, writeQueue));
+builder.Services.AddSingleton(new MetricsCollector(engine, writeQueue, runtimeLoggerFactory.CreateLogger<MetricsCollector>()));
 builder.Services.AddSingleton(new AccessLogWriter(options.Http.AccessLogPath));
 builder.Services.AddSingleton<ContinuousQueryRunner>();
 builder.Services.AddHostedService<ContinuousQueryHostedService>();
@@ -155,6 +158,29 @@ runtimeLogger.LogInformation("MiniInflux started with data dir {DataDir}, bind {
     Path.GetFullPath(options.DataPath), options.Http.BindAddress, options.Auth.Enabled, options.Logging.Level, options.Logging.SystemLevel);
 runtimeLogger.LogInformation("Performance tuning: adjust Write.QueueCapacity={QueueCapacity}, Write.BatchSize={BatchSize}, Storage.MaxBufferPoints={MaxBufferPoints}, Storage.MaxQueryDurationMs={MaxQueryDurationMs}, Storage.MaxQueryMemoryBytes={MaxQueryMemoryBytes}, and Wal.Fsync={WalFsync} as needed",
     options.Write.QueueCapacity, options.Write.BatchSize, options.Storage.MaxBufferPoints, options.Storage.MaxQueryDurationMs, options.Storage.MaxQueryMemoryBytes, options.Wal.Fsync);
+
+// Security response headers — outermost middleware so every response carries them regardless of
+// status code or downstream middleware short-circuiting.
+app.Use(async (context, next) =>
+{
+    var headers = context.Response.Headers;
+    headers["X-Content-Type-Options"] = "nosniff";
+    headers["X-Frame-Options"] = "DENY";
+    headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
+
+    if (context.Request.Path.StartsWithSegments("/admin"))
+    {
+        // Admin UI is a Vue SPA with Vite-inlined modules; unsafe-inline is required for the
+        // production build. This is still significantly better than no CSP at all.
+        headers["Content-Security-Policy"] =
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'";
+    }
+
+    if (options.Tls.Enabled)
+        headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains";
+
+    await next();
+});
 
 if (options.Http.LogEnabled)
 {

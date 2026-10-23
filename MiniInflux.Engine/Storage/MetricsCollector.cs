@@ -1,4 +1,5 @@
 using System.Text;
+using Microsoft.Extensions.Logging;
 using MiniInflux.Net10.Query;
 
 namespace MiniInflux.Net10.Storage;
@@ -30,9 +31,11 @@ public sealed class MetricsCollector
     private static readonly int[] QueryDurationBoundsMs = [1, 5, 10, 50, 100, 500, 1000, 5000];
     private readonly TsdbEngine _engine;
     private readonly WriteQueue? _writeQueue;
+    private readonly ILogger? _logger;
+    private volatile bool _segmentEnumerationErrorLogged;
     private readonly Dictionary<string, ContinuousQueryMetrics> _continuousQueryMetrics = new(StringComparer.Ordinal);
 
-    public MetricsCollector(TsdbEngine engine, WriteQueue? writeQueue = null) { _engine = engine; _writeQueue = writeQueue; }
+    public MetricsCollector(TsdbEngine engine, WriteQueue? writeQueue = null, ILogger? logger = null) { _engine = engine; _writeQueue = writeQueue; _logger = logger; }
 
     public void RecordWrite(int pointCount) => Interlocked.Add(ref _writePointsTotal, pointCount);
     public void RecordQuery() => Interlocked.Increment(ref _queryTotal);
@@ -188,7 +191,17 @@ public sealed class MetricsCollector
             foreach (var f in Directory.EnumerateFiles(dbDir, "*.seg", SearchOption.AllDirectories))
                 count++;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            // Directory enumeration can fail with IOException/UnauthorizedAccessException when a
+            // segment is being concurrently deleted; report once to avoid spamming on every
+            // subsequent /metrics poll, but keep returning 0 so the endpoint stays usable.
+            if (!_segmentEnumerationErrorLogged)
+            {
+                _segmentEnumerationErrorLogged = true;
+                _logger?.LogWarning(ex, "metrics: failed to enumerate segment files in {Dir}", dbDir);
+            }
+        }
         return count;
     }
 

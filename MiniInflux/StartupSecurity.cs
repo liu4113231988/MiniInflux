@@ -33,5 +33,21 @@ public static class StartupSecurity
                     ex);
             }
         }
+
+        // Production fail-closed: refuse to start with auth disabled unless the operator has
+        // explicitly opted out. Deployments behind a TLS-terminating reverse proxy still need
+        // the escape hatch because the proxy terminates TLS but MiniInflux must still authenticate
+        // clients hitting the proxy.
+        var env = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT")
+                  ?? Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT");
+        if (string.Equals(env, "Production", StringComparison.OrdinalIgnoreCase)
+            && !options.Auth.Enabled
+            && !string.Equals(Environment.GetEnvironmentVariable("MINI_INFLUX_ALLOW_INSECURE_PROD"), "true", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Running in Production environment with authentication disabled is refused. " +
+                "Set Auth.Enabled=true or, if access is gated by a trusted reverse proxy, " +
+                "set MINI_INFLUX_ALLOW_INSECURE_PROD=true to override.");
+        }
     }
 }

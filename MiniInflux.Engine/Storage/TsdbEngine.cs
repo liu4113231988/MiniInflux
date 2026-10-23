@@ -3575,7 +3575,10 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
 
     public void Dispose()
     {
-        _rpExpiryTimer?.Dispose(); _compactionTimer?.Dispose(); _flushTimer?.Dispose(); FlushAll(); _schema.SaveIfDirty(); _manifest.SaveIfDirty(); _wal.Dispose(); _walAppendGate.Dispose(); _writeCatalogGate.Dispose(); _globalLock.Dispose();
+        _rpExpiryTimer?.Dispose(); _compactionTimer?.Dispose(); _flushTimer?.Dispose();
+        FlushAll(); _schema.SaveIfDirty(); _manifest.SaveIfDirty();
+        _wal.Dispose(); _walAppendGate.Dispose(); _writeCatalogGate.Dispose(); _globalLock.Dispose();
+        _queryGate.Dispose();
         foreach (var lk in _locks.Values) lk.Dispose();
     }
 

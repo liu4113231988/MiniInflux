@@ -406,7 +406,67 @@ public sealed class P0SafetyRegressionTests : IDisposable
             Tls = new TlsOptions { Enabled = true, CertPath = certPath }
         });
 
-        StartupSecurity.Validate(new MiniInfluxOptions());
+        // Deterministic regardless of CI environment: explicit Production env must be cleared.
+        var prevDotnet = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT");
+        var prevAspNet = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT");
+        try
+        {
+            Environment.SetEnvironmentVariable("DOTNET_ENVIRONMENT", null);
+            Environment.SetEnvironmentVariable("ASPNETCORE_ENVIRONMENT", null);
+            StartupSecurity.Validate(new MiniInfluxOptions());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTNET_ENVIRONMENT", prevDotnet);
+            Environment.SetEnvironmentVariable("ASPNETCORE_ENVIRONMENT", prevAspNet);
+        }
+    }
+
+    [Fact]
+    public void StartupSecurity_ProductionEnvironmentWithoutAuth_FailsClosed()
+    {
+        var prevDotnet = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT");
+        var prevAspNet = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT");
+        var prevOverride = Environment.GetEnvironmentVariable("MINI_INFLUX_ALLOW_INSECURE_PROD");
+        try
+        {
+            Environment.SetEnvironmentVariable("DOTNET_ENVIRONMENT", "Production");
+            Environment.SetEnvironmentVariable("ASPNETCORE_ENVIRONMENT", null);
+            Environment.SetEnvironmentVariable("MINI_INFLUX_ALLOW_INSECURE_PROD", null);
+
+            var ex = Assert.Throws<InvalidOperationException>(() => StartupSecurity.Validate(new MiniInfluxOptions()));
+            Assert.Contains("Production", ex.Message);
+            Assert.Contains("authentication", ex.Message);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTNET_ENVIRONMENT", prevDotnet);
+            Environment.SetEnvironmentVariable("ASPNETCORE_ENVIRONMENT", prevAspNet);
+            Environment.SetEnvironmentVariable("MINI_INFLUX_ALLOW_INSECURE_PROD", prevOverride);
+        }
+    }
+
+    [Fact]
+    public void StartupSecurity_ProductionWithInsecureOverride_AllowsStart()
+    {
+        var prevDotnet = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT");
+        var prevAspNet = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT");
+        var prevOverride = Environment.GetEnvironmentVariable("MINI_INFLUX_ALLOW_INSECURE_PROD");
+        try
+        {
+            Environment.SetEnvironmentVariable("DOTNET_ENVIRONMENT", "Production");
+            Environment.SetEnvironmentVariable("ASPNETCORE_ENVIRONMENT", null);
+            Environment.SetEnvironmentVariable("MINI_INFLUX_ALLOW_INSECURE_PROD", "true");
+
+            // Default options (Auth.Enabled=false) must pass when the override is set.
+            StartupSecurity.Validate(new MiniInfluxOptions());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTNET_ENVIRONMENT", prevDotnet);
+            Environment.SetEnvironmentVariable("ASPNETCORE_ENVIRONMENT", prevAspNet);
+            Environment.SetEnvironmentVariable("MINI_INFLUX_ALLOW_INSECURE_PROD", prevOverride);
+        }
     }
 
     [Fact]

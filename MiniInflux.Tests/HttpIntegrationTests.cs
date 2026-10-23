@@ -284,6 +284,37 @@ public sealed class HttpAuthorizationTests : IClassFixture<MiniInfluxAuthAppFact
         Assert.Contains("read-only", await response.Content.ReadAsStringAsync());
     }
 
+    [Fact]
+    public async Task AnyEndpoint_SetsSecurityHeaders()
+    {
+        using var client = _factory.CreateClient();
+        using var response = await client.GetAsync("/ping");
+
+        Assert.True(response.Headers.TryGetValues("X-Content-Type-Options", out var nosniff));
+        Assert.Equal("nosniff", Assert.Single(nosniff));
+
+        Assert.True(response.Headers.TryGetValues("X-Frame-Options", out var frame));
+        Assert.Equal("DENY", Assert.Single(frame));
+
+        Assert.True(response.Headers.TryGetValues("Referrer-Policy", out var referrer));
+        Assert.Equal("strict-origin-when-cross-origin", Assert.Single(referrer));
+
+        // TLS disabled in the factory, so HSTS must NOT be set.
+        Assert.False(response.Headers.Contains("Strict-Transport-Security"));
+    }
+
+    [Fact]
+    public async Task AdminEndpoint_SetsContentSecurityPolicy()
+    {
+        using var client = _factory.CreateClient();
+        using var response = await client.GetAsync("/admin");
+
+        Assert.True(response.Headers.TryGetValues("Content-Security-Policy", out var csp));
+        var value = Assert.Single(csp);
+        Assert.Contains("default-src 'self'", value);
+        Assert.Contains("script-src", value);
+    }
+
     private async Task SeedAsync(HttpClient client, string db, string line)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, $"/write?db={db}&precision=ns")
