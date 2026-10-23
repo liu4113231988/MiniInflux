@@ -522,4 +522,4 @@ MiniInflux.Net10 当前已经具备“小型单节点时序数据库”的骨架
 InfluxDB 1.x 兼容性测试矩阵
 ```
 
-具体拆解、优先级和阶段路线见 [todo-202610.md](todo-202610.md)（P0/P1/P2 清单已于 2026-10-23 全部完成）；写入性能优化项见 [todo-write-optimization-20260908.md](todo-write-optimization-20260908.md) 与 [todo-write-optimization-20260909.md](todo-write-optimization-20260909.md)。
+具体拆解、优先级和阶段路线见 [todo-202610.md](todo-202610.md)（P0/P1/P2 清单已于 2026-10-23 全部完成）；写入性能优化的详细方案与执行记录见 [todo.md](todo.md) 的 2026-09 章节。
