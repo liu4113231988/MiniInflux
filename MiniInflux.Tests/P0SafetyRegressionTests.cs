@@ -439,6 +439,26 @@ public sealed class P0SafetyRegressionTests : IDisposable
     }
 
     [Fact]
+    public void CreateBackup_WithDestinationContainingDataDirectory_IsRejected()
+    {
+        var source = Path.Combine(_testDir, "data");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "live.txt"), "keep");
+
+        // The parent of the data directory must be rejected: replacing the destination would
+        // delete the live data directory before a single byte is copied.
+        var ancestor = _testDir;
+        var error = Assert.Throws<InvalidOperationException>(() => BackupManager.CreateBackup(source, ancestor));
+
+        Assert.Contains("must not contain the data directory", error.Message);
+        Assert.Equal("keep", File.ReadAllText(Path.Combine(source, "live.txt")));
+        Assert.False(File.Exists(Path.Combine(_testDir, "backup.metadata.json")));
+
+        var child = Path.Combine(source, "nested");
+        Assert.Throws<InvalidOperationException>(() => BackupManager.CreateBackup(source, child));
+    }
+
+    [Fact]
     public void ValidateBackup_WithoutMetadata_RejectsUnverifiableBackup()
     {
         var backup = Path.Combine(_testDir, "unverified");

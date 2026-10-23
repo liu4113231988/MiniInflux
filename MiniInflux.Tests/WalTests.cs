@@ -138,9 +138,9 @@ public class WalTests : IDisposable
 
         wal.Checkpoint(wal.CurrentPosition);
 
-        // Old files should be deleted, only current file remains
+        // Checkpointing to the current position must reclaim every rotated file, leaving one live WAL.
         var walFiles = Directory.GetFiles(walDir, "*.wal");
-        Assert.True(walFiles.Length >= 1);
+        Assert.Single(walFiles);
     }
 
     [Fact]

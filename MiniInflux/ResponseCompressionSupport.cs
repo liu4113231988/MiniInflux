@@ -52,7 +52,7 @@ public static class ResponseCompressionSupport
         // Compressed length is unknown up front; drop any pre-set Content-Length.
         response.Headers.ContentLength = null;
 
-        return new LazyGzipStream(response);
+        return new LazyGzipStream(response, response.Body);
     }
 
     public static bool AcceptsGzip(HttpRequest request)
@@ -86,7 +86,10 @@ public static class ResponseCompressionSupport
         return false;
     }
 
-    private sealed class LazyGzipStream(HttpResponse response) : Stream
+    // The target stream is captured eagerly: the middleware assigns the wrapper to
+    // HttpResponse.Body, so resolving response.Body lazily would make the gzip stream write
+    // into itself.
+    private sealed class LazyGzipStream(HttpResponse response, Stream target) : Stream
     {
         private GZipStream? _gzip;
         private CountingStream? _counter;
@@ -101,7 +104,7 @@ public static class ResponseCompressionSupport
                 // The encoding header was already advertised by TryWrap; the body is the
                 // compressed payload from here on.
                 response.Headers.ContentLength = null;
-                _counter = new CountingStream(response.Body);
+                _counter = new CountingStream(target);
                 _gzip = new GZipStream(_counter, CompressionLevel.Fastest, leaveOpen: true);
                 return _gzip;
             }
