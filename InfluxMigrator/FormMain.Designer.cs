@@ -793,16 +793,9 @@ namespace InfluxdbDataSync
         private System.Windows.Forms.RichTextBox rtbLog;
         private System.Windows.Forms.GroupBox groupBox5;
         private System.Windows.Forms.TextBox txtRestoreFilePath;
-        private System.Windows.Forms.Label label22;
-        private System.Windows.Forms.TextBox txtRestorePassword;
-        private System.Windows.Forms.Label label21;
-        private System.Windows.Forms.TextBox txtRestoreUsername;
         private System.Windows.Forms.Label label20;
-        private System.Windows.Forms.TextBox txtRestoreDatabase;
         private System.Windows.Forms.Label label19;
-        private System.Windows.Forms.TextBox txtRestorePort;
         private System.Windows.Forms.Label label18;
-        private System.Windows.Forms.TextBox txtRestoreHost;
         private System.Windows.Forms.Label label17;
         private System.Windows.Forms.TextBox txtBackupFilePath;
         #endregion
@@ -817,8 +810,6 @@ namespace InfluxdbDataSync
         private Button btnRestoreFromFile;
         private Button btnFillData;
         private Button btnCancelSync;
-        private TextBox textBox1;
-        private TextBox txtMinNumber;
         private NumericUpDown numMin;
         private NumericUpDown numMax;
         private TextBox txtTimeInterval;

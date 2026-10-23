@@ -83,11 +83,10 @@ public sealed class AuthenticationGuard
             if (state.FailureCount > 0 && now - state.WindowStartedUtc >= _failureWindow)
                 state.Reset();
 
-            var grantedPermission = "all";
-            var credentialsOk = source == "token"
-                ? (grantedPermission = ResolveTokenPermission(password ?? "")) != null
-                : CredentialsMatch(userName, password);
-            if (credentialsOk)
+            string? grantedPermission = source == "token"
+                ? ResolveTokenPermission(password ?? "")
+                : CredentialsMatch(userName, password) ? "all" : null;
+            if (grantedPermission != null)
             {
                 state.Reset();
                 return new AuthenticationAttempt

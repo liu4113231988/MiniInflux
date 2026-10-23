@@ -4,13 +4,13 @@ public sealed class StorageHealth
 {
     private long _failureCount;
     private long _lastDiskCheckTicks;
-    private volatile int _lastDiskCheckResult = 1; // 1 = sufficient, 0 = below floor
+    private int _lastDiskCheckResult = 1; // 1 = sufficient, 0 = below floor
     private string? _lastFailure;
     private string? _lastFailureComponent;
     private long _lastFailureUtcMilliseconds; // 0 = none; Interlocked works on long, not structs
-    private volatile int _writeAvailable = 1; // 1 = true, 0 = false
+    private int _writeAvailable = 1; // 1 = true, 0 = false
 
-    public bool WriteAvailable => _writeAvailable == 1;
+    public bool WriteAvailable => Volatile.Read(ref _writeAvailable) == 1;
     public long FailureCount => Interlocked.Read(ref _failureCount);
     public string? LastFailure => Volatile.Read(ref _lastFailure);
     public string? LastFailureComponent => Volatile.Read(ref _lastFailureComponent);
@@ -67,7 +67,7 @@ public sealed class StorageHealth
     }
 
     /// <summary>True while writes are latched off by a storage failure.</summary>
-    public bool NeedsRecoveryProbe => _writeAvailable == 0;
+    public bool NeedsRecoveryProbe => Volatile.Read(ref _writeAvailable) == 0;
 
     /// <summary>Run a recovery probe and unlatch writes when it succeeds.</summary>
     public bool TryRecover(Func<bool> probe)

@@ -589,7 +589,7 @@ dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo --no-restore
 
 ## 说明
 
-这是一个完整可运行的工程包，但仍是 InfluxDB 1.x 的兼容子集，不是完整替代品。生产增强建议包括：更完整 InfluxQL、LSM compaction、倒排索引持久化、Retention Policy、多节点副本等。
+这是一个完整可运行的工程包，但仍是 InfluxDB 1.x 的兼容子集，不是完整替代品。生产增强建议包括：更完整的 InfluxQL 语义、更完善的 LSM compaction、在线一致性备份、多节点副本等。
 
 ## 压测结果
 

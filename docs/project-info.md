@@ -3,17 +3,18 @@
 
 # MiniInflux.Net10 项目状态
 
-更新时间：2026-06-27
+更新时间：2026-10-23
 
 MiniInflux.Net10 是一个基于 .NET 10 / ASP.NET Core Minimal API 的轻量级 InfluxDB 1.x 兼容子集时序数据库。当前项目已经具备单节点时序数据库的完整主链路：HTTP 接口、Line Protocol 写入、写入队列、WAL、segment 存储、schema、manifest/index、shard/retention、compaction、InfluxQL 子集、查询保护、权限、诊断指标、管理 CLI 和回归测试。
 
 当前验证状态：
 
 ```text
+dotnet build .\MiniInflux.slnx -nologo --no-restore
+结果：成功，0 warning，0 error
+
 dotnet test .\MiniInflux.Tests\MiniInflux.Tests.csproj -nologo --no-restore
-结果：命令退出码 0
-测试用例：源码中共 168 个 [Fact]/[Theory] 测试标记
-备注：本次环境没有打印详细 passed 汇总，因此以退出码和测试标记数量记录。
+结果：通过 535/535，失败 0，跳过 0（2026-10-23）
 ```
 
 ***
@@ -35,21 +36,18 @@ InfluxDB 1.x 兼容性：子集可用，但不是完整替代
 生产级长期运行：具备基础保护，还需要继续打磨边界语义、压测和运维安全性
 ```
 
-## 2. 当前最需要注意的文档差异
+## 2. 当前已知限制
 
-`docs/README.md` 是当前最接近源码状态的说明；旧版 `docs/project-info.md` 中仍保留了一些已经完成的风险项，例如：
+`docs/README.md` 是面向使用者的说明，本文件记录面向开发者的实现状态。`docs/todo-202610.md` 中的 P0/P1/P2 清单已于 2026-10-23 全部完成，当前剩余限制主要是兼容性纵深和生产化能力：
 
 ```text
-WAL 仍是文件粒度 checkpoint
-完整多层 LSM compaction 还没有
-查询结果未支持 chunked response
-regex tag predicate 仍只能读点后过滤
-auth 仍是全局用户校验
-backup / restore 缺少元信息校验
-字节级内存限制未接入
+InfluxQL 仍是兼容子集，并非完整替代
+单超级管理员 + 静态 token（all/read/write），不支持多用户和细粒度授权
+compaction 为分层合并实现，不是完整 LSM
+backup/restore 有一致性校验与 pending restore，但不是在线快照协议
+查询内存估算为近似模型，需按真实 workload 校准
+无多节点复制/HA
 ```
-
-这些能力现在都已经至少完成第一版，应从“当前最大风险”中移出。
 
 ***
 
@@ -68,9 +66,14 @@ GET  /metrics
 POST /write?db=xxx&rp=xxx&precision=...
 GET  /query?db=xxx&q=...
 POST /query
+POST /api/v2/write?bucket=db/rp&precision=...
+POST /api/v3/query_influxql
+GET  /admin
+/admin/api/query
+/admin/api/tokens
 ```
 
-写入接口支持 gzip body。写入队列满、请求体过大、buffer 超限或 series cardinality 超限时会返回受控错误。
+写入接口支持 chunked body、gzip 请求体；`/query` 与 `/api/v3/query_influxql` 支持 `format=csv`，查询响应可按 `Accept-Encoding: gzip` 压缩。写入队列满、请求体过大、buffer 超限或 series cardinality 超限时会返回受控错误；`db`/`rp`/`bucket` 在 HTTP 入口和引擎边界统一做标识符校验。
 
 ## 2. Line Protocol 写入
 
@@ -368,17 +371,22 @@ query memory estimate metrics
 
 ```text
 HTTP Basic 认证
+Token / Bearer 认证（token 明文仅在创建时返回一次，服务端只存 SHA256）
+token 权限分级：all / read / write
 query 参数认证
 配置文件单一超级管理员
 Auth.Enabled 认证总开关，Http.AuthEnabled 作为旧配置兼容回退
 Auth.Username / Auth.Password 唯一凭据
+认证/TLS 配置不完整时启动失败（fail-closed）
 登录失败审计日志
 按客户端地址的失败限流与临时锁定
 query / write / admin / diagnostics 路由统一认证
+按语句类型校验权限：写语句、DDL、SELECT INTO 需要 write/all
+/admin/api/query 只读控制台拒绝所有非只读语句
 管理台登录与会话状态
 ```
 
-系统不再维护数据目录用户仓库，不支持运行时用户 CRUD、改密或 database / RP / measurement 级授权。旧 `meta/auth.json` 不再读取。
+系统不再维护数据目录用户仓库，不支持运行时用户 CRUD、改密或 database / RP / measurement 级授权。旧 `meta/auth.json` 不再读取。token 通过 `POST /admin/api/tokens` 由超级管理员创建，删除和列表现已支持持久化。
 
 ## 16. Continuous Query
 
@@ -466,22 +474,23 @@ LineProtocolParser
 InfluxQlParser
 Compression codecs
 CRC32
-WAL replay / checkpoint / rotation
-Segment read/write / atomic write / corruption detection
+WAL replay / checkpoint / rotation / 撕裂尾部恢复
+Segment read/write / atomic write / corruption detection / quarantine
 SchemaRegistry
-Index / Manifest
+Index / Manifest 损坏恢复与从段重建
 Duplicate point
-Aggregation
+Aggregation / GROUP BY / fill / 多函数组合
 P0/P1/P2 todo 回归项
-Configuration / logging
-Management CLI
+Configuration / logging / 启动安全校验
+Management CLI（含 backup / restore / repair / compact）
 Continuous Query
-配置文件单一超级管理员认证
-Backup / Restore
-恢复 / 备份 / compaction 故障注入
+认证、token 权限矩阵与 HTTP 集成测试
+HTTP /write、/query、v2/v3、chunked body、CSV、gzip 请求与响应
+Backup / Restore / 备份元信息校验
+恢复 / 备份 / compaction 故障注入与并发读一致性
 ```
 
-当前源码中共有 168 个 `[Fact]` / `[Theory]` 测试标记。
+当前 `dotnet test` 实际运行 535 个用例（`[Fact]`/`[Theory]` 实例化后的测试数），全部通过。
 
 ***
 
@@ -492,7 +501,7 @@ Backup / Restore
 ```text
 1. chunked raw SELECT 已完成边扫描边输出第一版；GROUP BY / 函数 / 子查询 / SELECT INTO 回写阶段的峰值估算已补强，但复杂查询仍需继续降低物化内存峰值。
 2. SELECT INTO / Subquery / Continuous Query 已补到短期可用：quoted db/rp/measurement、subquery string field/tag、CQ 子查询 + WHERE 已有回归；剩余主要是更复杂组合测试。
-3. Auth 已补齐单一超级管理员模型、失败审计和基础限流；后续主要是外部 secret provider 和凭据轮换。
+3. Auth 已补齐单一超级管理员模型、token 分级（all/read/write）、失败审计、基础限流和 fail-closed 启动；后续主要是外部 secret provider 和凭据轮换。
 4. Compaction 已补到短期可上线：overlap-aware、多轮排空 backlog、staged 切换、读序修正，以及并发查询/并发删除/混合删改 soak 回归已具备；后续重点转为更长期压测和限速策略。
 5. Backup / restore 已有校验、pending restore 和故障注入回归测试，但还不是在线一致性快照协议。
 6. 内存估算是近似模型，仍需按真实 workload 校准。
@@ -513,4 +522,4 @@ MiniInflux.Net10 当前已经具备“小型单节点时序数据库”的骨架
 InfluxDB 1.x 兼容性测试矩阵
 ```
 
-具体拆解、优先级和阶段路线见 [todo-202606.md](todo-202606.md)。
+具体拆解、优先级和阶段路线见 [todo-202610.md](todo-202610.md)（P0/P1/P2 清单已于 2026-10-23 全部完成）；写入性能优化项见 [todo-write-optimization-20260908.md](todo-write-optimization-20260908.md) 与 [todo-write-optimization-20260909.md](todo-write-optimization-20260909.md)。
