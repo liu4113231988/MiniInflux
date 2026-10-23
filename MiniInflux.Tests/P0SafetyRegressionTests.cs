@@ -41,6 +41,23 @@ public sealed class P0SafetyRegressionTests : IDisposable
     private static TsdbEngine NewEngine(string path, int flushThreshold = 1000) =>
         new(path, flushThreshold: flushThreshold, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0);
 
+    /// <summary>
+    /// Copies a data directory into a crash image. Sources may still be open for append, hence the
+    /// permissive share mode on the read side.
+    /// </summary>
+    private static void CopyDirectory(string source, string destination)
+    {
+        Directory.CreateDirectory(destination);
+        foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+        {
+            var target = Path.Combine(destination, Path.GetRelativePath(source, file));
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            using var input = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var output = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None);
+            input.CopyTo(output);
+        }
+    }
+
     private static void AssertSingleSeriesValue(QueryResponse response, string columnPrefix, double expected)
     {
         Assert.Null(response.Results[0].Error);
@@ -222,6 +239,61 @@ public sealed class P0SafetyRegressionTests : IDisposable
         await checkpointTask!;
         Assert.True(earliestUnflushedPosition.HasValue);
         Assert.Equal(earliestUnflushedPosition.Value, wal.CheckpointPosition);
+    }
+
+    [Fact]
+    public async Task CrashAfterAckBeforeBufferFloorPublication_RestartReplaysAcknowledgedPoint()
+    {
+        var dataPath = Path.Combine(_testDir, "wal-crash");
+        var crashCopy = Path.Combine(_testDir, "wal-crash-image");
+        using var engine = NewEngine(dataPath);
+        engine.CreateDatabase("testdb");
+
+        var engineType = typeof(TsdbEngine);
+        var appendGate = Assert.IsType<ReaderWriterLockSlim>(
+            engineType.GetField("_walAppendGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(engine));
+        var wal = Assert.IsType<WalManager>(
+            engineType.GetField("_wal", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(engine));
+        var checkpoint = engineType.GetMethod("UpdateWalCheckpoint", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var flushWalToDisk = typeof(WalManager).GetMethod("FlushToDisk", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        using var appended = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var pausedAppend = Task.Factory.StartNew(() =>
+        {
+            appendGate.EnterReadLock();
+            try
+            {
+                // Model the write path exactly at its crash window: the WAL record is durable and
+                // already acknowledged, but the buffer replay floor has not been published yet.
+                wal.AppendBatch("testdb", "autogen", [Point("cpu", 42, 100, ("host", "a"))]);
+                flushWalToDisk.Invoke(wal, null);
+                appended.Set();
+                release.Wait();
+            }
+            finally { appendGate.ExitReadLock(); }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        Assert.True(appended.Wait(TimeSpan.FromSeconds(5)), "paused append did not complete");
+        var checkpointTask = Task.Run(() => checkpoint.Invoke(engine, null));
+        Assert.True(
+            SpinWait.SpinUntil(() => appendGate.WaitingWriteCount > 0, TimeSpan.FromSeconds(5)),
+            "checkpoint did not wait for the paused append");
+        Assert.False(checkpointTask.IsCompleted);
+
+        // The crash image is taken while the checkpoint is still blocked: WAL has the record, the
+        // checkpoint file does not exist yet. A restart from this image must replay the point.
+        CopyDirectory(dataPath, crashCopy);
+        Assert.False(File.Exists(Path.Combine(crashCopy, "wal", "checkpoint.dat")));
+
+        release.Set();
+        await pausedAppend;
+        await checkpointTask;
+
+        using var recovered = NewEngine(crashCopy);
+        recovered.Recover();
+        var point = Assert.Single(recovered.ReadAllPoints("testdb", "autogen", "cpu", null, null));
+        Assert.Equal(42, point.Fields["value"].AsDouble());
     }
 
     [Fact]

@@ -296,11 +296,13 @@ public sealed class QueryExecutor
             ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
             : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var queryId = RegisterActiveQuery(q, db, linkedCts);
+        var previousZone = t_timeZone;
         try
         {
             var token = linkedCts.Token;
 
             var parsed = ParseAndBind(q, queryParams);
+            t_timeZone = ResolveTimeZone(parsed.GroupByTimeZone);
             using var segmentRead = parsed.Kind == QueryKind.Select ? e.AcquireSegmentRead(token) : null;
             QueryResponse response;
             if (CanStreamRawSelectResponse(e, db, parsed))
@@ -365,6 +367,7 @@ public sealed class QueryExecutor
         }
         finally
         {
+            t_timeZone = previousZone;
             UnregisterActiveQuery(queryId);
         }
     }
@@ -787,7 +790,7 @@ public sealed class QueryExecutor
                 rows.Add(new() { db, rp, (long)shard.Id, FormatTime(shard.StartTimeNs), FormatTime(shard.EndTimeNs) });
             }
         }
-        return [new() { Name = "shard groups", Columns = ["database", "retention_policy", "shard_id", "start_time", "end_time"], Values = rows }];
+        return [new() { Name = "shard groups", Columns = ["database", "retention_policy", "shard_group_id", "start_time", "end_time"], Values = rows }];
     }
 
     List<QuerySeries>? ShowStats(TsdbEngine e, string? db, ParsedQuery q)
@@ -836,6 +839,8 @@ public sealed class QueryExecutor
         // Per-measurement stats
         Req(db);
         var meas = target;
+        if (!e.ListMeasurements(db!).Any(name => string.Equals(name, meas, StringComparison.Ordinal)))
+            throw new InvalidOperationException($"measurement not found: {meas}");
         var fieldKeys = e.ListFieldKeys(db!, meas);
         var tagKeys = e.ListTagKeys(db!, meas);
         var series = e.ListSeries(db!, meas).Count;
@@ -896,12 +901,7 @@ public sealed class QueryExecutor
         return [new() { Name = "field key cardinality", Columns = ["count"], Values = [new List<object?> { fieldKeyCount }] }];
     }
 
-    static string FormatTime(long ns)
-    {
-        if (ns <= 0) return "";
-        var dt = DateTimeOffset.FromUnixTimeMilliseconds(ns / 1_000_000);
-        return dt.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
-    }
+    static string FormatTime(long ns) => ns == 0 ? "" : Time(ns);
 
     List<QuerySeries>? CreateContinuousQuery(TsdbEngine e, ParsedQuery q)
     {
@@ -1551,7 +1551,9 @@ public sealed class QueryExecutor
                 continue;
 
             var tagKey = BuildGroupByTagKey(point.Tags, q.GroupByTags, q.GroupByAllTags);
-            long? bucketTime = q.GroupByNs.HasValue ? point.TimestampNs / q.GroupByNs.Value * q.GroupByNs.Value : null;
+            long? bucketTime = q.GroupByNs.HasValue
+                ? BucketTime(point.TimestampNs, q.GroupByNs.Value, q.GroupByOffsetNs ?? 0)
+                : null;
             var key = (tagKey, bucketTime);
             if (!groups.TryGetValue(key, out var group))
             {
@@ -1789,7 +1791,7 @@ public sealed class QueryExecutor
         {
             cancellationToken.ThrowIfCancellationRequested();
             var tagKey = BuildGroupByTagKey(p.Tags, tagNames, groupByAllTags);
-            long? bucketTime = step.HasValue ? p.TimestampNs / step.Value * step.Value : null;
+            long? bucketTime = step.HasValue ? BucketTime(p.TimestampNs, step.Value, q.GroupByOffsetNs ?? 0) : null;
             var key = (tagKey, bucketTime);
             if (!groups.TryGetValue(key, out var list))
             {
@@ -1881,7 +1883,7 @@ public sealed class QueryExecutor
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var tagKey = BuildGroupByTagKey(p.Tags, tagNames, groupByAllTags);
-                long? bucketTime = step.HasValue ? p.TimestampNs / step.Value * step.Value : null;
+                long? bucketTime = step.HasValue ? BucketTime(p.TimestampNs, step.Value, q.GroupByOffsetNs ?? 0) : null;
                 var key = (tagKey, bucketTime);
                 
                 if (!chunkGroups.TryGetValue(key, out var list))
@@ -1961,7 +1963,7 @@ public sealed class QueryExecutor
         foreach (var p in pts)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var bucketTime = p.TimestampNs / step!.Value * step.Value;
+            var bucketTime = BucketTime(p.TimestampNs, step!.Value, q.GroupByOffsetNs ?? 0);
             if (!groups.TryGetValue(bucketTime, out var list))
             {
                 list = [];
@@ -2756,16 +2758,14 @@ public sealed class QueryExecutor
 
     static void ApplyFill(Dictionary<string, QuerySeries> seriesMap, ParsedQuery q, long step, List<SelectItem> items)
     {
-        var minBucket = q.MinTimeNs!.Value / step * step;
-        var maxBucket = q.MaxTimeNs!.Value / step * step;
+        var offset = q.GroupByOffsetNs ?? 0;
+        var minBucket = BucketTime(q.MinTimeNs!.Value, step, offset);
+        var maxBucket = BucketTime(q.MaxTimeNs!.Value, step, offset);
         foreach (var series in seriesMap.Values)
         {
             var timeSet = new HashSet<long>();
             foreach (var row in series.Values)
-            {
-                if (row[0] is string ts && DateTimeOffset.TryParse(ts, out var dto))
-                    timeSet.Add(dto.ToUnixTimeMilliseconds() * 1_000_000);
-            }
+                timeSet.Add(ParseTimeNs(row[0]));
             var filledRows = new List<List<object?>>();
             var prevValues = new object?[items.Count];
             var original = series.Values.ToDictionary(row => ParseTimeNs(row[0]), row => row);
@@ -4515,22 +4515,72 @@ public sealed class QueryExecutor
     }
 
     [ThreadStatic]
-    private static Dictionary<long, string>? _timeCache;
+    private static Dictionary<(long Ns, string? Zone), string>? _timeCache;
+
+    /// <summary>Output time zone for the query currently executing on this thread (GROUP BY ... tz()).</summary>
+    [ThreadStatic]
+    private static TimeZoneInfo? t_timeZone;
+
+    static TimeZoneInfo? ResolveTimeZone(string? id)
+    {
+        if (string.IsNullOrEmpty(id)) return null;
+        try
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById(id);
+        }
+        catch (TimeZoneNotFoundException)
+        {
+            throw new InvalidOperationException($"unknown time zone: {id}");
+        }
+        catch (InvalidTimeZoneException)
+        {
+            throw new InvalidOperationException($"invalid time zone: {id}");
+        }
+    }
+
+    /// <summary>Floor division/remainder, so times before the Unix epoch bucket correctly.</summary>
+    static (long Quotient, long Remainder) FloorDivRem(long value, long divisor)
+    {
+        var quotient = Math.DivRem(value, divisor, out var remainder);
+        if (remainder < 0)
+        {
+            quotient--;
+            remainder += divisor;
+        }
+        return (quotient, remainder);
+    }
+
+    static long BucketTime(long timestampNs, long step, long offset)
+    {
+        var (quotient, _) = FloorDivRem(timestampNs - offset, step);
+        return quotient * step + offset;
+    }
 
     static string Time(long ns)
     {
+        var zone = t_timeZone;
         // Cache formatted timestamps — effective for GROUP BY time where many rows share bucket boundaries.
-        var cache = _timeCache ??= new Dictionary<long, string>(128);
-        if (cache.TryGetValue(ns, out var cached))
+        var cache = _timeCache ??= new Dictionary<(long, string?), string>(128);
+        var key = (ns, zone?.Id);
+        if (cache.TryGetValue(key, out var cached))
             return cached;
 
-        var seconds = Math.DivRem(ns, 1_000_000_000L, out var nanos);
-        var dt = DateTimeOffset.FromUnixTimeSeconds(seconds).UtcDateTime;
-        var result = $"{dt:yyyy-MM-ddTHH:mm:ss}.{nanos:D9}Z";
+        var (seconds, nanos) = FloorDivRem(ns, 1_000_000_000L);
+        var instant = DateTimeOffset.FromUnixTimeSeconds(seconds);
+        string result;
+        if (zone is null)
+        {
+            result = $"{instant.UtcDateTime:yyyy-MM-ddTHH:mm:ss}.{nanos:D9}Z";
+        }
+        else
+        {
+            var local = TimeZoneInfo.ConvertTime(instant, zone);
+            result = $"{local:yyyy-MM-ddTHH:mm:ss}.{nanos:D9}{local:zzz}";
+        }
 
         // Bound cache size to prevent unbounded growth for unique-timestamp queries.
         if (cache.Count < 4096)
-            cache[ns] = result;
+            cache[key] = result;
 
         return result;
     }
@@ -4543,18 +4593,25 @@ public sealed class QueryExecutor
         if (long.TryParse(s, out var numeric)) return numeric;
 
         var trimmed = s.Trim();
-        var z = trimmed.EndsWith("Z", StringComparison.OrdinalIgnoreCase) ? trimmed[..^1] : trimmed;
-        var dot = z.IndexOf('.');
-        var basePart = dot >= 0 ? z[..dot] : z;
-        var fraction = dot >= 0 ? z[(dot + 1)..] : "";
-        if (DateTime.TryParseExact(basePart, "yyyy-MM-ddTHH:mm:ss", null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var dt))
+        // Fast path for Z-suffixed times preserves nanosecond precision.
+        if (trimmed.EndsWith("Z", StringComparison.OrdinalIgnoreCase))
         {
-            var seconds = new DateTimeOffset(dt, TimeSpan.Zero).ToUnixTimeSeconds();
-            var normalizedFraction = fraction.Length == 0 ? "0" : (fraction.Length >= 9 ? fraction[..9] : fraction.PadRight(9, '0'));
-            var nanos = long.Parse(normalizedFraction);
-            return seconds * 1_000_000_000L + nanos;
+            var z = trimmed[..^1];
+            var dot = z.IndexOf('.');
+            var basePart = dot >= 0 ? z[..dot] : z;
+            var fraction = dot >= 0 ? z[(dot + 1)..] : "";
+            if (DateTime.TryParseExact(basePart, "yyyy-MM-ddTHH:mm:ss", null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var dt))
+            {
+                var seconds = new DateTimeOffset(dt, TimeSpan.Zero).ToUnixTimeSeconds();
+                var normalizedFraction = fraction.Length == 0 ? "0" : (fraction.Length >= 9 ? fraction[..9] : fraction.PadRight(9, '0'));
+                var nanos = long.Parse(normalizedFraction);
+                return seconds * 1_000_000_000L + nanos;
+            }
         }
-        return DateTimeOffset.TryParse(s, out var dto) ? dto.ToUnixTimeMilliseconds() * 1_000_000 : 0;
+        // Offset-bearing timestamps (GROUP BY ... tz()) must be converted through the offset.
+        return DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dto)
+            ? checked((dto.UtcTicks - DateTimeOffset.UnixEpoch.UtcTicks) * 100)
+            : 0;
     }
 
     static object? LinearFill(List<(long T, double V)> valid, long time)

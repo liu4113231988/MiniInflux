@@ -54,11 +54,29 @@ public sealed class HttpSmokeTests : IClassFixture<MiniInfluxAppFactory>
     public HttpSmokeTests(MiniInfluxAppFactory factory) => _factory = factory;
 
     [Fact]
-    public async Task Ping_ReturnsNoContent()
+    public async Task Ping_GetAndHead_ReturnNoContentWithVersionHeader()
     {
         var client = _factory.CreateClient();
         var response = await client.GetAsync("/ping");
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.True(response.Headers.Contains("X-Influxdb-Version"));
+
+        using var headRequest = new HttpRequestMessage(HttpMethod.Head, "/ping");
+        using var headResponse = await client.SendAsync(headRequest);
+        Assert.Equal(HttpStatusCode.NoContent, headResponse.StatusCode);
+        Assert.True(headResponse.Headers.Contains("X-Influxdb-Version"));
+    }
+
+    [Fact]
+    public async Task Root_RedirectsToAdmin()
+    {
+        var client = _factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false
+        });
+        using var response = await client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.Equal("/admin", response.Headers.Location?.OriginalString);
     }
 
     [Fact]

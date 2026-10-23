@@ -154,12 +154,12 @@ public sealed class ShardManager
 
     /// <summary>
     /// Delete expired shards based on retention policies.
-    /// Returns count of deleted shards.
+    /// Returns the (db, rp, shardId) entries that were removed so the caller can prune indexes.
     /// </summary>
-    public int CleanupExpiredShards(long nowNs)
+    public List<(string Db, string Rp, int ShardId)> CleanupExpiredShards(long nowNs)
     {
         var expired = _manifest.GetExpiredShards(_dataPath, nowNs);
-        int count = 0;
+        var removed = new List<(string Db, string Rp, int ShardId)>(expired.Count);
         foreach (var (db, rp, shardId, _) in expired)
         {
             try
@@ -170,11 +170,11 @@ public sealed class ShardManager
                 if (Directory.Exists(dir))
                     Directory.Delete(dir, recursive: true);
                 _manifest.RemoveShardGroup(db, rp, shardId);
-                count++;
+                removed.Add((db, rp, shardId));
             }
             catch { /* best effort */ }
         }
-        return count;
+        return removed;
     }
 
     /// <summary>

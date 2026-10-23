@@ -235,7 +235,13 @@ app.Use(async (context, next) =>
     await next();
 });
 
-app.MapGet("/ping", () => Results.NoContent());
+// InfluxDB 1.x clients probe /ping and read X-Influxdb-Version; HEAD must answer like GET.
+var serverVersion = typeof(Program).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+app.MapMethods("/ping", ["GET", "HEAD"], (HttpContext context) =>
+{
+    context.Response.Headers["X-Influxdb-Version"] = serverVersion;
+    return Results.NoContent();
+});
 
 app.MapGet("/health", (TsdbEngine tsdbEngine) =>
 {
@@ -279,6 +285,9 @@ app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
 
 app.MapPost("/write", (HttpRequest request, WriteQueue writeQueue, MetricsCollector metrics, string? db, string? rp, string? precision) =>
 {
+    // Authenticate before parameter validation so unauthenticated callers always see 401, not 400.
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "write"))
+        return Task.FromResult<IResult>(authResult);
     if (string.IsNullOrWhiteSpace(db))
         return Task.FromResult<IResult>(Results.BadRequest(new ErrorResponse("missing required parameter db")));
     if (!IdentifierValidator.IsValidDatabaseName(db))
@@ -295,6 +304,8 @@ app.MapPost("/write", (HttpRequest request, WriteQueue writeQueue, MetricsCollec
 app.MapPost("/api/v2/write", (HttpRequest request, WriteQueue writeQueue, MetricsCollector metrics, string? bucket, string? org, string? precision) =>
 {
     _ = org; // accepted and ignored per InfluxDB 2.x spec (required param but no org model)
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, v2ErrorFormat: true, requiredPermission: "write"))
+        return Task.FromResult<IResult>(authResult);
     if (!V2WriteSupport.TryResolveBucket(bucket, out var db, out var rp, out var error))
         return Task.FromResult<IResult>(Results.Json(new V2ErrorResponse("invalid", error), AppJsonContext.Default.V2ErrorResponse, statusCode: 400));
     return WritePointsAsync(request, db, rp, precision, writeQueue, metrics, isV2: true);
@@ -302,6 +313,11 @@ app.MapPost("/api/v2/write", (HttpRequest request, WriteQueue writeQueue, Metric
 
 app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics, string? db, string? q) =>
 {
+    // Authenticate before reading a form body; the statement-level write check follows once q
+    // is known (form bodies may carry it).
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
+        return authResult;
+
     var chunked = TryParseBool(request.Query["chunked"].ToString());
     var debug = TryParseBool(request.Query["debug"].ToString());
     var epoch = request.Query["epoch"].ToString();
@@ -335,7 +351,8 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
     try { requiredPermission = QueryPermission.RequiredPermission(InfluxQlParser.Parse(q)); }
     catch { /* malformed query: executor returns the parse error */ }
 
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: requiredPermission))
+    if (requiredPermission != "read"
+        && !EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out authResult, requiredPermission: requiredPermission))
         return authResult;
 
     // P3 参数化查询：v1 `?params={"host":"a"}`（或 form 字段）中的 `$name` 占位符由
@@ -391,6 +408,10 @@ app.MapMethods("/query", ["GET", "POST"], async (HttpRequest request, QueryExecu
 // v3 的 v1 风格 {"results":[...]} 信封，执行错误（非超时/取消）以 400 + {"error"} 返回
 app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor executor, TsdbEngine tsdbEngine, MetricsCollector metrics) =>
 {
+    // Authenticate before parsing the JSON/form body; the write-tier check runs after q is known.
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
+        return authResult;
+
     V3QueryRequest? body = null;
     if (request.ContentLength != 0
         && (request.ContentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true
@@ -422,7 +443,8 @@ app.MapPost("/api/v3/query_influxql", async (HttpRequest request, QueryExecutor 
     try { requiredPermission = QueryPermission.RequiredPermission(InfluxQlParser.Parse(q)); }
     catch { /* malformed query: executor returns the parse error */ }
 
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: requiredPermission))
+    if (requiredPermission != "read"
+        && !EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out authResult, requiredPermission: requiredPermission))
         return authResult;
 
     var format = body?.Format ?? request.Query["format"].ToString();
@@ -858,12 +880,13 @@ app.MapGet("/admin/{**path}", (string? path) =>
     return EmbeddedFile(staticAssets, "admin/index.html", "text/html; charset=utf-8");
 });
 
-app.MapGet("/", () => EmbeddedFile(staticAssets, "index.html", "text/html; charset=utf-8"));
+// wwwroot has no index.html; send browsers to the admin UI instead of a 404.
+app.MapGet("/", () => Results.Redirect("/admin"));
 
 app.MapGet("/{**staticPath}", (string? staticPath) =>
 {
     if (string.IsNullOrWhiteSpace(staticPath))
-        return EmbeddedFile(staticAssets, "index.html", "text/html; charset=utf-8");
+        return Results.Redirect("/admin");
 
     var resourcePath = staticPath.Replace('\\', '/');
     if (resourcePath.Contains("../", StringComparison.Ordinal))
@@ -1109,8 +1132,17 @@ static bool TryWriteEpochValue(Utf8JsonWriter writer, object? value, long epochD
 static bool TryParseRfc3339Ns(string text, out long ns)
 {
     ns = 0;
+    if (!text.EndsWith("Z", StringComparison.Ordinal))
+    {
+        // GROUP BY ... tz(...) emits offset-bearing timestamps (e.g. +08:00).
+        if (!DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var zoned))
+            return false;
+        ns = checked((zoned.UtcTicks - DateTimeOffset.UnixEpoch.UtcTicks) * 100);
+        return true;
+    }
+
     var dot = text.IndexOf('.');
-    var z = text.EndsWith("Z", StringComparison.Ordinal) ? text.Length - 1 : text.Length;
+    var z = text.Length - 1;
     var secondEnd = dot >= 0 ? dot : z;
     if (!DateTimeOffset.TryParse(text[..secondEnd] + "Z", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dto))
         return false;
@@ -1238,8 +1270,7 @@ static bool TryParseBool(string? value) =>
 /// </summary>
 async Task<IResult> WritePointsAsync(HttpRequest request, string db, string? rp, string? precision, WriteQueue writeQueue, MetricsCollector metrics, bool isV2 = false)
 {
-    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, v2ErrorFormat: isV2, requiredPermission: "write"))
-        return authResult;
+    // Callers (/write, /api/v2/write) authenticate before validating db/bucket parameters.
     if (request.ContentLength > options.Write.MaxRequestBodyBytes)
         return isV2
             ? Results.Json(new V2ErrorResponse("too large", "request body too large"), AppJsonContext.Default.V2ErrorResponse, statusCode: 413)

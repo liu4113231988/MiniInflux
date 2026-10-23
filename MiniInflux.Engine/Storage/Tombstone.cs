@@ -27,6 +27,7 @@ public sealed class Tombstone
 public sealed class TombstoneStore
 {
     private readonly string _dir;
+    private readonly StorageHealth? _health;
     private readonly object _lock = new();
     private readonly Dictionary<string, List<Tombstone>> _tombstones = new(StringComparer.Ordinal);
     private long _version;
@@ -34,9 +35,10 @@ public sealed class TombstoneStore
 
     private sealed record RangeCache(long Version, Dictionary<string, List<(long Min, long Max)>> ByKey);
 
-    public TombstoneStore(string dataPath)
+    public TombstoneStore(string dataPath, StorageHealth? health = null)
     {
         _dir = Path.Combine(dataPath, "tombstones");
+        _health = health;
         LoadAll();
     }
 
@@ -502,7 +504,12 @@ public sealed class TombstoneStore
                 var list = JsonSerializer.Deserialize(json, TombstoneJsonContext.Default.ListTombstone);
                 if (list != null) _tombstones[db] = list;
             }
-            catch { /* corrupted tombstone file, skip */ }
+            catch (Exception ex)
+            {
+                // Reporting the failure keeps deleted data from silently reappearing after a
+                // corrupt tombstone file: operators see it in health stats instead of a clean start.
+                _health?.RecordFailure("tombstone_load", ex);
+            }
         }
     }
 
@@ -513,9 +520,20 @@ public sealed class TombstoneStore
         Directory.CreateDirectory(_dir);
         var path = Path.Combine(_dir, $"{db}.json");
         var tmp = path + ".tmp";
-        var json = JsonSerializer.Serialize(list, TombstoneJsonContext.Default.ListTombstone);
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, path, overwrite: true);
+        try
+        {
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(fs, list, TombstoneJsonContext.Default.ListTombstone);
+                fs.Flush(true);
+            }
+            File.Move(tmp, path, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch (IOException) { }
+            throw;
+        }
     }
 }
 

@@ -46,6 +46,12 @@ public sealed record ParsedQuery
     public int? SeriesOffset { get; init; }
     public bool Desc { get; init; }
     public long? GroupByNs { get; init; }
+
+    /// <summary>Bucket alignment offset from GROUP BY time(interval, offset).</summary>
+    public long? GroupByOffsetNs { get; init; }
+
+    /// <summary>IANA/windows time zone id from GROUP BY ... tz('...'), used for result timestamps.</summary>
+    public string? GroupByTimeZone { get; init; }
     public List<string> GroupByTags { get; init; } = [];
     public bool GroupByAllTags { get; init; }
     public FillMode Fill { get; init; } = FillMode.None;
@@ -164,7 +170,7 @@ public static class InfluxQlParser
             var forIdx = u.IndexOf(" FOR ");
             if (forIdx >= 0)
             {
-                var target = q[(forIdx + 5)..].Trim().Trim('\'');
+                var target = Unq(q[(forIdx + 5)..].Trim().Trim('\''));
                 return new() { Kind = QueryKind.ShowStats, StatsTarget = target };
             }
             return new() { Kind = QueryKind.ShowStats };
@@ -606,6 +612,10 @@ public static class InfluxQlParser
         else
         {
             string sourceToken = ReadSourceToken(rest);
+            if (sourceToken.Length > 1 && sourceToken[0] == '/' && sourceToken[^1] == '/')
+                throw new NotSupportedException("SELECT FROM a regular expression measurement is not supported");
+            if (sourceToken.Contains(',') || rest[sourceToken.Length..].TrimStart().StartsWith(','))
+                throw new NotSupportedException("SELECT from multiple measurements is not supported");
             var source = ParseQualifiedMeasurement(sourceToken);
             measurement = source.Measurement;
             sourceDb = source.Database;
@@ -613,7 +623,12 @@ public static class InfluxQlParser
             tail = rest.Length > sourceToken.Length ? rest[sourceToken.Length..] : "";
         }
 
-        long? min = null, max = null, gb = null; int? limit = null, offset = null;
+        // Multiple measurements are valid InfluxQL but require cross-measurement merge semantics;
+        // reject them explicitly instead of silently querying only the first one.
+        if (tail.TrimStart().StartsWith(','))
+            throw new NotSupportedException("SELECT from multiple measurements is not supported");
+
+        long? min = null, max = null, gb = null, gbOffset = null; string? gbTz = null; int? limit = null, offset = null;
         int? slimit = null, soffset = null;
         var tu = tail.ToUpperInvariant();
         bool desc = tu.Contains(" ORDER BY TIME DESC");
@@ -624,7 +639,7 @@ public static class InfluxQlParser
         int wi = tu.IndexOf(" WHERE ");
         if (wi >= 0) { var end = EndClause(tu, wi + 7); ParseWhere(tail[(wi + 7)..end], out min, out max, tagFilters, fieldFilters, out orGroups, out hasOr, paramFilters); }
         var gu = tu.IndexOf(" GROUP BY ");
-        if (gu >= 0) { var gs = gu + 10; var ge = EndClause(tu, gs); ParseGroupBy(tail[gs..ge].Trim(), out gb, groupByTags, out groupByAllTags); }
+        if (gu >= 0) { var gs = gu + 10; var ge = EndClause(tu, gs); ParseGroupBy(tail[gs..ge].Trim(), out gb, out gbOffset, groupByTags, out groupByAllTags, out gbTz); }
         var fu = IndexOfFill(tu, 0);
         if (fu >= 0)
         {
@@ -662,21 +677,69 @@ public static class InfluxQlParser
         if (sou >= 0) soffset = int.Parse(tail[(sou + 9)..].Trim().Split(' ')[0], CultureInfo.InvariantCulture);
         return new() { Kind = QueryKind.Select, Measurement = measurement, Subquery = subquery, SourceDatabase = sourceDb, SourceRpName = sourceRp, Select = ParseItems(fieldText),
             MinTimeNs = min, MaxTimeNs = max, Limit = limit, Desc = desc, GroupByNs = gb,
+            GroupByOffsetNs = gbOffset, GroupByTimeZone = gbTz,
             Offset = offset, SeriesLimit = slimit, SeriesOffset = soffset,
             GroupByTags = groupByTags, GroupByAllTags = groupByAllTags, Fill = fill, FillValue = fillValue, TagFilters = tagFilters, FieldFilters = fieldFilters, ParamFilters = paramFilters, OrTagFilterGroups = orGroups, HasOrFilters = hasOr, IntoTarget = intoTarget };
     }
 
-    static void ParseGroupBy(string text, out long? gbNs, List<string> tags, out bool groupByAllTags)
+    static void ParseGroupBy(string text, out long? gbNs, out long? gbOffsetNs, List<string> tags, out bool groupByAllTags, out string? timeZone)
     {
         gbNs = null;
+        gbOffsetNs = null;
         groupByAllTags = false;
-        foreach (var part in text.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+        timeZone = null;
+
+        // tz('zone') is written after time(...) without a separating comma.
+        var tzIdx = IndexOfTimeZoneClause(text);
+        if (tzIdx >= 0)
+        {
+            var open = text.IndexOf('(', tzIdx);
+            var close = FindMatchingParen(text, open);
+            if (close < 0) throw new FormatException("GROUP BY tz(...) requires closing ')'");
+            var zone = Unq(text[(open + 1)..close].Trim().Trim('\''));
+            if (zone.Length == 0) throw new FormatException("GROUP BY tz(...) requires a time zone id");
+            timeZone = zone;
+            text = (text[..tzIdx] + text[(close + 1)..]).Trim().TrimEnd(',');
+        }
+
+        // Split only on top-level commas so time(1h, 30m) keeps its offset argument intact.
+        foreach (var part in SplitOutsideParens(text))
         {
             var p = part.Trim(); var pu = p.ToUpperInvariant();
-            if (pu.StartsWith("TIME(") && p.EndsWith(')')) gbNs = DurationToNs(p[5..^1]);
+            if (p.Length == 0) continue;
+            if (pu.StartsWith("TIME(") && p.EndsWith(')'))
+            {
+                var args = p[5..^1].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                if (args.Length == 0) throw new FormatException("GROUP BY time(...) requires an interval");
+                gbNs = DurationToNs(args[0]);
+                if (args.Length > 1)
+                {
+                    gbOffsetNs = ParseSignedDuration(args[1]);
+                    if (Math.Abs(gbOffsetNs.Value) >= gbNs.Value)
+                        throw new FormatException("GROUP BY time offset must be smaller than the interval");
+                }
+            }
             else if (p == "*") groupByAllTags = true;
             else tags.Add(Unq(p));
         }
+    }
+
+    static int IndexOfTimeZoneClause(string text)
+    {
+        for (var i = 0; i <= text.Length - 3; i++)
+        {
+            if (i > 0 && !char.IsWhiteSpace(text[i - 1]) && text[i - 1] != ',') continue;
+            if (text.AsSpan(i, 3).Equals("tz(", StringComparison.OrdinalIgnoreCase)) return i;
+        }
+        return -1;
+    }
+
+    static long ParseSignedDuration(string s)
+    {
+        s = s.Trim();
+        if (s.StartsWith('-')) return checked(-DurationToNs(s[1..]));
+        if (s.StartsWith('+')) return DurationToNs(s[1..]);
+        return DurationToNs(s);
     }
 
     static void ParseWhere(string where, out long? min, out long? max, List<TagFilter> tagFilters, List<FieldFilter> fieldFilters, out List<List<TagFilter>> orGroups, out bool hasOr, List<ParamFilter> paramFilters)
@@ -947,6 +1010,11 @@ public static class InfluxQlParser
                 var f = x[..p].Trim().ToLowerInvariant();
                 var inner = x[(p + 1)..^1].Trim();
 
+                // These functions are not implemented; fail the query instead of returning a
+                // silently empty/null column.
+                if (f is "holt_winters" or "holt_winters_with_monthly" or "histogram")
+                    throw new NotSupportedException($"{f.ToUpperInvariant()} is not supported");
+
                 // Handle COUNT(DISTINCT field)
                 if (f == "count" && inner.StartsWith("DISTINCT ", StringComparison.OrdinalIgnoreCase))
                 {
@@ -963,6 +1031,8 @@ public static class InfluxQlParser
                 }
 
                 var args = inner.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                if (args[0].IndexOf('(') >= 0)
+                    throw new NotSupportedException("nested aggregate functions are not supported");
                 var fld2 = Unq(args[0]);
                 double param = 0;
                 long? unitNs = null;
@@ -1117,7 +1187,37 @@ public static class InfluxQlParser
             }
         }
         if (s.StartsWith("now()", StringComparison.OrdinalIgnoreCase)) return ParseNowTime(s);
-        return DateTimeOffset.Parse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal).ToUnixTimeMilliseconds() * 1_000_000;
+
+        // DateTimeOffset only keeps 7 fractional digits, so extract up to 9 digits separately to
+        // preserve nanosecond precision; ticks handle negative (pre-epoch) timestamps correctly.
+        var text = s.Trim();
+        long nanos = 0;
+        var dot = text.IndexOf('.');
+        if (dot >= 0)
+        {
+            var end = dot + 1;
+            var scale = 100_000_000L;
+            while (end < text.Length && char.IsDigit(text[end]))
+            {
+                if (scale > 0)
+                {
+                    nanos += (text[end] - '0') * scale;
+                    scale /= 10;
+                }
+                end++;
+            }
+            text = text[..dot] + text[end..];
+        }
+
+        var dto = DateTimeOffset.Parse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal);
+        try
+        {
+            return checked((dto.UtcTicks - DateTimeOffset.UnixEpoch.UtcTicks) * 100 + nanos);
+        }
+        catch (OverflowException)
+        {
+            throw new FormatException($"timestamp out of range: {s}");
+        }
     }
     static long ParseNowTime(string s)
     {

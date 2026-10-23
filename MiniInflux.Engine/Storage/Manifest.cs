@@ -42,6 +42,15 @@ public sealed class ShardGroupInfo
 }
 
 /// <summary>
+/// Summary of an offline manifest rebuild from segment files.
+/// </summary>
+public sealed record ManifestRebuildResult(
+    int Databases,
+    int ShardGroups,
+    int SegmentFiles,
+    int UnreadableSegments);
+
+/// <summary>
 /// Central metadata manifest for the database engine.
 /// Tracks databases, retention policies, shard groups, and segment files.
 /// Persisted to data/meta/manifest.json.
@@ -765,6 +774,136 @@ public sealed class Manifest
 
     #endregion
 
+    #region Offline rebuild
+
+    /// <summary>
+    /// Returns false when the persisted catalog cannot be loaded (missing while data exists, or
+    /// both manifest.json and manifest.json.bak are unreadable). Unlike constructing an engine,
+    /// this only touches the catalog files, so callers can rebuild before opening anything else.
+    /// </summary>
+    public static bool CanLoad(string dataPath)
+    {
+        try
+        {
+            _ = new Manifest(dataPath);
+            return true;
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds manifest.json from the segment files on disk. Used by <c>miniinfluxctl repair</c>
+    /// when both manifest.json and its backup are unusable, so the engine cannot even construct.
+    /// Retention durations, shard durations and continuous queries are not derivable from segments
+    /// and are reset (duration 0 = infinite); operators must recreate them explicitly.
+    /// </summary>
+    public static ManifestRebuildResult RebuildFromSegments(string dataPath)
+    {
+        var metaDir = Path.Combine(dataPath, "meta");
+        Directory.CreateDirectory(metaDir);
+        var manifestPath = Path.Combine(metaDir, "manifest.json");
+
+        var data = new ManifestData();
+        var shardGroups = 0;
+        var segmentFiles = 0;
+        var unreadableSegments = 0;
+        var maxShardId = 0;
+
+        foreach (var dbDir in EnumerateSortedDirectories(Path.Combine(dataPath, "db")))
+        {
+            var dbName = Path.GetFileName(dbDir);
+            if (!IdentifierValidator.IsValidDatabaseName(dbName)) continue;
+            if (data.Databases.Keys.Any(existing => string.Equals(existing, dbName, StringComparison.OrdinalIgnoreCase))) continue;
+
+            var dbInfo = new DatabaseInfo();
+            foreach (var rpDir in EnumerateSortedDirectories(dbDir))
+            {
+                var rpName = Path.GetFileName(rpDir);
+                if (!IdentifierValidator.IsValidRetentionPolicyName(rpName)) continue;
+                if (dbInfo.RetentionPolicies.Keys.Any(existing => string.Equals(existing, rpName, StringComparison.OrdinalIgnoreCase))) continue;
+
+                var rp = new RetentionPolicyInfo { Name = rpName };
+                foreach (var shardDir in EnumerateSortedDirectories(Path.Combine(rpDir, "shards")))
+                {
+                    if (!int.TryParse(Path.GetFileName(shardDir), out var shardId) || shardId <= 0) continue;
+
+                    var readableSegments = new List<string>();
+                    var minTime = long.MaxValue;
+                    var maxTime = long.MinValue;
+                    foreach (var segPath in Directory.GetFiles(shardDir, "*.seg").Order(StringComparer.Ordinal))
+                    {
+                        List<SegmentColumnMeta> metas;
+                        try
+                        {
+                            metas = SegmentReader.ReadMetadata(segPath);
+                        }
+                        catch (Exception ex) when (ex is InvalidDataException or IOException)
+                        {
+                            unreadableSegments++;
+                            continue;
+                        }
+
+                        readableSegments.Add(Path.GetFileName(segPath));
+                        segmentFiles++;
+                        foreach (var meta in metas)
+                        {
+                            minTime = Math.Min(minTime, meta.MinTime);
+                            maxTime = Math.Max(maxTime, meta.MaxTime);
+                        }
+                    }
+
+                    // Skip shards whose every segment is unreadable: a guessed range would route
+                    // future writes into a directory whose data cannot be served.
+                    if (readableSegments.Count == 0) continue;
+
+                    rp.ShardGroups.Add(new ShardGroupInfo
+                    {
+                        Id = shardId,
+                        StartTimeNs = minTime == long.MaxValue ? 0 : minTime,
+                        EndTimeNs = maxTime == long.MinValue ? 1 : (maxTime == long.MaxValue ? long.MaxValue : maxTime + 1),
+                        SegmentFiles = readableSegments
+                    });
+                    shardGroups++;
+                    if (shardId > maxShardId) maxShardId = shardId;
+                }
+
+                dbInfo.RetentionPolicies[rpName] = rp;
+            }
+
+            // Every database needs at least one RP; without a directory to infer from, fall back
+            // to the InfluxDB default so the database stays usable after the rebuild.
+            if (dbInfo.RetentionPolicies.Count == 0)
+                dbInfo.RetentionPolicies["autogen"] = new RetentionPolicyInfo { Name = "autogen" };
+
+            var defaultRp = dbInfo.RetentionPolicies.TryGetValue("autogen", out var autogen)
+                ? autogen
+                : dbInfo.RetentionPolicies.Values.OrderBy(r => r.Name, StringComparer.Ordinal).First();
+            defaultRp.IsDefault = true;
+
+            data.Databases[dbName] = dbInfo;
+        }
+
+        data.NextShardId = maxShardId + 1L;
+
+        // Keep the damaged catalog for diagnosis instead of overwriting it in place.
+        if (File.Exists(manifestPath))
+        {
+            try { File.Move(manifestPath, manifestPath + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmssfff}"); }
+            catch (IOException) { }
+        }
+
+        WriteManifestFile(manifestPath, data);
+        return new ManifestRebuildResult(data.Databases.Count, shardGroups, segmentFiles, unreadableSegments);
+    }
+
+    private static IEnumerable<string> EnumerateSortedDirectories(string path) =>
+        Directory.Exists(path) ? Directory.GetDirectories(path).Order(StringComparer.Ordinal).ToArray() : [];
+
+    #endregion
+
     #region Persistence
 
     private void Load()
@@ -898,29 +1037,34 @@ public sealed class Manifest
 
     public void Save()
     {
-        var tmp = _path + ".tmp";
+        WriteManifestFile(_path, _data);
+        _dirty = false;
+    }
+
+    private static void WriteManifestFile(string manifestPath, ManifestData data)
+    {
+        var tmp = manifestPath + ".tmp";
         using (var stream = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
         {
-            JsonSerializer.Serialize(stream, _data, ManifestJsonContext.Default.ManifestData);
+            JsonSerializer.Serialize(stream, data, ManifestJsonContext.Default.ManifestData);
             stream.Flush(true);
         }
-        File.Move(tmp, _path, overwrite: true);
+        File.Move(tmp, manifestPath, overwrite: true);
 
         // Keep one known-good copy for the next startup. Write it atomically so a crash during
         // the copy cannot replace the last good backup with a torn file.
         try
         {
-            var backupTmp = _path + ".bak.tmp";
-            using (var source = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            var backupTmp = manifestPath + ".bak.tmp";
+            using (var source = new FileStream(manifestPath, FileMode.Open, FileAccess.Read, FileShare.Read))
             using (var backup = new FileStream(backupTmp, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 source.CopyTo(backup);
                 backup.Flush(true);
             }
-            File.Move(backupTmp, _path + ".bak", overwrite: true);
+            File.Move(backupTmp, manifestPath + ".bak", overwrite: true);
         }
         catch { /* best effort: the primary manifest is already durable */ }
-        _dirty = false;
     }
 
     public void SaveIfDirty()

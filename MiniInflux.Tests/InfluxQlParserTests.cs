@@ -131,6 +131,73 @@ public class InfluxQlParserTests
     }
 
     [Fact]
+    public void Parse_SelectWithGroupByTimeOffsetAndTimeZone_ParsesBoth()
+    {
+        var query = InfluxQlParser.Parse(
+            "SELECT mean(value) FROM cpu GROUP BY time(1h, 30m) tz('America/Chicago')");
+
+        Assert.Equal(3_600_000_000_000, query.GroupByNs);
+        Assert.Equal(1_800_000_000_000, query.GroupByOffsetNs);
+        Assert.Equal("America/Chicago", query.GroupByTimeZone);
+    }
+
+    [Fact]
+    public void Parse_SelectWithNegativeGroupByOffset_ParsesSignedOffset()
+    {
+        var query = InfluxQlParser.Parse("SELECT mean(value) FROM cpu GROUP BY time(1h, -15m)");
+
+        Assert.Equal(-900_000_000_000, query.GroupByOffsetNs);
+    }
+
+    [Fact]
+    public void Parse_SelectWithGroupByOffsetNotSmallerThanInterval_Throws()
+    {
+        Assert.Throws<FormatException>(() =>
+            InfluxQlParser.Parse("SELECT mean(value) FROM cpu GROUP BY time(1h, 1h)"));
+    }
+
+    [Fact]
+    public void Parse_SelectFromMultipleMeasurements_ThrowsNotSupported()
+    {
+        Assert.Throws<NotSupportedException>(() =>
+            InfluxQlParser.Parse("SELECT value FROM cpu, mem"));
+    }
+
+    [Fact]
+    public void Parse_SelectFromRegexMeasurement_ThrowsNotSupported()
+    {
+        Assert.Throws<NotSupportedException>(() =>
+            InfluxQlParser.Parse("SELECT value FROM /cpu.*/"));
+    }
+
+    [Theory]
+    [InlineData("SELECT holt_winters(mean(value), 4) FROM cpu GROUP BY time(1h)")]
+    [InlineData("SELECT holt_winters_with_monthly(value, 4) FROM cpu GROUP BY time(1h)")]
+    [InlineData("SELECT histogram(value, 10) FROM cpu GROUP BY time(1h)")]
+    public void Parse_UnsupportedFunction_ThrowsNotSupported(string query)
+    {
+        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse(query));
+    }
+
+    [Fact]
+    public void Parse_SelectWithSubMillisecondRfc3339_PreservesNanoseconds()
+    {
+        var query = InfluxQlParser.Parse(
+            "SELECT value FROM cpu WHERE time >= '2026-01-01T00:00:00.123456789Z'");
+
+        Assert.Equal(1_767_225_600_123_456_789, query.MinTimeNs);
+    }
+
+    [Fact]
+    public void Parse_SelectWithRfc3339BeforeEpoch_PreservesNegativeNanoseconds()
+    {
+        var query = InfluxQlParser.Parse(
+            "SELECT value FROM cpu WHERE time >= '1969-12-31T23:59:59.500Z'");
+
+        Assert.Equal(-500_000_000, query.MinTimeNs);
+    }
+
+    [Fact]
     public void Parse_SelectWithGroupByAllTags_ParsesWildcardGrouping()
     {
         var query = InfluxQlParser.Parse("SELECT mean(value) INTO cpu_rollup FROM cpu GROUP BY time(1m),*");

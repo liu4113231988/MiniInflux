@@ -200,6 +200,70 @@ public class AggregationTests : IDisposable
     }
 
     [Fact]
+    public async Task GroupByTimeWithOffset_AlignsBucketsToOffset()
+    {
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT count(*) FROM cpu GROUP BY time(10s, 5s)");
+
+        Assert.Null(result.Results[0].Error);
+        var values = result.Results[0].Series![0].Values;
+        Assert.Equal(2, values.Count);
+        Assert.Equal("1969-12-31T23:59:55.000000000Z", values[0][0]);
+        Assert.Equal(4L, Convert.ToInt64(values[0][1]));
+        Assert.Equal("1970-01-01T00:00:05.000000000Z", values[1][0]);
+        Assert.Equal(6L, Convert.ToInt64(values[1][1]));
+    }
+
+    [Fact]
+    public async Task GroupByTimeWithTimeZone_FormatsBucketsInZone()
+    {
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT mean(value) FROM cpu GROUP BY time(10s) tz('Asia/Shanghai')");
+
+        Assert.Null(result.Results[0].Error);
+        var row = result.Results[0].Series![0].Values[0];
+        Assert.Equal("1970-01-01T08:00:00.000000000+08:00", row[0]);
+    }
+
+    [Fact]
+    public async Task Select_RawPointBeforeEpoch_FormatsNegativeTimestamp()
+    {
+        await _engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "neg",
+                Tags = new Dictionary<string, string>(),
+                Fields = new Dictionary<string, FieldValue> { { "value", FieldValue.FromDouble(1) } },
+                TimestampNs = -500_000_000
+            }
+        ]);
+
+        var result = await _executor.ExecuteAsync(_engine, "testdb", "SELECT value FROM neg");
+
+        Assert.Null(result.Results[0].Error);
+        var row = Assert.Single(result.Results[0].Series![0].Values);
+        Assert.Equal("1969-12-31T23:59:59.500000000Z", row[0]);
+    }
+
+    [Fact]
+    public async Task ShowStatsForUnknownMeasurement_ReturnsError()
+    {
+        var result = await _executor.ExecuteAsync(_engine, "testdb", "SHOW STATS FOR 'missing'");
+
+        Assert.Contains("measurement not found", result.Results[0].Error);
+    }
+
+    [Fact]
+    public async Task ShowShardGroups_UsesShardGroupIdColumn()
+    {
+        var result = await _executor.ExecuteAsync(_engine, "testdb", "SHOW SHARD GROUPS");
+
+        Assert.Null(result.Results[0].Error);
+        Assert.Contains("shard_group_id", result.Results[0].Series![0].Columns);
+    }
+
+    [Fact]
     public async Task CountStar_WithOverlappingSegments_UsesFastCountFallback()
     {
         var dir = Path.Combine(Path.GetTempPath(), $"miniinflux_fastcount_{Guid.NewGuid():N}");

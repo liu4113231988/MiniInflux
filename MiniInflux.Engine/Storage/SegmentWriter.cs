@@ -166,70 +166,80 @@ public static class SegmentWriter
         var tmpPath = path + ".tmp";
 
         var metas = new List<SegmentColumnMeta>(columns.Count);
-        using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.Read))
-        using (var ms = new MemoryStream())
+        try
         {
-            using (var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+            using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.Read))
+            using (var ms = new MemoryStream())
             {
-                bw.Write(Magic);
-                bw.Write(FormatVersion);
-                bw.Write(columns.Count);
-                foreach (var column in columns)
+                using (var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
                 {
-                    var kind = column.Kind;
-                    var ts = column.Timestamps;
-                    var vals = column.Values;
-                    TimestampEncodedBlock timestampBlock;
-                    using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.TimestampEncode))
-                        timestampBlock = CompressionCodec.EncodeTimestampsAdaptive(ts);
-                    ValueEncodedBlock valueBlock;
-                    using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.ValueEncode))
-                        valueBlock = CompressionCodec.EncodeValuesAdaptive(kind, vals);
-                    WriteString(bw, column.Measurement);
-                    WriteString(bw, column.TagsCanonical);
-                    WriteString(bw, column.Field);
-                    bw.Write((byte)kind);
-                    bw.Write(ts[0]); bw.Write(ts[^1]); bw.Write(ts.Count);
-                    bw.Write((byte)timestampBlock.Codec);
-                    bw.Write((byte)timestampBlock.Compression);
-                    bw.Write((byte)valueBlock.Codec);
-                    bw.Write((byte)valueBlock.Compression);
-                    bw.Write(timestampBlock.Payload.Length); bw.Write(timestampBlock.Payload);
-                    bw.Write(valueBlock.Payload.Length); bw.Write(valueBlock.Payload);
-                    // Block stats
-                    var stats = ComputeStats(kind, vals);
-                    bw.Write(stats.Min); bw.Write(stats.Max); bw.Write(stats.Sum); bw.Write(stats.Count);
-                    metas.Add(new SegmentColumnMeta(
-                        column.Measurement, column.TagsCanonical, column.Field, kind,
-                        ts[0], ts[^1], ts.Count, new BlockStats(stats.Min, stats.Max, stats.Sum, stats.Count),
-                        timestampBlock.Codec, valueBlock.Codec, timestampBlock.Compression, valueBlock.Compression));
-                }
+                    bw.Write(Magic);
+                    bw.Write(FormatVersion);
+                    bw.Write(columns.Count);
+                    foreach (var column in columns)
+                    {
+                        var kind = column.Kind;
+                        var ts = column.Timestamps;
+                        var vals = column.Values;
+                        TimestampEncodedBlock timestampBlock;
+                        using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.TimestampEncode))
+                            timestampBlock = CompressionCodec.EncodeTimestampsAdaptive(ts);
+                        ValueEncodedBlock valueBlock;
+                        using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.ValueEncode))
+                            valueBlock = CompressionCodec.EncodeValuesAdaptive(kind, vals);
+                        WriteString(bw, column.Measurement);
+                        WriteString(bw, column.TagsCanonical);
+                        WriteString(bw, column.Field);
+                        bw.Write((byte)kind);
+                        bw.Write(ts[0]); bw.Write(ts[^1]); bw.Write(ts.Count);
+                        bw.Write((byte)timestampBlock.Codec);
+                        bw.Write((byte)timestampBlock.Compression);
+                        bw.Write((byte)valueBlock.Codec);
+                        bw.Write((byte)valueBlock.Compression);
+                        bw.Write(timestampBlock.Payload.Length); bw.Write(timestampBlock.Payload);
+                        bw.Write(valueBlock.Payload.Length); bw.Write(valueBlock.Payload);
+                        // Block stats
+                        var stats = ComputeStats(kind, vals);
+                        bw.Write(stats.Min); bw.Write(stats.Max); bw.Write(stats.Sum); bw.Write(stats.Count);
+                        metas.Add(new SegmentColumnMeta(
+                            column.Measurement, column.TagsCanonical, column.Field, kind,
+                            ts[0], ts[^1], ts.Count, new BlockStats(stats.Min, stats.Max, stats.Sum, stats.Count),
+                            timestampBlock.Codec, valueBlock.Codec, timestampBlock.Compression, valueBlock.Compression));
+                    }
 
-                var metadataOffset = ms.Position;
-                bw.Write(MetadataMagic);
-                bw.Write(metas.Count);
-                foreach (var meta in metas)
-                    WriteMetadata(bw, meta);
-                var metadataLength = checked((int)(ms.Position - metadataOffset));
-                bw.Write(metadataOffset);
-                bw.Write(metadataLength);
-                bw.Write(MetadataFooterMagic);
+                    var metadataOffset = ms.Position;
+                    bw.Write(MetadataMagic);
+                    bw.Write(metas.Count);
+                    foreach (var meta in metas)
+                        WriteMetadata(bw, meta);
+                    var metadataLength = checked((int)(ms.Position - metadataOffset));
+                    bw.Write(metadataOffset);
+                    bw.Write(metadataLength);
+                    bw.Write(MetadataFooterMagic);
+                }
+                // Write the MemoryStream's backing buffer directly: ToArray() would copy the whole
+                // segment a second time (a large LOH allocation for big flushes).
+                using var persistTiming = WriteDiagnostics.Measure(WriteDiagnostics.Stage.SegmentPersist);
+                var buffer = ms.GetBuffer();
+                var length = checked((int)ms.Length);
+                fs.Write(buffer, 0, length);
+                var crc = Crc32.Compute(buffer.AsSpan(0, length));
+                var crcBytes = new byte[4];
+                BitConverter.TryWriteBytes(crcBytes, crc);
+                fs.Write(crcBytes);
+                fs.Flush(true);
             }
-            // Write the MemoryStream's backing buffer directly: ToArray() would copy the whole
-            // segment a second time (a large LOH allocation for big flushes).
-            using var persistTiming = WriteDiagnostics.Measure(WriteDiagnostics.Stage.SegmentPersist);
-            var buffer = ms.GetBuffer();
-            var length = checked((int)ms.Length);
-            fs.Write(buffer, 0, length);
-            var crc = Crc32.Compute(buffer.AsSpan(0, length));
-            var crcBytes = new byte[4];
-            BitConverter.TryWriteBytes(crcBytes, crc);
-            fs.Write(crcBytes);
-            fs.Flush(true);
+            // Atomic replace: never delete the live segment first, otherwise a crash between
+            // delete and move would leave the shard without that file.
+            File.Move(tmpPath, path, overwrite: true);
+            return metas;
         }
-        if (File.Exists(path)) File.Delete(path);
-        File.Move(tmpPath, path);
-        return metas;
+        catch
+        {
+            // Encoding/CRC/fsync failures used to leave orphan .tmp files behind forever.
+            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch (IOException) { }
+            throw;
+        }
     }
 
     private static (double Min, double Max, double Sum, int Count) ComputeStats(FieldKind kind, IReadOnlyList<FieldValue> vals)

@@ -9,4 +9,7 @@
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="MiniInflux.Tests" />
+  </ItemGroup>
 </Project>

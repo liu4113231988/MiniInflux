@@ -88,7 +88,6 @@ public sealed class TsdbEngine : IDisposable
     // retiring coverage for data those snapshots will still write to segments.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _flushSnapshotMinTs = new(StringComparer.Ordinal);
     private readonly LastValueCache _lastValueCache;
-    private readonly DistinctValueCache _distinctCache = new();
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
     private Timer? _flushTimer;
@@ -129,7 +128,7 @@ public sealed class TsdbEngine : IDisposable
         _manifest = new Manifest(_root);
         _schema = new SchemaRegistry(_root, maxFieldsPerMeasurement);
         _shards = new ShardManager(_root, _manifest);
-        _tombstones = new TombstoneStore(_root);
+        _tombstones = new TombstoneStore(_root, _health);
         _compactor = new Compactor(_manifest, _shards, _tombstones, _schema,
             maxL0Segments: 6, maxL1Segments: 3,                    // 更积极的segment数量阈值
             maxL0Bytes: compactionTargetBytes, maxL1Bytes: compactionTargetBytes,
@@ -139,7 +138,7 @@ public sealed class TsdbEngine : IDisposable
             segmentFillRatio: _segmentFillRatio,
             maxWriteBytesPerSecond: compactionMaxWriteBytesPerSecond,
             inFlightFlushMinTs: GetInFlightFlushMinTs,
-            beginPublish: _segmentPublication.Publish,
+            beginPublish: () => _segmentPublication.Publish(),
             segmentsPublished: InvalidateSegmentMetadataIndex);
         if (rpCheckIntervalMs > 0) _rpExpiryTimer = new Timer(_ => CleanupExpiredShards(), null, rpCheckIntervalMs, rpCheckIntervalMs);
         if (compactionIntervalMs > 0) _compactionTimer = new Timer(_ => RunCompaction(), null, compactionIntervalMs, compactionIntervalMs);
@@ -251,7 +250,12 @@ public sealed class TsdbEngine : IDisposable
                         _manifest.AddSegmentToShard(db, shardRp, shard.Id, segFile);
                         _manifest.UpdateIndexes(db, pointsForIndex);
                     }
-                    catch (InvalidDataException) { result.SegmentsCorrupted++; }
+                    catch (Exception ex) when (ex is InvalidDataException or IOException)
+                    {
+                        // Metadata reads also throw EndOfStreamException/IOException on truncated
+                        // files; SegmentReader has already quarantined the path, keep counting it.
+                        result.SegmentsCorrupted++;
+                    }
                 }
             }
 
@@ -3462,25 +3466,43 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
         return _locks.GetOrAdd(key, _ => new ReaderWriterLockSlim());
     }
 
-    private void CleanupExpiredShards()
+    internal void CleanupExpiredShards()
     {
         if (IsBackupInProgress()) return; // shard expiry during backup would delete copied shard dirs
         try
         {
             var removed = _shards.CleanupExpiredShards(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000);
-            if (removed > 0)
+            if (removed.Count == 0) return;
+
+            foreach (var (db, rp, shardId) in removed)
+                SegmentReader.ClearQuarantinedByPrefix(_shards.ShardDir(db, rp, shardId));
+
+            var databases = removed.Select(entry => entry.Db).Distinct(StringComparer.Ordinal).ToList();
+
+            // A series may have lived only in the expired shards. Rebuild the tracked series set and
+            // the manifest tag/series indexes from surviving segments + buffers so SHOW SERIES and
+            // cardinality stop reporting data that no longer exists.
+            // Take the publication lease before the catalog gate: a SELECT INTO holds a read lease
+            // and still needs the catalog read side, so the opposite order would deadlock until
+            // the publish timeout fires.
+            using var publication = _segmentPublication.Publish();
+            _writeCatalogGate.EnterWriteLock();
+            try
             {
-                InvalidateSegmentMetadataIndex();
-                // retention expiry removed shard files; any cached last point in those shards is now stale
-                // conservatively clear the last-value cache so next queries backfill from remaining segments
-                // (per-RP precise eviction would require time-range filtering; global clear is safe and infrequent)
-                var all = _lastValueCache.CountByDbRp.Keys.ToList();
-                foreach (var key in all)
+                foreach (var db in databases)
                 {
-                    var sep = key.IndexOf('|');
-                    if (sep > 0) _lastValueCache.EvictWhere(key[..sep], key[(sep+1)..], (_, _) => true);
+                    var surviving = RebuildTrackedSeriesKeys(db);
+                    SyncManifestIndexesAndSchema(db, surviving);
                 }
             }
+            finally { _writeCatalogGate.ExitWriteLock(); }
+
+            // Cached last points from the deleted shards are stale; clearing the affected databases
+            // is cheap and avoids returning a last point that no longer exists on disk.
+            foreach (var db in databases)
+                _lastValueCache.ClearDb(db);
+
+            InvalidateSegmentMetadataIndex();
         }
         catch (Exception ex) { _health.RecordFailure("retention_cleanup", ex); }
     }

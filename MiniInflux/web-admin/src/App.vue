@@ -83,7 +83,19 @@ function clearProtectedData() {
   overview.value = null
   databases.value = []
   queries.value = []
+  tokens.value = []
+  createdToken.value = null
+  cacheStats.value = null
+  shardsInfo.value = []
+  queryResult.value = null
+  queryError.value = ''
+  queryPage.value = 1
+  queryHasNextPage.value = false
   activeTab.value = 'overview'
+}
+
+function quoteIdentifier(name) {
+  return `"${String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
 }
 
 function clearAuthentication(message = '') {
@@ -164,7 +176,7 @@ async function api(path, options = {}) {
     clearAuthentication('登录信息已失效，请重新登录')
     throw new Error('登录信息已失效，请重新登录')
   }
-  if (response.status === 403) throw new Error('请求被拒绝')
+  if (response.status === 403) throw new Error(await readError(response))
   if (!response.ok) throw new Error(await readError(response))
   if (response.status === 204) return null
   return response.json()
@@ -235,7 +247,7 @@ async function createDatabase() {
   if (!newDbName.value.trim()) { error.value = '请输入数据库名'; return }
   busy.value = true; error.value=''; notice.value=''
   try {
-    await execAdminCommand(`CREATE DATABASE "${newDbName.value.trim()}"`)
+    await execAdminCommand(`CREATE DATABASE ${quoteIdentifier(newDbName.value.trim())}`)
     newDbName.value = ''
     await Promise.all([loadOverview(), loadDatabases()])
     notice.value = '数据库已创建'
@@ -246,7 +258,7 @@ async function dropDatabase(name) {
   if (!confirm(`确认删除数据库 ${name}？数据将不可恢复`)) return
   busy.value = true; error.value=''; notice.value=''
   try {
-    await execAdminCommand(`DROP DATABASE "${name}"`)
+    await execAdminCommand(`DROP DATABASE ${quoteIdentifier(name)}`)
     await Promise.all([loadOverview(), loadDatabases()])
     notice.value = `数据库 ${name} 已删除`
   } catch (ex) { error.value = ex.message } finally { busy.value = false }
@@ -270,7 +282,7 @@ async function createRp() {
   if (!newRp.value.db || !newRp.value.name) { error.value = '请选择数据库并输入 RP 名称'; return }
   const dur = newRp.value.duration?.trim() || '7d'
   const def = newRp.value.isDefault ? ' DEFAULT' : ''
-  const q = `CREATE RETENTION POLICY "${newRp.value.name}" ON "${newRp.value.db}" DURATION ${dur} REPLICATION 1${def}`
+  const q = `CREATE RETENTION POLICY ${quoteIdentifier(newRp.value.name)} ON ${quoteIdentifier(newRp.value.db)} DURATION ${dur} REPLICATION 1${def}`
   busy.value = true; error.value=''; notice.value=''
   try {
     await execAdminCommand(q)
@@ -287,7 +299,7 @@ async function createCq() {
   }
   busy.value = true; error.value = ''; notice.value = ''
   try {
-    await execAdminCommand(`CREATE CONTINUOUS QUERY "${newCq.value.name.trim()}" ON "${newCq.value.db}" BEGIN ${newCq.value.text.trim()} END`)
+    await execAdminCommand(`CREATE CONTINUOUS QUERY ${quoteIdentifier(newCq.value.name.trim())} ON ${quoteIdentifier(newCq.value.db)} BEGIN ${newCq.value.text.trim()} END`)
     newCq.value.name = ''; newCq.value.text = ''
     await loadQueries()
     notice.value = 'Continuous Query 已创建'
@@ -298,7 +310,7 @@ async function dropCq(database, name) {
   if (!confirm(`确认删除 Continuous Query ${name}？`)) return
   busy.value = true; error.value = ''; notice.value = ''
   try {
-    await execAdminCommand(`DROP CONTINUOUS QUERY "${name}" ON "${database}"`)
+    await execAdminCommand(`DROP CONTINUOUS QUERY ${quoteIdentifier(name)} ON ${quoteIdentifier(database)}`)
     await loadQueries()
     notice.value = `Continuous Query ${name} 已删除`
   } catch (ex) { error.value = ex.message } finally { busy.value = false }

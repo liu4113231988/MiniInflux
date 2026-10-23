@@ -211,6 +211,11 @@ public sealed class CliRepairResult
     public int SegmentsScanned { get; set; }
     public int SegmentsCorrupted { get; set; }
     public int SchemaConflictsSkipped { get; set; }
+    /// <summary>True when the catalog was rebuilt from segment files because manifest and backup were unusable.</summary>
+    public bool ManifestRebuilt { get; set; }
+    public int ManifestRebuiltShardGroups { get; set; }
+    public int ManifestRebuiltSegmentFiles { get; set; }
+    public int ManifestRebuildUnreadableSegments { get; set; }
     /// <summary>Human-readable notice about the cost of a dry run (empty when not a dry run).</summary>
     public string DryRunNotice { get; set; } = "";
 }

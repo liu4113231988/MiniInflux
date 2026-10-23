@@ -1,4 +1,4 @@
-﻿
+
 namespace InfluxdbDataSync
 {
     partial class FormMain
@@ -341,7 +341,7 @@ namespace InfluxdbDataSync
             label16.Name = "label16";
             label16.Size = new Size(68, 17);
             label16.TabIndex = 1;
-            label16.Text = "加载文件：";
+            label16.Text = "加载目录：";
             // 
             // txtLocalMeasure
             // 

@@ -708,10 +708,18 @@ public static class ManagementCli
         var executionDataPath = dryRun ? CreateDryRunDataClone(dataPath) : dataPath;
         try
         {
+            // A missing/torn catalog with an unusable backup makes the engine constructor fail,
+            // so `repair` could not even start. Check the catalog first (without opening WAL or
+            // segments) and rebuild it from the segment files when it is unusable.
+            ManifestRebuildResult? rebuild = Manifest.CanLoad(executionDataPath)
+                ? null
+                : Manifest.RebuildFromSegments(executionDataPath);
+
             using var engine = OpenOfflineEngine(executionDataPath, options);
             var result = engine.Recover();
             engine.FlushAll();
-            var exitCode = result.SegmentsCorrupted > 0 ? 1 : 0;
+            var manifestRebuilt = rebuild != null;
+            var exitCode = result.SegmentsCorrupted > 0 || (rebuild?.UnreadableSegments ?? 0) > 0 ? 1 : 0;
 
             if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
             {
@@ -724,6 +732,10 @@ public static class ManagementCli
                     SegmentsScanned = result.SegmentsScanned,
                     SegmentsCorrupted = result.SegmentsCorrupted,
                     SchemaConflictsSkipped = result.SchemaConflictsSkipped,
+                    ManifestRebuilt = manifestRebuilt,
+                    ManifestRebuiltShardGroups = rebuild?.ShardGroups ?? 0,
+                    ManifestRebuiltSegmentFiles = rebuild?.SegmentFiles ?? 0,
+                    ManifestRebuildUnreadableSegments = rebuild?.UnreadableSegments ?? 0,
                     DryRunNotice = dryRun ? DryRunCostNotice : ""
                 };
                 output.WriteLine(JsonSerializer.Serialize(jsonResult, CliJsonContext.Default.CliRepairResult));
@@ -738,6 +750,15 @@ public static class ManagementCli
             output.WriteLine($"segments_scanned={result.SegmentsScanned}");
             output.WriteLine($"segments_corrupted={result.SegmentsCorrupted}");
             output.WriteLine($"schema_conflicts_skipped={result.SchemaConflictsSkipped}");
+            output.WriteLine($"manifest_rebuilt={manifestRebuilt.ToString().ToLowerInvariant()}");
+            if (rebuild != null)
+            {
+                output.WriteLine($"manifest_rebuild_databases={rebuild.Databases}");
+                output.WriteLine($"manifest_rebuild_shard_groups={rebuild.ShardGroups}");
+                output.WriteLine($"manifest_rebuild_segment_files={rebuild.SegmentFiles}");
+                output.WriteLine($"manifest_rebuild_unreadable_segments={rebuild.UnreadableSegments}");
+                output.WriteLine("manifest_rebuild_notice=retention policy durations and continuous queries are reset; recreate them manually");
+            }
             if (dryRun)
                 output.WriteLine("changes_applied=false");
             return exitCode;

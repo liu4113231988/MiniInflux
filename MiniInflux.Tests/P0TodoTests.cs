@@ -1,3 +1,4 @@
+using System.Text.Json;
 using MiniInflux.Net10.Model;
 using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
@@ -276,6 +277,79 @@ public class P0TodoTests : IDisposable
         Assert.Contains(segmentName, repairedShard.SegmentFiles);
         Assert.Contains("segments_scanned=1", stdout.ToString());
         Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task Repair_WithMissingManifestAndBackup_RebuildsCatalogFromSegments()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 5, "server01", 1_000_000_000)]);
+            engine.FlushAll();
+        }
+
+        var metaDir = Path.Combine(dataPath, "meta");
+        File.Delete(Path.Combine(metaDir, "manifest.json"));
+        File.Delete(Path.Combine(metaDir, "manifest.json.bak"));
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["repair", "--data", dataPath, "--format", "json"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        using var json = JsonDocument.Parse(stdout.ToString());
+        Assert.Equal(0, exitCode);
+        Assert.True(json.RootElement.GetProperty("ManifestRebuilt").GetBoolean());
+        Assert.Equal(1, json.RootElement.GetProperty("ManifestRebuiltShardGroups").GetInt32());
+        Assert.Equal(1, json.RootElement.GetProperty("ManifestRebuiltSegmentFiles").GetInt32());
+        Assert.Equal(0, json.RootElement.GetProperty("ManifestRebuildUnreadableSegments").GetInt32());
+        Assert.Equal(string.Empty, stderr.ToString());
+
+        var manifest = new Manifest(dataPath);
+        Assert.Equal(new[] { "testdb" }, manifest.ListDatabases());
+        Assert.Contains(manifest.GetShards("testdb", "autogen").Single().SegmentFiles,
+            file => file.EndsWith(".seg", StringComparison.Ordinal));
+
+        using var reopened = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0);
+        reopened.Recover();
+        Assert.Single(reopened.ReadAllPoints("testdb", "autogen", "cpu", null, null));
+    }
+
+    [Fact]
+    public async Task Repair_WithCorruptManifestAndBackup_PreservesDamagedFileAndRebuilds()
+    {
+        var dataPath = Path.Combine(_testDir, "data");
+        using (var engine = new TsdbEngine(dataPath, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0))
+        {
+            await engine.WriteAsync("testdb", "autogen", [Point("cpu", 7, "server01", 2_000_000_000)]);
+            engine.FlushAll();
+        }
+
+        var metaDir = Path.Combine(dataPath, "meta");
+        File.WriteAllText(Path.Combine(metaDir, "manifest.json"), "{ torn");
+        File.WriteAllText(Path.Combine(metaDir, "manifest.json.bak"), "{ also torn");
+
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var exitCode = ManagementCli.TryRun(
+            ["repair", "--data", dataPath, "--format", "json"],
+            CreateOptions(dataPath),
+            stdout,
+            stderr);
+
+        using var json = JsonDocument.Parse(stdout.ToString());
+        Assert.Equal(0, exitCode);
+        Assert.True(json.RootElement.GetProperty("ManifestRebuilt").GetBoolean());
+        Assert.Single(Directory.GetFiles(metaDir, "manifest.json.corrupt-*"));
+        Assert.Equal(string.Empty, stderr.ToString());
+
+        var manifest = new Manifest(dataPath);
+        var shard = Assert.Single(manifest.GetShards("testdb", "autogen"));
+        Assert.True(shard.StartTimeNs <= 2_000_000_000 && shard.EndTimeNs > 2_000_000_000);
     }
 
     private static Point Point(string measurement, double value, string host, long timestampNs) => new()

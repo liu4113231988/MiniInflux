@@ -52,7 +52,7 @@ public class P2ConvergenceTests : IDisposable
                 for (long i = 0; i < 6000; i++)
                     timeMethod.Invoke(null, [i * 1_000_000_000L + i]);
 
-                var cache = (Dictionary<long, string>)cacheField.GetValue(null)!;
+                var cache = (Dictionary<(long Ns, string? Zone), string>)cacheField.GetValue(null)!;
                 Assert.True(cache.Count <= 4096,
                     $"_timeCache grew to {cache.Count} entries; expected bounded at 4096");
             }

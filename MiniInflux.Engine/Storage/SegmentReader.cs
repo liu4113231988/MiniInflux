@@ -337,15 +337,16 @@ public static class SegmentReader
 
     public static SegmentMetadataReadResult ReadMetadataWithInfo(string path)
     {
-        if (TryReadFooterMetadata(path, out var metadata))
-            return new SegmentMetadataReadResult(metadata, true);
-
         try
         {
+            if (TryReadFooterMetadata(path, out var metadata))
+                return new SegmentMetadataReadResult(metadata, true);
             return ReadMetadataByFullScan(path);
         }
-        catch (InvalidDataException)
+        catch (Exception ex) when (ex is InvalidDataException or IOException)
         {
+            // Truncated payloads surface as EndOfStreamException (an IOException) rather than
+            // InvalidDataException; quarantine both so queries stop re-reading the same file.
             s_quarantined.TryAdd(path, 0);
             throw;
         }
@@ -478,7 +479,7 @@ public static class SegmentReader
         {
             return OpenSegmentChecked(path, out dataLength, out fileLength);
         }
-        catch (InvalidDataException)
+        catch (Exception ex) when (ex is InvalidDataException or IOException)
         {
             s_quarantined.TryAdd(path, 0);
             throw;

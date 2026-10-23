@@ -5,6 +5,7 @@ using Newtonsoft.Json.Linq;
 using System.Diagnostics.Metrics;
 using System.IO.Compression;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Security.Policy;
 using System.Text;
 using static InfluxdbDataSync.FormMain;
@@ -14,13 +15,13 @@ namespace InfluxdbDataSync
 {
     public partial class FormMain : Form
     {
-        // ÓÃÓÚÏÔÊ¾ÈÕÖ¾µÄÎ¯ÍĞ
+        // ç”¨äºæ˜¾ç¤ºæ—¥å¿—çš„å§”æ‰˜
         public delegate void LogDelegate(string message);
 
-        // HTTP¿Í»§¶Ë£¨¸´ÓÃÌáÉıĞÔÄÜ£©
+        // HTTPå®¢æˆ·ç«¯ï¼ˆå¤ç”¨æå‡æ€§èƒ½ï¼‰
         private static readonly HttpClient _httpClient = new HttpClient();
 
-        private const int MAX_SIZE = 5000; // 32MB ·ÖÆ¬´óĞ¡
+        private const int MAX_SIZE = 5000; // 32MB åˆ†ç‰‡å¤§å°
         private CancellationTokenSource? _syncCancellation;
         private string? _resumeKey;
         private string? _resumeTag;
@@ -33,29 +34,29 @@ namespace InfluxdbDataSync
 
         private void InitializeUI()
         {
-            // ÉèÖÃÈÕÆÚÊ±¼äÄ¬ÈÏÖµÎª×î½ü1Ğ¡Ê±
+            // è®¾ç½®æ—¥æœŸæ—¶é—´é»˜è®¤å€¼ä¸ºæœ€è¿‘1å°æ—¶
             dtpStartTime.Value = DateTime.Parse(DateTime.Now.AddHours(-2).ToString("yyyy-MM-dd HH:00:00"));
             dtpEndTime.Value = DateTime.Parse(DateTime.Now.ToString("yyyy-MM-dd HH:00:00"));
 
-            // Ô¶³ÌInfluxDBÄ¬ÈÏÅäÖÃ
+            // è¿œç¨‹InfluxDBé»˜è®¤é…ç½®
             txtRemoteHost.Text = "localhost";
             txtRemotePort.Text = "38086";
             txtRemoteDatabase.Text = "ofm_tsdb";
             txtRemoteMeasure.Text = "INDEX";
 
-            // ±¾µØInfluxDBÄ¬ÈÏÅäÖÃ
+            // æœ¬åœ°InfluxDBé»˜è®¤é…ç½®
             txtLocalHost.Text = "localhost";
             txtLocalPort.Text = "38086";
             txtLocalDatabase.Text = "ofm_tsdb";
             txtLocalMeasure.Text = "INDEX";
             txtTimeInterval.Text = "0";
 
-            // ³õÊ¼»¯ÈÕÖ¾ÎÄ±¾¿ò
+            // åˆå§‹åŒ–æ—¥å¿—æ–‡æœ¬æ¡†
             rtbLog.ReadOnly = true;
         }
 
         /// <summary>
-        /// ÏòÈÕÖ¾ÇøÓòÌí¼ÓÏûÏ¢
+        /// å‘æ—¥å¿—åŒºåŸŸæ·»åŠ æ¶ˆæ¯
         /// </summary>
         private static DateTime GetWindowEnd(DateTime start, DateTime end, int sampleIntervalSeconds, TimeSpan queryWindow)
         {
@@ -75,7 +76,7 @@ namespace InfluxdbDataSync
         private static bool IsTimeout(Exception ex) =>
             ex is TimeoutException or TaskCanceledException
             || ex.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
-            || ex.Message.Contains("³¬Ê±", StringComparison.Ordinal);
+            || ex.Message.Contains("è¶…æ—¶", StringComparison.Ordinal);
         private void AddLog(string message)
         {
             if (rtbLog.InvokeRequired)
@@ -102,19 +103,19 @@ namespace InfluxdbDataSync
         {
             if (_syncCancellation == null) return;
             btnCancelSync.Enabled = false;
-            AddLog("ÕıÔÚÈ¡ÏûÍ¬²½...");
+            AddLog("æ­£åœ¨å–æ¶ˆåŒæ­¥...");
             _syncCancellation.Cancel();
         }
         private async void btnSync_Click(object sender, EventArgs e)
         {
             try
             {
-                // ½ûÓÃ°´Å¥·ÀÖ¹ÖØ¸´µã»÷
+                // ç¦ç”¨æŒ‰é’®é˜²æ­¢é‡å¤ç‚¹å‡»
                 SetOperationButtonsEnabled(false);
                 _syncCancellation = new CancellationTokenSource();
                 var cancellationToken = _syncCancellation.Token;
                 btnCancelSync.Enabled = true;
-                AddLog("¿ªÊ¼Êı¾İÍ¬²½...");
+                AddLog("å¼€å§‹æ•°æ®åŒæ­¥...");
                 string remoteHost = txtRemoteHost.Text, strRemotePort = txtRemotePort.Text,
                    remoteUser = txtRemoteUsername.Text, remotePassword = txtRemotePassword.Text,
                    remoteDB = txtRemoteDatabase.Text, remoteMeasure = txtRemoteMeasure.Text;
@@ -126,78 +127,78 @@ namespace InfluxdbDataSync
 
                 if (string.IsNullOrWhiteSpace(remoteMeasure))
                 {
-                    AddLog("ÇëÊäÈëÔ¶³ÌĞòÁĞÃû³Æ");
+                    AddLog("è¯·è¾“å…¥è¿œç¨‹åºåˆ—åç§°");
                     return;
                 }
                 else if (string.IsNullOrWhiteSpace(remoteHost))
                 {
-                    AddLog("ÇëÊäÈëÔ¶³ÌµØÖ·");
+                    AddLog("è¯·è¾“å…¥è¿œç¨‹åœ°å€");
                     return;
                 }
                 else if (string.IsNullOrWhiteSpace(remoteDB))
                 {
-                    AddLog("ÇëÊäÈëÔ¶³ÌÊı¾İ¿âÃû³Æ");
+                    AddLog("è¯·è¾“å…¥è¿œç¨‹æ•°æ®åº“åç§°");
                     return;
                 }
                 if (string.IsNullOrWhiteSpace(strRemotePort))
                 {
-                    AddLog("ÇëÊäÈëÔ¶³Ì¶Ë¿Ú");
+                    AddLog("è¯·è¾“å…¥è¿œç¨‹ç«¯å£");
                     return;
                 }
                 if (!int.TryParse(strRemotePort, out int remotePort) || remotePort <= 0 || remotePort > 65535)
                 {
-                    AddLog("Ô¶³Ì¶Ë¿Ú¸ñÊ½´íÎó");
+                    AddLog("è¿œç¨‹ç«¯å£æ ¼å¼é”™è¯¯");
                     return;
                 }
 
                 if (string.IsNullOrWhiteSpace(localMeasure))
                 {
-                    AddLog("ÇëÊäÈëÄ¿±êĞòÁĞÃû³Æ");
+                    AddLog("è¯·è¾“å…¥ç›®æ ‡åºåˆ—åç§°");
                     return;
                 }
                 else if (string.IsNullOrWhiteSpace(localHost))
                 {
-                    AddLog("ÇëÊäÈëÄ¿±êµØÖ·");
+                    AddLog("è¯·è¾“å…¥ç›®æ ‡åœ°å€");
                     return;
                 }
                 else if (string.IsNullOrWhiteSpace(localDB))
                 {
-                    AddLog("ÇëÊäÈëÄ¿±êÊı¾İ¿âÃû³Æ");
+                    AddLog("è¯·è¾“å…¥ç›®æ ‡æ•°æ®åº“åç§°");
                     return;
                 }
                 if (!int.TryParse(strlocalPort, out int localPort) || localPort <= 0 || localPort > 65535)
                 {
-                    AddLog("Ä¿±ê¶Ë¿Ú¸ñÊ½´íÎó");
+                    AddLog("ç›®æ ‡ç«¯å£æ ¼å¼é”™è¯¯");
                     return;
                 }
 
                 if (dtpStartTime.Value >= dtpEndTime.Value)
                 {
-                    AddLog("¿ªÊ¼Ê±¼ä±ØĞëÔçÓÚ½áÊøÊ±¼ä");
+                    AddLog("å¼€å§‹æ—¶é—´å¿…é¡»æ—©äºç»“æŸæ—¶é—´");
                     return;
                 }
                 if (!int.TryParse(txtTimeInterval.Text, out int sampleIntervalSeconds) || sampleIntervalSeconds < 0)
                 {
-                    AddLog("²ÉÑùÊ±¼ä¼ä¸ô±ØĞëÊÇ´óÓÚ»òµÈÓÚ 0 µÄÃëÊı£¨0 ±íÊ¾Ô­Ê¼Êı¾İ£©");
+                    AddLog("é‡‡æ ·æ—¶é—´é—´éš”å¿…é¡»æ˜¯å¤§äºæˆ–ç­‰äº 0 çš„ç§’æ•°ï¼ˆ0 è¡¨ç¤ºåŸå§‹æ•°æ®ï¼‰");
                     return;
                 }
                 var migrationConcurrency = (int)numMigrationConcurrency.Value;
                 var writeBatchSize = (int)numWriteBatchSize.Value;
                 using var remoteInfluxService = new InfluxDBService(remoteHost, remotePort, remoteDB, remoteUser, remotePassword);
 
-                // ²âÊÔÁ¬½Ó
-                AddLog("²âÊÔÔ¶³ÌInfluxDBÁ¬½Ó...");
+                // æµ‹è¯•è¿æ¥
+                AddLog("æµ‹è¯•è¿œç¨‹InfluxDBè¿æ¥...");
                 if (!await remoteInfluxService.TestInfluxConnection(AddLog, cancellationToken))
                 {
-                    AddLog("Ô¶³ÌInfluxDBÁ¬½ÓÊ§°Ü£¬ÎŞ·¨¼ÌĞø");
+                    AddLog("è¿œç¨‹InfluxDBè¿æ¥å¤±è´¥ï¼Œæ— æ³•ç»§ç»­");
                     return;
                 }
 
-                AddLog("²âÊÔ±¾µØInfluxDBÁ¬½Ó...");
+                AddLog("æµ‹è¯•æœ¬åœ°InfluxDBè¿æ¥...");
                 using var localInfluxService = new InfluxDBService(localHost, localPort, localDB, localUser, localPassword, writeBatchSize);
                 if (!await localInfluxService.TestInfluxConnection(AddLog, cancellationToken))
                 {
-                    AddLog("±¾µØInfluxDBÁ¬½ÓÊ§°Ü£¬ÎŞ·¨¼ÌĞø");
+                    AddLog("æœ¬åœ°InfluxDBè¿æ¥å¤±è´¥ï¼Œæ— æ³•ç»§ç»­");
                     return;
                 }
                 if (!await localInfluxService.EnsureLocalDatabaseExists(AddLog, cancellationToken))
@@ -207,14 +208,14 @@ namespace InfluxdbDataSync
                 List<string> tagFilters;
                 if (enteredTags.Length == 0)
                 {
-                    AddLog("ÕıÔÚ·ÖÒ³»ñÈ¡È«²¿²âµã...");
+                    AddLog("æ­£åœ¨åˆ†é¡µè·å–å…¨éƒ¨æµ‹ç‚¹...");
                     tagFilters = await remoteInfluxService.GetTagValuesAsync(remoteMeasure, cancellationToken: cancellationToken);
                     if (tagFilters.Count == 0)
                     {
-                        AddLog("Î´ÕÒµ½ tag ²âµã£¬ÎŞ·¨°´²âµã²ğ·ÖÍ¬²½¡£");
+                        AddLog("æœªæ‰¾åˆ° tag æµ‹ç‚¹ï¼Œæ— æ³•æŒ‰æµ‹ç‚¹æ‹†åˆ†åŒæ­¥ã€‚");
                         return;
                     }
-                    AddLog($"ÒÑ»ñÈ¡ {tagFilters.Count} ¸ö²âµã£¬½«ÒÀ´ÎÍ¬²½¡£");
+                    AddLog($"å·²è·å– {tagFilters.Count} ä¸ªæµ‹ç‚¹ï¼Œå°†ä¾æ¬¡åŒæ­¥ã€‚");
                 }
                 else
                 {
@@ -228,7 +229,7 @@ namespace InfluxdbDataSync
                 var syncKey = $"{remoteHost}\u001f{remoteDB}\u001f{remoteMeasure}\u001f{localHost}\u001f{localDB}\u001f{localMeasure}\u001f{startTime:O}\u001f{endTime:O}\u001f{sampleIntervalSeconds}\u001f{configuredWindow.Ticks}\u001f{tagSelectionKey}";
                 var startTagIndex = _resumeKey == syncKey && _resumeTag != null ? tagFilters.IndexOf(_resumeTag) : -1;
                 if (startTagIndex >= 0)
-                    AddLog($"´ÓÉÏ´ÎÎ»ÖÃ¼ÌĞø£º²âµã {_resumeTag}£¬Ê±¼ä {_resumeTime:yyyy-MM-dd HH:mm:ss}");
+                    AddLog($"ä»ä¸Šæ¬¡ä½ç½®ç»§ç»­ï¼šæµ‹ç‚¹ {_resumeTag}ï¼Œæ—¶é—´ {_resumeTime:yyyy-MM-dd HH:mm:ss}");
                 else
                     startTagIndex = 0;
                 AddLog($"Start sync {tagFilters.Count} tags (window {configuredWindow.TotalHours:g}h, sample {sampleIntervalSeconds}s, concurrency {migrationConcurrency}, write batch {writeBatchSize})...");
@@ -244,12 +245,12 @@ namespace InfluxdbDataSync
                         _resumeTag = tag;
                         _resumeTime = dtTime;
                     }
-                    AddLog($"----- [{tagIndex + 1}/{tagFilters.Count}] ¿ªÊ¼Í¬²½²âµã: {tag} -----");
+                    AddLog($"----- [{tagIndex + 1}/{tagFilters.Count}] å¼€å§‹åŒæ­¥æµ‹ç‚¹: {tag} -----");
 
                     while (dtTime < endTime)
                     {
                         var et = GetWindowEnd(dtTime, endTime, sampleIntervalSeconds, queryWindow);
-                        AddLog($"²éÑ¯ {dtTime:yyyy-MM-dd HH:mm:ss} - {et:yyyy-MM-dd HH:mm:ss}");
+                        AddLog($"æŸ¥è¯¢ {dtTime:yyyy-MM-dd HH:mm:ss} - {et:yyyy-MM-dd HH:mm:ss}");
                         string queryResult;
                         try
                         {
@@ -258,18 +259,18 @@ namespace InfluxdbDataSync
                         catch (Exception ex) when (!cancellationToken.IsCancellationRequested && IsTimeout(ex) && queryWindow > minimumWindow)
                         {
                             queryWindow = TimeSpan.FromTicks(Math.Max(minimumWindow.Ticks, queryWindow.Ticks / 2));
-                            AddLog($"²éÑ¯³¬Ê±£¬×Ô¶¯ËõĞ¡ÖÜÆÚÎª {queryWindow.TotalMinutes:g} ·ÖÖÓºóÖØÊÔ¡£");
+                            AddLog($"æŸ¥è¯¢è¶…æ—¶ï¼Œè‡ªåŠ¨ç¼©å°å‘¨æœŸä¸º {queryWindow.TotalMinutes:g} åˆ†é’Ÿåé‡è¯•ã€‚");
                             continue;
                         }
 
                         if (!string.IsNullOrEmpty(queryResult))
                         {
-                            AddLog("----- ²éÑ¯³É¹¦£¬¿ªÊ¼Ğ´Èë -----");
+                            AddLog("----- æŸ¥è¯¢æˆåŠŸï¼Œå¼€å§‹å†™å…¥ -----");
                             await localInfluxService.WritePointsAsync(queryResult, cancellationToken);
                         }
                         else
                         {
-                            AddLog($"²âÁ¿µã {tag} µ±Ç°Ê±¶ÎÎŞÊı¾İ");
+                            AddLog($"æµ‹é‡ç‚¹ {tag} å½“å‰æ—¶æ®µæ— æ•°æ®");
                         }
 
                         dtTime = et;
@@ -303,15 +304,15 @@ namespace InfluxdbDataSync
 
                 _resumeKey = null;
                 _resumeTag = null;
-                AddLog("ËùÓĞ²âµãÊı¾İÍ¬²½Íê³É£¡");
+                AddLog("æ‰€æœ‰æµ‹ç‚¹æ•°æ®åŒæ­¥å®Œæˆï¼");
             }
             catch (OperationCanceledException) when (_syncCancellation?.IsCancellationRequested == true)
             {
-                AddLog("Í¬²½ÒÑÈ¡Ïû¡£");
+                AddLog("åŒæ­¥å·²å–æ¶ˆã€‚");
             }
             catch (Exception ex)
             {
-                AddLog($"Í¬²½¹ı³ÌÖĞ·¢Éú´íÎó: {ex.Message}");
+                AddLog($"åŒæ­¥è¿‡ç¨‹ä¸­å‘ç”Ÿé”™è¯¯: {ex.Message}");
             }
             finally
             {
@@ -320,6 +321,32 @@ namespace InfluxdbDataSync
                 _syncCancellation = null;
                 SetOperationButtonsEnabled(true);
             }
+        }
+
+        /// <summary>
+        /// å°†è¿œç«¯ tag å€¼æ˜ å°„ä¸ºå¤‡ä»½ç›®å½•å†…çš„å®‰å…¨æ–‡ä»¶åï¼šæ›¿æ¢éæ³•å­—ç¬¦ã€å»æ‰ç»“å°¾ç‚¹å¹¶é™åˆ¶é•¿åº¦ï¼›
+        /// åç§°å‘ç”Ÿæ”¹å†™æ—¶è¿½åŠ åŸå€¼å“ˆå¸Œï¼Œé¿å… ../ ç©¿è¶Šä¸ä¸åŒ tag è½åˆ°åŒä¸€æ–‡ä»¶ã€‚
+        /// </summary>
+        private static string BuildBackupFilePath(string backupDirectory, string tag)
+        {
+            var invalid = Path.GetInvalidFileNameChars();
+            var safe = new StringBuilder(tag.Length);
+            foreach (var ch in tag)
+                safe.Append(char.IsControl(ch) || Array.IndexOf(invalid, ch) >= 0 ? '_' : ch);
+
+            var name = safe.ToString().Trim().TrimEnd('.');
+            if (name.Length == 0) name = "point";
+            if (name.Length > 80) name = name[..80];
+
+            if (!string.Equals(name, tag, StringComparison.Ordinal))
+                name += "_" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(tag)))[..8];
+
+            var root = Path.GetFullPath(backupDirectory);
+            var fullPath = Path.GetFullPath(Path.Combine(root, name + ".bak"));
+            var prefix = root.EndsWith(Path.DirectorySeparatorChar) ? root : root + Path.DirectorySeparatorChar;
+            if (!fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"éæ³•çš„å¤‡ä»½æ–‡ä»¶å: {tag}");
+            return fullPath;
         }
 
         private async void btnBackupToFile_Click(object sender, EventArgs e)
@@ -333,61 +360,63 @@ namespace InfluxdbDataSync
                 SetOperationButtonsEnabled(false);
 
                 string backupFilePath = txtBackupFilePath.Text;
-                // ÑéÖ¤ÊäÈë
+                // éªŒè¯è¾“å…¥
                 if (string.IsNullOrWhiteSpace(remoteMeasure))
                 {
-                    AddLog("ÇëÊäÈëÔ¶³ÌĞòÁĞÃû³Æ");
+                    AddLog("è¯·è¾“å…¥è¿œç¨‹åºåˆ—åç§°");
                     return;
                 }
                 if (string.IsNullOrWhiteSpace(remoteHost))
                 {
-                    AddLog("ÇëÊäÈëÔ¶³ÌµØÖ·");
+                    AddLog("è¯·è¾“å…¥è¿œç¨‹åœ°å€");
                     return;
                 }
                 if (string.IsNullOrWhiteSpace(remoteDB))
                 {
-                    AddLog("ÇëÊäÈëÔ¶³Ì¶Ë¿Ú");
+                    AddLog("è¯·è¾“å…¥è¿œç¨‹ç«¯å£");
                     return;
                 }
                 if (string.IsNullOrWhiteSpace(backupFilePath))
                 {
-                    AddLog("ÇëÑ¡Ôñ±¸·İÎÄ¼ş±£´æÂ·¾¶");
+                    AddLog("è¯·é€‰æ‹©å¤‡ä»½æ–‡ä»¶ä¿å­˜è·¯å¾„");
                     return;
                 }
                 if (!int.TryParse(strRemotePort, out int remotePort) || remotePort <= 0 || remotePort > 65535)
                 {
-                    AddLog("Ô¶³Ì¶Ë¿Ú¸ñÊ½´íÎó");
+                    AddLog("è¿œç¨‹ç«¯å£æ ¼å¼é”™è¯¯");
                     return;
                 }
                 if (dtpStartTime.Value >= dtpEndTime.Value)
                 {
-                    AddLog("¿ªÊ¼Ê±¼ä±ØĞëÔçÓÚ½áÊøÊ±¼ä");
+                    AddLog("å¼€å§‹æ—¶é—´å¿…é¡»æ—©äºç»“æŸæ—¶é—´");
                     return;
                 }
-                // ²âÊÔÔ¶³ÌÁ¬½Ó
-                AddLog("²âÊÔÔ¶³ÌInfluxDBÁ¬½Ó...");
+                // æµ‹è¯•è¿œç¨‹è¿æ¥
+                AddLog("æµ‹è¯•è¿œç¨‹InfluxDBè¿æ¥...");
                 using var influxDBService = new InfluxDBService(remoteHost, remotePort, remoteDB, remoteUser, remotePassword);
                 if (!await influxDBService.TestInfluxConnection(AddLog))
                 {
-                    AddLog("Ô¶³ÌInfluxDBÁ¬½ÓÊ§°Ü£¬ÎŞ·¨¼ÌĞø");
+                    AddLog("è¿œç¨‹InfluxDBè¿æ¥å¤±è´¥ï¼Œæ— æ³•ç»§ç»­");
 
                     return;
                 }
 
                 var pointList = points.Split(new[] { '\r', '\n', ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
-                AddLog($"¹²»ñÈ¡µ½ {pointList.Length} ¸ö²âÁ¿µã£¬¿ªÊ¼±¸·İÊı¾İ...");
+                AddLog($"å…±è·å–åˆ° {pointList.Length} ä¸ªæµ‹é‡ç‚¹ï¼Œå¼€å§‹å¤‡ä»½æ•°æ®...");
 
                 foreach (var point in pointList)
                 {
-                    AddLog($"¿ªÊ¼±¸·İ²âµã£º{point}");
-                    string backFilePath = Path.Combine(backupFilePath, point + ".bak");
-                    await influxDBService.ExportToCompressedFileAsync(remoteMeasure, point, dtpStartTime.Value, dtpEndTime.Value, backFilePath, AddLog);
+                    var tag = point.Trim();
+                    if (tag.Length == 0) continue;
+                    AddLog($"å¼€å§‹å¤‡ä»½æµ‹ç‚¹ï¼š{tag}");
+                    string backFilePath = BuildBackupFilePath(backupFilePath, tag);
+                    await influxDBService.ExportToCompressedFileAsync(remoteMeasure, tag, dtpStartTime.Value, dtpEndTime.Value, backFilePath, AddLog);
                 }
 
             }
             catch (Exception ex)
             {
-                AddLog($"±¸·İ¹ı³ÌÖĞ·¢Éú´íÎó: {ex.Message}");
+                AddLog($"å¤‡ä»½è¿‡ç¨‹ä¸­å‘ç”Ÿé”™è¯¯: {ex.Message}");
             }
             finally
             {
@@ -396,7 +425,7 @@ namespace InfluxdbDataSync
         }
 
         /// <summary>
-        /// Ñ¡Ôñ±¸·İÎÄ¼şÂ·¾¶
+        /// é€‰æ‹©å¤‡ä»½æ–‡ä»¶è·¯å¾„
         /// </summary>
         private void btnSelectBackupFile_Click(object sender, EventArgs e)
         {
@@ -410,17 +439,17 @@ namespace InfluxdbDataSync
         }
 
         /// <summary>
-        /// Ñ¡Ôñ»Ö¸´ÎÄ¼şÂ·¾¶
+        /// é€‰æ‹©å¤‡ä»½ç›®å½•ï¼ˆå¤‡ä»½æŒ‰æµ‹ç‚¹å†™å…¥å¤šä¸ª .bak æ–‡ä»¶ï¼Œæ¢å¤æ—¶æ•´ç›®å½•å¯¼å…¥ï¼‰
         /// </summary>
         private void btnSelectRestoreFile_Click(object sender, EventArgs e)
         {
-            using (var openDialog = new OpenFileDialog())
+            using (var dialog = new FolderBrowserDialog())
             {
-                openDialog.Title = "Ñ¡ÔñÒª»Ö¸´µÄ±¸·İÎÄ¼ş";
+                dialog.Description = "é€‰æ‹©å¤‡ä»½ç›®å½•ï¼ˆå°†å¯¼å…¥ç›®å½•å†…å…¨éƒ¨ .bak æ–‡ä»¶ï¼‰";
 
-                if (openDialog.ShowDialog() == DialogResult.OK)
+                if (dialog.ShowDialog() == DialogResult.OK)
                 {
-                    txtRestoreFilePath.Text = openDialog.FileName;
+                    txtRestoreFilePath.Text = dialog.SelectedPath;
                 }
             }
         }
@@ -433,48 +462,77 @@ namespace InfluxdbDataSync
                     localUser = txtLocalUsername.Text, localPassword = txtLocalPassword.Text,
                     localDB = txtLocalDatabase.Text, localMeasure = txtLocalMeasure.Text;
                 SetOperationButtonsEnabled(false);
-                string restoreFilePath = txtRestoreFilePath.Text;
-                // ÑéÖ¤ÊäÈë
-                if (string.IsNullOrWhiteSpace(restoreFilePath))
+                string restorePath = txtRestoreFilePath.Text.Trim();
+                // éªŒè¯è¾“å…¥ï¼šç›®å½•è¡¨ç¤ºæ•´æ‰¹å¤‡ä»½ï¼Œæ–‡ä»¶è¡¨ç¤ºå•ä¸ªå¤‡ä»½
+                if (string.IsNullOrWhiteSpace(restorePath))
                 {
-                    AddLog("ÇëÑ¡ÔñÒª»Ö¸´µÄ±¸·İÎÄ¼ş");
+                    AddLog("è¯·é€‰æ‹©è¦æ¢å¤çš„å¤‡ä»½ç›®å½•æˆ–æ–‡ä»¶");
                     return;
                 }
-                if (!File.Exists(restoreFilePath))
+                string[] backupFiles;
+                if (Directory.Exists(restorePath))
                 {
-                    AddLog("Ñ¡ÔñµÄ±¸·İÎÄ¼ş²»´æÔÚ");
+                    backupFiles = Directory.GetFiles(restorePath, "*.bak", SearchOption.TopDirectoryOnly);
+                    Array.Sort(backupFiles, StringComparer.OrdinalIgnoreCase);
+                    if (backupFiles.Length == 0)
+                    {
+                        AddLog("å¤‡ä»½ç›®å½•ä¸­æ²¡æœ‰ .bak æ–‡ä»¶");
+                        return;
+                    }
+                }
+                else if (File.Exists(restorePath))
+                {
+                    backupFiles = new[] { restorePath };
+                }
+                else
+                {
+                    AddLog("é€‰æ‹©çš„å¤‡ä»½ç›®å½•æˆ–æ–‡ä»¶ä¸å­˜åœ¨");
                     return;
                 }
                 if (!int.TryParse(strlocalPort, out int localPort) || localPort <= 0 || localPort > 65535)
                 {
-                    AddLog("»Ö¸´Ä¿±ê¶Ë¿Ú¸ñÊ½´íÎó");
+                    AddLog("æ¢å¤ç›®æ ‡ç«¯å£æ ¼å¼é”™è¯¯");
                     return;
                 }
 
-                // ²âÊÔÄ¿±êInfluxDBÁ¬½Ó
-                AddLog("²âÊÔ±¾µØInfluxDBÁ¬½Ó...");
+                // æµ‹è¯•ç›®æ ‡InfluxDBè¿æ¥
+                AddLog("æµ‹è¯•æœ¬åœ°InfluxDBè¿æ¥...");
                 using var influxDBService = new InfluxDBService(localHost, localPort, localDB, localUser, localPassword, (int)numWriteBatchSize.Value);
                 if (!await influxDBService.TestInfluxConnection(AddLog))
                 {
-                    AddLog("±¾µØInfluxDBÁ¬½ÓÊ§°Ü£¬ÎŞ·¨¼ÌĞø");
+                    AddLog("æœ¬åœ°InfluxDBè¿æ¥å¤±è´¥ï¼Œæ— æ³•ç»§ç»­");
                     return;
                 }
-                AddLog("¼ì²é±¾µØÊı¾İ¿âÊÇ·ñ´æÔÚ...");
+                AddLog("æ£€æŸ¥æœ¬åœ°æ•°æ®åº“æ˜¯å¦å­˜åœ¨...");
                 bool flag = await influxDBService.EnsureLocalDatabaseExists(AddLog);
                 if (!flag)
                 {
                     return;
                 }
 
-                // »ñÈ¡±¸·İÎÄ¼şµÄ»ù±¾Â·¾¶ºÍ²âÁ¿µãÃû³Æ
-                string basePath = txtRestoreFilePath.Text;
-                await influxDBService.ImportFromCompressedFileAsync(basePath, AddLog);
+                var succeeded = 0;
+                foreach (var backupFile in backupFiles)
+                {
+                    AddLog($"å¼€å§‹å¯¼å…¥å¤‡ä»½æ–‡ä»¶ï¼ˆ{succeeded + 1}/{backupFiles.Length}ï¼‰ï¼š{Path.GetFileName(backupFile)}");
+                    try
+                    {
+                        await influxDBService.ImportFromCompressedFileAsync(backupFile, AddLog);
+                        succeeded++;
+                    }
+                    catch (Exception ex)
+                    {
+                        AddLog($"å¯¼å…¥ {Path.GetFileName(backupFile)} å¤±è´¥: {ex.Message}");
+                    }
+                }
 
-                AddLog("Êı¾İ»Ö¸´³É¹¦£¡");
+                if (succeeded == backupFiles.Length)
+                    AddLog($"æ•°æ®æ¢å¤æˆåŠŸï¼å…±å¯¼å…¥ {succeeded} ä¸ªå¤‡ä»½æ–‡ä»¶ã€‚");
+                else
+                    AddLog($"æ•°æ®æ¢å¤å®Œæˆï¼šæˆåŠŸ {succeeded} ä¸ªï¼Œå¤±è´¥ {backupFiles.Length - succeeded} ä¸ªã€‚");
             }
             catch (Exception ex)
             {
-                AddLog($"»Ö¸´¹ı³ÌÖĞ·¢Éú´íÎó: {ex.Message}");
+                AddLog($"æ¢å¤è¿‡ç¨‹ä¸­å‘ç”Ÿé”™è¯¯: {ex.Message}");
             }
             finally
             {
@@ -493,45 +551,45 @@ namespace InfluxdbDataSync
                 SetOperationButtonsEnabled(false);
                 if (string.IsNullOrWhiteSpace(localMeasure))
                 {
-                    AddLog("ÇëÊäÈëÄ¿±êĞòÁĞÃû³Æ");
+                    AddLog("è¯·è¾“å…¥ç›®æ ‡åºåˆ—åç§°");
                     return;
                 }
                 else if (string.IsNullOrWhiteSpace(localHost))
                 {
-                    AddLog("ÇëÊäÈëÄ¿±êµØÖ·");
+                    AddLog("è¯·è¾“å…¥ç›®æ ‡åœ°å€");
                     return;
                 }
                 else if (string.IsNullOrWhiteSpace(localDB))
                 {
-                    AddLog("ÇëÊäÈëÄ¿±êÊı¾İ¿âÃû³Æ");
+                    AddLog("è¯·è¾“å…¥ç›®æ ‡æ•°æ®åº“åç§°");
                     return;
                 }
                 if (!int.TryParse(strlocalPort, out int localPort) || localPort <= 0 || localPort > 65535)
                 {
-                    AddLog("Ä¿±ê¶Ë¿Ú¸ñÊ½´íÎó");
+                    AddLog("ç›®æ ‡ç«¯å£æ ¼å¼é”™è¯¯");
                     return;
                 }
                 if (minNum >= maxNum)
                 {
-                    AddLog("ÊıÖµ·¶Î§ÉèÖÃ´íÎó");
+                    AddLog("æ•°å€¼èŒƒå›´è®¾ç½®é”™è¯¯");
                     return;
                 }
                 if (dtpStartTime.Value >= dtpEndTime.Value)
                 {
-                    AddLog("¿ªÊ¼Ê±¼ä±ØĞëÔçÓÚ½áÊøÊ±¼ä");
+                    AddLog("å¼€å§‹æ—¶é—´å¿…é¡»æ—©äºç»“æŸæ—¶é—´");
                     return;
                 }
 
-                // ²âÊÔÄ¿±êInfluxDBÁ¬½Ó
-                AddLog("²âÊÔ±¾µØInfluxDBÁ¬½Ó...");
+                // æµ‹è¯•ç›®æ ‡InfluxDBè¿æ¥
+                AddLog("æµ‹è¯•æœ¬åœ°InfluxDBè¿æ¥...");
                 using var influxDBService = new InfluxDBService(localHost, localPort, localDB, localUser, localPassword, (int)numWriteBatchSize.Value);
                 if (!await influxDBService.TestInfluxConnection(AddLog))
                 {
-                    AddLog("±¾µØInfluxDBÁ¬½ÓÊ§°Ü£¬ÎŞ·¨¼ÌĞø");
+                    AddLog("æœ¬åœ°InfluxDBè¿æ¥å¤±è´¥ï¼Œæ— æ³•ç»§ç»­");
                     SetOperationButtonsEnabled(true);
                     return;
                 }
-                AddLog("¼ì²é±¾µØÊı¾İ¿âÊÇ·ñ´æÔÚ...");
+                AddLog("æ£€æŸ¥æœ¬åœ°æ•°æ®åº“æ˜¯å¦å­˜åœ¨...");
                 bool flag = await influxDBService.EnsureLocalDatabaseExists(AddLog);
                 if (!flag)
                 {
@@ -542,10 +600,10 @@ namespace InfluxdbDataSync
                 var pointList = points.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
                 if (pointList.Length == 0)
                 {
-                    AddLog($"²âµãÊı¾İÎª¿Õ£¬ÇëÌí¼Ó²âµã");
+                    AddLog($"æµ‹ç‚¹æ•°æ®ä¸ºç©ºï¼Œè¯·æ·»åŠ æµ‹ç‚¹");
                     return;
                 }
-                AddLog($"¹²»ñÈ¡µ½ {pointList.Length} ¸ö²âÁ¿µã£¬¿ªÊ¼±¸·İÊı¾İ...");
+                AddLog($"å…±è·å–åˆ° {pointList.Length} ä¸ªæµ‹é‡ç‚¹ï¼Œå¼€å§‹å¤‡ä»½æ•°æ®...");
                 DateTime startTime = dtpStartTime.Value, endTime = dtpEndTime.Value;
                 DateTimeOffset dt1 = DateTime.SpecifyKind(startTime, DateTimeKind.Local);
                 DateTimeOffset dt2 = DateTime.SpecifyKind(endTime, DateTimeKind.Local);
@@ -556,9 +614,9 @@ namespace InfluxdbDataSync
                 double diff = maxNum - minNum;
                 foreach (var tag in pointList)
                 {
-                    AddLog($"----- ¿ªÊ¼Éú³É²âµãÊı¾İ: {tag} -----");
+                    AddLog($"----- å¼€å§‹ç”Ÿæˆæµ‹ç‚¹æ•°æ®: {tag} -----");
                     int count = (int)(endTimestamp - startTimestamp) / 1000;
-                    AddLog($"----- ¿ªÊ¼Éú³É²âµã: {tag}  Ê±¼ä{startTime:yyyy-MM-dd HH:mm:ss}-----{endTime:yyyy-MM-dd HH:mm:ss}");
+                    AddLog($"----- å¼€å§‹ç”Ÿæˆæµ‹ç‚¹: {tag}  æ—¶é—´{startTime:yyyy-MM-dd HH:mm:ss}-----{endTime:yyyy-MM-dd HH:mm:ss}");
 
                     for (int i = 0; i <= count; i++)
                     {
@@ -578,13 +636,13 @@ namespace InfluxdbDataSync
                         sb.Clear();
                     }
 
-                    await Task.Delay(10); // ±ÜÃâÇëÇó¹ıÓÚÆµ·±
-                    AddLog($"----- ²âµãÊı¾İÒÑÉú³É -----");
+                    await Task.Delay(10); // é¿å…è¯·æ±‚è¿‡äºé¢‘ç¹
+                    AddLog($"----- æµ‹ç‚¹æ•°æ®å·²ç”Ÿæˆ -----");
                 }
             }
             catch (Exception ex)
             {
-                AddLog("Êı¾İÉú³ÉÊ§°Ü£º" + ex.Message);
+                AddLog("æ•°æ®ç”Ÿæˆå¤±è´¥ï¼š" + ex.Message);
             }
             finally
             {

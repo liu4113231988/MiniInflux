@@ -91,10 +91,11 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
 
 ## 功能
 
-- `GET /ping`
+- `GET|HEAD /ping`（返回 204，并带 `X-Influxdb-Version` 头；`GET /` 重定向到 `/admin`）
 - `GET /debug/stats`：设置启动环境变量 `MiniInflux__WriteDiagnostics=true` 可启用写入/flush 分阶段累计计时，返回 `WriteDiagnosticsEnabled`、`WritePhaseMilliseconds` 和 `WritePhaseCounts`。默认关闭；计数为进程级，重启清零，阶段可能嵌套或并行，不能相加当成总耗时或 CPU 占比。该开关仅从环境变量读取。
 - `POST /write?db=metrics&precision=ns|u|ms|s|m|h`
 - `POST /api/v2/write?bucket=metrics&org=&precision=...`（v2 兼容写入，`bucket` 支持 `db/rp` 形式，接受 `Authorization: Token xxx`）
+  - `org` 按 InfluxDB 2.x 必填参数接收，但服务端没有 org 模型，值会被忽略；鉴权只认 token 与 `bucket`
 - `GET|POST /query?db=metrics&q=...&format=csv`（`format=csv` 返回服务器端 CSV）
 - `POST /api/v3/query_influxql`（JSON 请求体 `{db, q, params?, format?(json|csv), epoch?}`）
 - Line Protocol 写入
@@ -109,12 +110,14 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
   - `CREATE CONTINUOUS QUERY ... BEGIN SELECT ... INTO ... END`
   - `SHOW CONTINUOUS QUERIES`
   - `DROP CONTINUOUS QUERY ... ON db`
-- `SELECT * FROM measurement [WHERE ...] [GROUP BY time(1m)] [ORDER BY time DESC] [LIMIT n]`
+- `SELECT * FROM measurement [WHERE ...] [GROUP BY time(1m[, offset])] [tz('zone')] [ORDER BY time DESC] [LIMIT n]`
   - 支持 `FROM (<select ...>)` 聚合型子查询第一版
   - 聚合函数：`count,sum,mean,min,max,first,last,spread,stddev,median,percentile`
   - 序列函数：`difference,derivative,non_negative_derivative,moving_average,cumulative_sum,integral,elapsed`
   - 采样/排名函数：`top,bottom,sample`
   - 已支持 `GROUP BY time(...)`、`GROUP BY tag`、`GROUP BY time(...),tag`
+  - 已支持 `GROUP BY time(1h, 30m)` bucket 偏移与 `GROUP BY time(1h) tz('Asia/Shanghai')` 时区输出（负偏移亦可）
+  - `FROM m1,m2`、`FROM /regex/`、`HOLT_WINTERS`、`HOLT_WINTERS_WITH_MONTHLY`、`HISTOGRAM` 及嵌套聚合会明确返回“不支持”，不再静默返回空结果
   - 已支持 `GROUP BY *`，用于在 `SELECT INTO` / Continuous Query 中保留源 tags
   - 已支持 `fill(none|null|previous|linear|zero)`、`ORDER BY time DESC`、`SLIMIT`、`SOFFSET`
   - 已支持 `AS` 别名（`SELECT mean(value) AS m FROM cpu`）；`time = X` 相等过滤（min=max 区间）
@@ -126,6 +129,7 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
   - 支持 `DROP SERIES FROM m1,m2 WHERE ...`
 - 查询保护与观测
   - chunked query response
+  - gzip 边界：仅当请求带 `Accept-Encoding: gzip`（`q=0` 视为拒绝）且路径属于 `/query`、`/api/v3/query_influxql`、`/admin/api`、`/metrics`、`/debug/stats`、`/debug/benchmark` 时压缩响应体；请求体仅在带 `Content-Encoding: gzip` 时解压（当前用于写入）。空响应（204/304）会在开始发送前撤销 `Content-Encoding`，不压缩静态资源、`/ping`、`/health`
   - query count / error / timeout / rows / scanned points / duration buckets
   - `MaxQueryDuration`、`MaxQueryPoints`、`MaxResponseRows`、`MaxQueryMemoryBytes`
 - 写入保护
@@ -553,7 +557,7 @@ dotnet run -- restore --data ./data --path ./backup
 - `inspect schema` 用于查看 field schema，支持按 `--db`、`--measurement` 过滤。
 - `inspect tombstone` 用于查看 delete tombstone 摘要和明细，支持按 `--db` 过滤。
 - `validate data-dir` 用于检查 manifest、schema、tombstone 与磁盘 segment 的基本一致性，并提示缺失文件、孤儿 segment、临时文件和 restore 残留目录。
-- `repair` 会离线执行恢复流程并刷新 WAL/内存状态。
+- `repair` 会离线执行恢复流程并刷新 WAL/内存状态；当 `manifest.json` 与 `.bak` 均不可读（引擎无法启动）时，会先按 `db/<db>/<rp>/shards/*/*.seg` 重建目录（保留损坏文件为 `manifest.json.corrupt-*`），重建时 RP 时长与连续查询无法推断，需事后手工恢复，输出 `manifest_rebuilt=true` 及重建计数。
 - `compact` 会离线触发 compaction。
 - `backup verify` 会离线校验备份元数据、文件长度和 SHA256。
 - `backup` / `restore` 使用带元数据校验的备份恢复流程。
