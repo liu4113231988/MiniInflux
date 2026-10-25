@@ -8,18 +8,27 @@ namespace MiniInflux.Net10.Query;
 /// </summary>
 public static class QueryPermission
 {
+    /// <summary>
+    /// Maximum subquery nesting depth. Guards both permission classification and execution
+    /// against unbounded recursion (StackOverflowException cannot be caught and would crash
+    /// the process); deeper queries are rejected with an explicit error instead.
+    /// </summary>
+    public const int MaxSubqueryDepth = 16;
+
     public static string RequiredPermission(ParsedQuery query) =>
         IsReadOnly(query) ? "read" : "write";
 
-    public static bool IsReadOnly(ParsedQuery query)
+    public static bool IsReadOnly(ParsedQuery query, int depth = 0)
     {
+        if (depth > MaxSubqueryDepth)
+            throw new NotSupportedException($"subquery nesting exceeds the maximum depth of {MaxSubqueryDepth}");
         switch (query.Kind)
         {
             case QueryKind.Select:
                 return string.IsNullOrWhiteSpace(query.IntoTarget)
-                    && (query.Subquery == null || IsReadOnly(query.Subquery));
+                    && (query.Subquery == null || IsReadOnly(query.Subquery, depth + 1));
             case QueryKind.Explain:
-                return query.ExplainedQuery == null || IsReadOnly(query.ExplainedQuery);
+                return query.ExplainedQuery == null || IsReadOnly(query.ExplainedQuery, depth + 1);
             case QueryKind.ShowDatabases:
             case QueryKind.ShowMeasurements:
             case QueryKind.ShowFieldKeys:

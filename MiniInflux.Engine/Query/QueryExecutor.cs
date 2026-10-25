@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Text.Json.Serialization;
 using MiniInflux.Net10.Model;
@@ -161,8 +162,8 @@ public sealed class QueryExecutor
             if (seriesFilter is null || seriesFilter.Count != 1)
                 return null;
 
-            var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
-            var readLimit = checked(Math.Max(0, q.Offset ?? 0) + rowLimit);
+            var rowLimit = EffectiveRowLimit(q);
+            var readLimit = rowLimit.HasValue ? checked(Math.Max(0, q.Offset ?? 0) + rowLimit.Value) : int.MaxValue;
             var tagsCanonical = seriesFilter.First();
             var resultMeasurement = ResolveResultMeasurementName(q);
             var fields = ResolveRawFields(e, sourceDb, q, requestedFields);
@@ -194,7 +195,7 @@ public sealed class QueryExecutor
                     var fieldResultBytes = EstimateRawSeriesShellBytes(resultMeasurement, fieldCols);
                     var fieldBuffer = new System.Buffers.ArrayBufferWriter<byte>();
                     using (var writer = new System.Text.Json.Utf8JsonWriter(fieldBuffer))
-                        WriteFieldRowsRawJsonResponse(writer, resultMeasurement, seriesTags, fieldCols, fieldsRead, offset, rowLimit, epochDivisor, report, ref fieldResultBytes);
+                        WriteFieldRowsRawJsonResponse(writer, resultMeasurement, seriesTags, fieldCols, fieldsRead, offset, rowLimit ?? int.MaxValue, epochDivisor, report, ref fieldResultBytes);
 
                     sw.Stop();
                     report.DurationMs = sw.ElapsedMilliseconds;
@@ -229,7 +230,7 @@ public sealed class QueryExecutor
 
             var buffer = new System.Buffers.ArrayBufferWriter<byte>();
             using (var writer = new System.Text.Json.Utf8JsonWriter(buffer))
-                WriteRawJsonResponse(writer, resultMeasurement, seriesTags, cols, fields, points, offset, rowLimit, epochDivisor, report, ref resultBytes);
+                WriteRawJsonResponse(writer, resultMeasurement, seriesTags, cols, fields, points, offset, rowLimit ?? int.MaxValue, epochDivisor, report, ref resultBytes);
 
             sw.Stop();
             report.DurationMs = sw.ElapsedMilliseconds;
@@ -549,7 +550,7 @@ public sealed class QueryExecutor
             yield return RawChunk(resultMeasurement, cols, chunkRows);
     }
 
-    List<QuerySeries>? Run(TsdbEngine e, string? db, ParsedQuery q, CancellationToken cancellationToken, QueryExecutionReport report)
+    List<QuerySeries>? Run(TsdbEngine e, string? db, ParsedQuery q, CancellationToken cancellationToken, QueryExecutionReport report, int depth = 0)
     {
         cancellationToken.ThrowIfCancellationRequested();
         return q.Kind switch
@@ -576,7 +577,7 @@ public sealed class QueryExecutor
             QueryKind.DropSeries => DropSeriesResult(e, db, q),
             QueryKind.DropShard => DropShard(e, q),
             QueryKind.Delete => DeleteResult(e, db, q),
-            QueryKind.Select => Select(e, db, q, cancellationToken, report),
+            QueryKind.Select => Select(e, db, q, cancellationToken, report, depth),
             QueryKind.Explain => ExplainQuery(e, db, q, cancellationToken, report),
             QueryKind.ShowQueries => ShowQueries(),
             QueryKind.KillQuery => KillQueryResult(q),
@@ -1019,7 +1020,7 @@ public sealed class QueryExecutor
         return null;
     }
 
-    List<QuerySeries> Select(TsdbEngine e, string? db, ParsedQuery q, CancellationToken cancellationToken, QueryExecutionReport report)
+    List<QuerySeries> Select(TsdbEngine e, string? db, ParsedQuery q, CancellationToken cancellationToken, QueryExecutionReport report, int depth = 0)
     {
         Req(q.SourceDatabase ?? db);
         var sourceDb = q.SourceDatabase ?? db!;
@@ -1043,7 +1044,9 @@ public sealed class QueryExecutor
         var filtersMayChangePoints = true;
         if (q.Subquery != null)
         {
-            var innerSeries = Run(e, db, q.Subquery, cancellationToken, report) ?? [];
+            if (depth >= QueryPermission.MaxSubqueryDepth)
+                throw new NotSupportedException($"subquery nesting exceeds the maximum depth of {QueryPermission.MaxSubqueryDepth}");
+            var innerSeries = Run(e, db, q.Subquery, cancellationToken, report, depth + 1) ?? [];
             pts = MaterializeSubqueryPoints(innerSeries);
             EnsureQueryPointLimit(pts.Count);
             var materializedPointBytes = EstimatePointsBytes(pts);
@@ -1155,8 +1158,12 @@ public sealed class QueryExecutor
                 {
                     // ponytail: push LIMIT down into ReadAllPoints so we never fully materialize every
                     // point across all segments before applying Skip/Take. Deduplication can only shrink
-                    // the result set, so stopping once (offset + limit) points are gathered is safe.
-                    var readLimit = q.Limit.HasValue ? q.Offset + q.Limit.Value : (int?)null;
+                    // the result set, so stopping once (offset + limit) points are gathered is safe —
+                    // but per-point field filters also shrink the set and run AFTER this read
+                    // (ApplyFieldFilters below), so the limit must not be pushed down while any field
+                    // filter is present, otherwise matching points beyond the raw read budget would be
+                    // silently dropped and the query could return fewer rows than LIMIT.
+                    var readLimit = q.Limit.HasValue && q.FieldFilters.Count == 0 ? q.Offset + q.Limit.Value : (int?)null;
                     pts = e.ReadAllPoints(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, q.FieldFilters, cancellationToken, readLimit);
                 }
             }
@@ -1239,14 +1246,17 @@ public sealed class QueryExecutor
             return functionResult;
         }
 
-        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        var rowLimit = EffectiveRowLimit(q);
         var distinctField = q.Select.SingleOrDefault(item => item.IsDistinct)?.Field;
         if (distinctField != null)
             pts = pts.DistinctBy(point => point.Fields.TryGetValue(distinctField, out var field)
                 ? field.ToObject()
                 : point.Tags.GetValueOrDefault(distinctField)).ToList();
         if (!pointsAreDescending || (q.Offset ?? 0) != 0)
-            pts = pts.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
+        {
+            var skippedPts = pts.Skip(q.Offset ?? 0);
+            pts = (rowLimit.HasValue ? skippedPts.Take(rowLimit.Value) : skippedPts).ToList();
+        }
 
         var isStar = q.Select.Count == 1 && q.Select[0].Field == "*";
         var fields = isStar
@@ -1336,9 +1346,9 @@ public sealed class QueryExecutor
         if (series.Count == 0)
             return null;
 
-        var rowLimit = Math.Min(q.Limit ?? maxResponseRows, maxResponseRows);
+        var rowLimit = EffectiveRowLimit(maxResponseRows, q.Limit);
         var offset = Math.Max(0, q.Offset ?? 0);
-        var readLimit = checked(offset + rowLimit);
+        var readLimit = rowLimit.HasValue ? checked(offset + rowLimit.Value) : int.MaxValue;
         var tagKeys = ResolveRawTags(e, sourceDb, q.Measurement);
         var columns = new List<string> { "time" };
         columns.AddRange(tagKeys);
@@ -1433,9 +1443,9 @@ public sealed class QueryExecutor
 
         var orderedRows = groupedByTags
             ? rows.GroupBy(row => BuildGroupByTagKey(ParseTagsCanonical(row.TagsCanonical), q.GroupByTags, q.GroupByAllTags), StringComparer.Ordinal)
-                .SelectMany(group => group.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit))
+                .SelectMany(group => group.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit ?? int.MaxValue))
                 .ToList()
-            : rows.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit).ToList();
+            : rows.OrderByDescending(row => row.Timestamp).Skip(offset).Take(rowLimit ?? int.MaxValue).ToList();
         foreach (var row in orderedRows)
             resultBytes += 16 + row.Row.Sum(EstimateObjectBytes);
 
@@ -1502,8 +1512,8 @@ public sealed class QueryExecutor
             || q.HasOrFilters)
             return null;
 
-        var rowLimit = Math.Min(q.Limit ?? maxResponseRows, maxResponseRows);
-        var readLimit = checked(Math.Max(0, q.Offset ?? 0) + rowLimit);
+        var rowLimit = EffectiveRowLimit(maxResponseRows, q.Limit);
+        var readLimit = rowLimit.HasValue ? checked(Math.Max(0, q.Offset ?? 0) + rowLimit.Value) : int.MaxValue;
         return e.TryReadSeriesDescending(sourceDb, sourceRp, q.Measurement, seriesFilter.First(), q.MinTimeNs, q.MaxTimeNs, requestedFields, readLimit, cancellationToken);
     }
 
@@ -1525,8 +1535,8 @@ public sealed class QueryExecutor
             || q.FieldFilters.Count != 0)
             return null;
 
-        var rowLimit = Math.Min(q.Limit.Value, maxResponseRows);
-        var readLimit = checked(Math.Max(0, q.Offset ?? 0) + rowLimit);
+        var rowLimit = EffectiveRowLimit(maxResponseRows, q.Limit.Value);
+        var readLimit = rowLimit.HasValue ? checked(Math.Max(0, q.Offset ?? 0) + rowLimit.Value) : int.MaxValue;
         return e.TryReadGlobalAscending(sourceDb, sourceRp, q.Measurement, q.MinTimeNs, q.MaxTimeNs, requestedFields, seriesFilter, readLimit, cancellationToken);
     }
 
@@ -1610,13 +1620,14 @@ public sealed class QueryExecutor
         }
 
         if (q.GroupByNs.HasValue && q.Fill != FillMode.None && q.MinTimeNs.HasValue && q.MaxTimeNs.HasValue)
-            ApplyFill(seriesMap, q, q.GroupByNs.Value, items);
+            ApplyFill(seriesMap, q, q.GroupByNs.Value, items, _maxResponseRows);
 
-        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        var rowLimit = EffectiveRowLimit(q);
         foreach (var series in seriesMap.Values)
         {
             series.Values = OrderRowsByTime(series.Values, q.Desc);
-            series.Values = series.Values.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
+            var skippedRows = series.Values.Skip(q.Offset ?? 0);
+            series.Values = (rowLimit.HasValue ? skippedRows.Take(rowLimit.Value) : skippedRows).ToList();
         }
 
         var result = ApplySeriesWindow(seriesMap.Values, q.SeriesOffset, q.SeriesLimit);
@@ -1733,7 +1744,7 @@ public sealed class QueryExecutor
         }
 
         var offset = Math.Max(0, q.Offset ?? 0);
-        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        var rowLimit = EffectiveRowLimit(q);
         var seriesList = new List<QuerySeries>(groups.Count);
         foreach (var entry in groups.Values)
         {
@@ -1765,7 +1776,7 @@ public sealed class QueryExecutor
                     skipped++;
                     continue;
                 }
-                if (values.Count >= rowLimit) break;
+                if (rowLimit.HasValue && values.Count >= rowLimit.Value) break;
                 values.Add(row);
             }
 
@@ -1832,13 +1843,14 @@ public sealed class QueryExecutor
         }
 
         if (!hasRowExpandingFunctions && step.HasValue && q.Fill != FillMode.None && q.MinTimeNs.HasValue && q.MaxTimeNs.HasValue)
-            ApplyFill(seriesMap, q, step.Value, items);
+            ApplyFill(seriesMap, q, step.Value, items, _maxResponseRows);
 
-        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        var rowLimit = EffectiveRowLimit(q);
         foreach (var s in seriesMap.Values)
         {
             s.Values = OrderRowsByTime(s.Values, q.Desc);
-            s.Values = s.Values.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
+            var skippedRows = s.Values.Skip(q.Offset ?? 0);
+            s.Values = (rowLimit.HasValue ? skippedRows.Take(rowLimit.Value) : skippedRows).ToList();
         }
 
         var seriesList = ApplySeriesWindow(seriesMap.Values, q.SeriesOffset, q.SeriesLimit);
@@ -1950,13 +1962,14 @@ public sealed class QueryExecutor
         }
 
         if (!hasRowExpandingFunctions && step.HasValue && q.Fill != FillMode.None && q.MinTimeNs.HasValue && q.MaxTimeNs.HasValue)
-            ApplyFill(seriesMap, q, step.Value, items);
+            ApplyFill(seriesMap, q, step.Value, items, _maxResponseRows);
 
-        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        var rowLimit = EffectiveRowLimit(q);
         foreach (var s in seriesMap.Values)
         {
             s.Values = OrderRowsByTime(s.Values, q.Desc);
-            s.Values = s.Values.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
+            var skippedRows = s.Values.Skip(q.Offset ?? 0);
+            s.Values = (rowLimit.HasValue ? skippedRows.Take(rowLimit.Value) : skippedRows).ToList();
         }
 
         var seriesList = ApplySeriesWindow(seriesMap.Values, q.SeriesOffset, q.SeriesLimit);
@@ -1998,12 +2011,13 @@ public sealed class QueryExecutor
         if (!hasRowExpandingFunctions && step.HasValue && q.Fill != FillMode.None && q.MinTimeNs.HasValue && q.MaxTimeNs.HasValue)
         {
             var singleSeriesMap = new Dictionary<string, QuerySeries> { [""] = series };
-            ApplyFill(singleSeriesMap, q, step.Value, items);
+            ApplyFill(singleSeriesMap, q, step.Value, items, _maxResponseRows);
         }
 
-        var rowLimit = Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
+        var rowLimit = EffectiveRowLimit(q);
         series.Values = OrderRowsByTime(series.Values, q.Desc);
-        series.Values = series.Values.Skip(q.Offset ?? 0).Take(rowLimit).ToList();
+        var skippedRows = series.Values.Skip(q.Offset ?? 0);
+        series.Values = (rowLimit.HasValue ? skippedRows.Take(rowLimit.Value) : skippedRows).ToList();
 
         return ApplySeriesWindow([series], q.SeriesOffset, q.SeriesLimit);
     }
@@ -2569,20 +2583,39 @@ public sealed class QueryExecutor
         if (points.Count == 0)
             return 0;
 
+        // The grouping pass that follows (AggGroupBy/AggGroupByParallel) computes these exact
+        // keys again, so a full traversal here duplicates that work — one string key per point.
+        // Sample like EstimatePointsBytes/EstimateFunctionStateBytes do and scale linearly:
+        // with ~1 point per group the total tracks the point count, and with many points per
+        // group the sampled distinct-group count already matches the full set.
+        var useSample = points.Count > EstimateSampleThreshold;
         var groups = new Dictionary<(string TagKey, long? BucketTime), int>();
-        foreach (var point in points)
+        if (useSample)
         {
-            var tagKey = BuildGroupByTagKey(point.Tags, groupByTags, groupByAllTags);
-            long? bucketTime = groupByNs.HasValue ? point.TimestampNs / groupByNs.Value * groupByNs.Value : null;
-            var key = (tagKey, bucketTime);
-            groups.TryGetValue(key, out var count);
-            groups[key] = count + 1;
+            var stride = (double)points.Count / EstimateSampleSize;
+            for (var i = 0; i < EstimateSampleSize; i++)
+                CountGroupingKey(groups, points[(int)(i * stride)], groupByTags, groupByAllTags, groupByNs);
+        }
+        else
+        {
+            foreach (var point in points)
+                CountGroupingKey(groups, point, groupByTags, groupByAllTags, groupByNs);
         }
 
         long size = 0;
         foreach (var group in groups)
             size += 112 + EstimateStringBytes(group.Key.TagKey) + 16 + group.Value * 8L;
-        return size;
+        return useSample ? size * points.Count / EstimateSampleSize : size;
+    }
+
+    static void CountGroupingKey(Dictionary<(string TagKey, long? BucketTime), int> groups, Point point,
+        List<string> groupByTags, bool groupByAllTags, long? groupByNs)
+    {
+        var tagKey = BuildGroupByTagKey(point.Tags, groupByTags, groupByAllTags);
+        long? bucketTime = groupByNs.HasValue ? point.TimestampNs / groupByNs.Value * groupByNs.Value : null;
+        var key = (tagKey, bucketTime);
+        groups.TryGetValue(key, out var count);
+        groups[key] = count + 1;
     }
 
     static long EstimateFunctionStateBytes(List<Point> points, List<SelectItem> items)
@@ -2768,11 +2801,22 @@ public sealed class QueryExecutor
 
     static long EstimateTimelineBytes(int outputCount) => 96 + outputCount * 48L;
 
-    static void ApplyFill(Dictionary<string, QuerySeries> seriesMap, ParsedQuery q, long step, List<SelectItem> items)
+    static void ApplyFill(Dictionary<string, QuerySeries> seriesMap, ParsedQuery q, long step, List<SelectItem> items, int maxResponseRows)
     {
         var offset = q.GroupByOffsetNs ?? 0;
         var minBucket = BucketTime(q.MinTimeNs!.Value, step, offset);
         var maxBucket = BucketTime(q.MaxTimeNs!.Value, step, offset);
+        // Reject the fill before materializing anything: a tiny step (e.g. 1ns) over a wide time
+        // range would otherwise build millions of bucket rows per series first and only hit the
+        // response-row limit afterwards — i.e. OOM before the error. The projection mirrors
+        // EnsureWithinLimit: buckets per series × series count must stay within the cap.
+        if (maxResponseRows > 0 && maxBucket >= minBucket)
+        {
+            var buckets = (double)(maxBucket - minBucket) / step + 1;
+            var projectedRows = buckets * Math.Max(1, seriesMap.Count);
+            if (projectedRows > maxResponseRows)
+                throw new InvalidOperationException($"query response row limit exceeded: fill would produce more than {maxResponseRows} rows");
+        }
         foreach (var series in seriesMap.Values)
         {
             var timeSet = new HashSet<long>();
@@ -2983,7 +3027,9 @@ public sealed class QueryExecutor
             // Reuse existing function logic over the small cachedPoints set (<10ms)
             var rows = BuildFunctionRows(cachedPoints, q.Select.Where(s => s.Func != "").ToList(), ct);
             rows = OrderRowsByTime(rows, q.Desc);
-            rows = rows.Skip(q.Offset ?? 0).Take(Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows)).ToList();
+            var rowLimit = EffectiveRowLimit(q);
+            var skippedRows = rows.Skip(q.Offset ?? 0);
+            rows = (rowLimit.HasValue ? skippedRows.Take(rowLimit.Value) : skippedRows).ToList();
             EnsureWithinLimit(rows.Count);
             var cols = new List<string> { "time" };
             cols.AddRange(q.Select.Select(s => s.Alias));
@@ -2997,7 +3043,9 @@ public sealed class QueryExecutor
             var groupPoints = kv.Value;
             var rows = BuildFunctionRows(groupPoints, q.Select.Where(s => s.Func != "").ToList(), ct);
             rows = OrderRowsByTime(rows, q.Desc);
-            rows = rows.Skip(q.Offset ?? 0).Take(Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows)).ToList();
+            var rowLimit = EffectiveRowLimit(q);
+            var skippedRows = rows.Skip(q.Offset ?? 0);
+            rows = (rowLimit.HasValue ? skippedRows.Take(rowLimit.Value) : skippedRows).ToList();
             if (rows.Count == 0) continue;
             var cols = new List<string> { "time" };
             cols.AddRange(q.Select.Select(s => s.Alias));
@@ -3166,7 +3214,9 @@ public sealed class QueryExecutor
 
         var rows = BuildFunctionRows(pts, q.Select.Where(s => s.Func != "").ToList(), cancellationToken);
         rows = OrderRowsByTime(rows, q.Desc);
-        rows = rows.Skip(q.Offset ?? 0).Take(Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows)).ToList();
+        var rowLimit = EffectiveRowLimit(q);
+        var skippedRows = rows.Skip(q.Offset ?? 0);
+        rows = (rowLimit.HasValue ? skippedRows.Take(rowLimit.Value) : skippedRows).ToList();
         EnsureWithinLimit(rows.Count);
         series.Values = rows;
         return ApplySeriesWindow([series], q.SeriesOffset, q.SeriesLimit);
@@ -3890,7 +3940,32 @@ public sealed class QueryExecutor
             return string.Empty;
         // Use \0 as separator and percent-encode occurrences inside values to avoid collisions
         // e.g. ["a|","b"] vs ["a","|b"] previously collided with '|' join.
-        return string.Join('\0', groupByTags.Select(tag => tags.TryGetValue(tag, out var value) ? EscapeGroupKeyPart(value) : ""));
+        // Built in a single StringBuilder pass: the common value needs no escaping, so the
+        // per-point cost is one string instead of a LINQ chain plus two Replace allocations.
+        var sb = new StringBuilder();
+        for (int i = 0; i < groupByTags.Count; i++)
+        {
+            if (i > 0) sb.Append('\0');
+            if (tags.TryGetValue(groupByTags[i], out var value))
+                AppendEscapedGroupKeyPart(sb, value);
+        }
+        return sb.ToString();
+    }
+
+    static void AppendEscapedGroupKeyPart(StringBuilder sb, string v)
+    {
+        // Fast path: nothing to escape, append verbatim (no intermediate strings).
+        if (v.IndexOf('%') < 0 && v.IndexOf('\0') < 0)
+        {
+            sb.Append(v);
+            return;
+        }
+        foreach (var c in v)
+        {
+            if (c == '%') sb.Append("%25");
+            else if (c == '\0') sb.Append("%00");
+            else sb.Append(c);
+        }
     }
 
     static Dictionary<string, string>? BuildGroupByTags(string groupKey, List<string> groupByTags, bool groupByAllTags)
@@ -3910,7 +3985,6 @@ public sealed class QueryExecutor
         return result;
     }
 
-    static string EscapeGroupKeyPart(string v) => v.Replace("%", "%25").Replace("\0", "%00");
     static string UnescapeGroupKeyPart(string v) => v.Replace("%00", "\0").Replace("%25", "%");
 
     static string ToCanonicalTagKey(IReadOnlyDictionary<string, string> tags) =>
@@ -4274,12 +4348,16 @@ public sealed class QueryExecutor
         return fields.Select(field => aliasByField.TryGetValue(field, out var alias) ? alias : field).ToList();
     }
 
-    int? EffectiveRowLimit(ParsedQuery q)
-    {
-        if (_maxResponseRows <= 0)
-            return q.Limit;
-        return Math.Min(q.Limit ?? _maxResponseRows, _maxResponseRows);
-    }
+    int? EffectiveRowLimit(ParsedQuery q) => EffectiveRowLimit(_maxResponseRows, q.Limit);
+
+    /// <summary>
+    /// Effective per-query row cap. A configured cap of 0 (or less) means unlimited — the same
+    /// convention as the other guardrail options — and an explicit LIMIT always wins when smaller.
+    /// Null means no cap. Callers must treat null as "no truncation": a plain Math.Min here would
+    /// collapse an unlimited configuration to Take(0) and silently return no rows at all.
+    /// </summary>
+    static int? EffectiveRowLimit(int maxResponseRows, int? queryLimit) =>
+        maxResponseRows <= 0 ? queryLimit : Math.Min(queryLimit ?? maxResponseRows, maxResponseRows);
 
     // ponytail: compiled tag-filter regex cache. Regex.IsMatch re-compiles uncached patterns inside
     // the per-point loop on regex-heavy scans; the cache is bounded like the parse-template cache.

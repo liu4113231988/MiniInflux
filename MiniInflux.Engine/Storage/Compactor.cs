@@ -418,12 +418,18 @@ public sealed class Compactor
         return finalized;
     }
 
-    private const long CompactionBatchPointBudget = 2_000_000;
+    /// <summary>
+    /// Decoded-bytes budget for one merge batch. The previous point-count budget (2M points)
+    /// scaled with per-point width and input-file count, so a wide or multi-file compaction could
+    /// still pin hundreds of MB. A byte budget bounds the peak directly: decoded columns plus the
+    /// filtered/merged copies stay within a small multiple of this value.
+    /// </summary>
+    private const long CompactionBatchByteBudget = 64L * 1024 * 1024;
 
     /// <summary>
     /// ponytail: streaming merge. Previously every input segment was fully decoded into memory
     /// before merging, so a byte-triggered compaction of large files pinned multiple GB on the heap.
-    /// Now groups are processed in batches sized by metadata point counts; each batch decodes only
+    /// Now groups are processed in batches sized by estimated decoded bytes; each batch decodes only
     /// its own columns (one pass per input file), merges them, and the resulting columns are written
     /// out and dropped before the next batch. Peak memory is one batch plus one output chunk.
     /// </summary>
@@ -436,17 +442,17 @@ public sealed class Compactor
         long? retentionCutoffNs)
     {
         var batch = new List<(string Meas, string Tags, string Field)>();
-        long batchPoints = 0;
+        long batchBytes = 0;
         foreach (var group in orderedGroups)
         {
             batch.Add(group);
-            foreach (var (_, meta) in groups[group]) batchPoints += meta.PointCount;
-            if (batchPoints < CompactionBatchPointBudget) continue;
+            foreach (var (_, meta) in groups[group]) batchBytes += EstimateGroupBytes(meta);
+            if (batchBytes < CompactionBatchByteBudget) continue;
 
             foreach (var col in MergeBatch(db, rp, batch, groups, inputMetas, retentionCutoffNs))
                 yield return col;
             batch = [];
-            batchPoints = 0;
+            batchBytes = 0;
         }
         if (batch.Count > 0)
             foreach (var col in MergeBatch(db, rp, batch, groups, inputMetas, retentionCutoffNs))

@@ -142,13 +142,13 @@ MiniInflux is usable as an InfluxDB 1.x compatible subset for small single-node 
   - 不支持运行时创建用户、改密或按 db 授权
 - WAL + Segment 存储
   - 查询保留 compaction 旧段直到读取结束；合并编码可并行，发布、元数据缓存失效与旧段删除在读取完成后进行。长时间查询或未释放的流式枚举会延后合并发布；这不提供与并发写入、删除之间的完整事务快照。
-- Segment v3 列编码：时间戳 `delta-of-delta/Gorilla`、浮点 `legacy XOR/Gorilla`、整数 delta、bool bit-pack、string 字典
+- Segment v4 列编码（codec 字节自 v3 引入）：时间戳 `delta-of-delta/Gorilla`、浮点 `legacy XOR/Gorilla`、整数 delta、bool bit-pack、string 字典
 - 自适应浮点压缩策略：在 `legacy_raw`、`legacy_brotli`、`gorilla_raw` 之间按体积/速度折中选择
 - 存储健壮性
   - 在线备份一致性：备份前 flush + WAL checkpoint，备份期间暂停 compaction/shard 过期，manifest 最后拷贝并补齐引用段
   - 墓碑 GC：compaction 全量重写 shard 后回收已应用的 delete 覆盖范围，DELETE 不再留下永久读放大
   - 部分过期：compaction 合并时丢弃早于 `now - duration` 的点（有界 RP），shard 内数据不再陪跑到整 shard 老化
-  - 损坏段隔离：结构校验失败的 segment 进入 quarantine，不再被查询反复读取，`/debug/stats` 报告计数
+  - 损坏段隔离：结构校验失败（magic/尺寸/CRC/元数据/长度前缀/截断）的 segment 进入 quarantine，不再被查询反复读取；瞬时 IO 错误（共享违例、磁盘抖动）不隔离，该次读取跳过、下次重试，`/debug/stats` 报告计数
   - 缓存上限：CRC 校验缓存与 Last Value Cache 均有逐出上限（`LastValueCacheMaxEntries`），超限回退全扫保证正确性
 - 独立管理 CLI `miniinfluxctl`：`benchmark`、`inspect`、`validate`、`repair`、`compact`、`backup`、`restore`
 - Native AOT 友好：无动态代理、JSON Source Generator
@@ -314,8 +314,8 @@ miniinfluxctl inspect manifest --data ./data
 - `Storage.MaxQueryDurationMs`：单次查询的时间上限（毫秒）；`0` 表示不限制。仓库默认配置为 `30000`，未配置时的代码默认值为 `10000`
 - `Storage.MaxConcurrentQueries`：同时执行的查询数量上限；`0` 表示不限制
 - `Storage.MaxSegmentFileBytes`：单个 segment 文件的目标大小上限，默认 512 MiB
-- `Storage.MinSegmentFileBytes`：参与分层压缩的 segment 文件最小字节数；`0` 表示不限制
-- `Storage.MinSegmentFillRatio`：分层压缩允许的最小填充率，低于该比例的 segment 不参与合并；默认 `0.5`
+- `Storage.MinSegmentFileBytes`：flush 门控——估算字节低于该值的缓冲数据暂不生成 segment（避免小文件散射），累积到更大体积或冷数据超时后再落盘；`0` 表示不限制。WAL 已持久化这些点，延迟只推迟 WAL 截断，不丢数据
+- `Storage.MinSegmentFillRatio`：分层压缩输出文件的尾合并填充率下限——输出达到 `MaxSegmentFileBytes × 该比例` 后才切分下一个文件，避免压缩产出过小的尾段；不用于过滤输入 segment
 - `Storage.CompactionMaxWriteBytesPerSecond`：分层压缩的写入限速（字节/秒）；`0` 表示不限速
 - `Storage.LastValueCacheMaxEntries`：last-value 缓存的最大条目数
 - `Storage.FlushColdDurationMs`：低于 `FlushThreshold` 的缓冲数据连续无写入多久后生成 segment；默认 10 分钟，期间数据已由 WAL 持久化且查询可见
@@ -560,7 +560,7 @@ dotnet run -- restore --data ./data --path ./backup
 - `repair` 会离线执行恢复流程并刷新 WAL/内存状态；当 `manifest.json` 与 `.bak` 均不可读（引擎无法启动）时，会先按 `db/<db>/<rp>/shards/*/*.seg` 重建目录（保留损坏文件为 `manifest.json.corrupt-*`），重建时 RP 时长与连续查询无法推断，需事后手工恢复，输出 `manifest_rebuilt=true` 及重建计数。
 - `compact` 会离线触发 compaction。
 - `backup verify` 会离线校验备份元数据、文件长度和 SHA256。
-- `backup` / `restore` 使用带元数据校验的备份恢复流程。
+- `backup` / `restore` 使用带元数据校验的备份恢复流程。注意两条路径语义不同：HTTP 在线备份（`/admin/backup`）会 flush + WAL checkpoint 并暂停 compaction/shard 过期后拷贝；CLI `backup` 是离线路径（先恢复+flush 再释放引擎独占锁），执行前应已停止服务端。
 - 除 `benchmark` 支持 `text/json/prometheus` 外，其余管理 CLI 也已支持稳定的 `--format json` 输出，便于脚本消费；所有顶层 JSON 结果当前都带 `SchemaVersion=1`；`repair`、`compact`、`restore` 同时支持 `--dry-run`。
 - CLI 不读取 `appsettings.json` 或环境变量。通过 `--data PATH` 指定目标数据目录；`repair` 与 `compact` 如需匹配服务端的离线引擎设置，可传入 `--flush-threshold`、`--wal-fsync`、`--wal-fsync-interval-ms`、`--wal-max-file-bytes`、`--storage-max-series-per-database`、`--storage-max-fields-per-measurement`、`--storage-max-buffer-points` 和 `--storage-max-buffer-bytes`。CLI 会先锁定 `--data` 指定的目录，再执行命令。
 

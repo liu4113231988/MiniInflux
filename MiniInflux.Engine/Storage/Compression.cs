@@ -235,7 +235,7 @@ public static class CompressionCodec
     private static List<long> DecodeTimestampsLegacy(byte[] data)
     {
         using var ms = new MemoryStream(data);
-        var count = checked((int)Varint.ReadUInt64(ms));
+        var count = ReadCount(ms);
         var result = new List<long>(count);
         if (count == 0)
             return result;
@@ -290,7 +290,7 @@ public static class CompressionCodec
     private static List<long> DecodeTimestampsGorilla(byte[] data)
     {
         using var ms = new MemoryStream(data);
-        var count = checked((int)Varint.ReadUInt64(ms));
+        var count = ReadCount(ms);
         var result = new List<long>(count);
         if (count == 0)
             return result;
@@ -405,7 +405,7 @@ public static class CompressionCodec
     private static List<FieldValue> DecodeFloatValuesLegacy(byte[] data)
     {
         using var ms = new MemoryStream(data);
-        var count = checked((int)Varint.ReadUInt64(ms));
+        var count = ReadCount(ms);
         var result = new List<FieldValue>(count);
         ulong previous = 0;
         for (int i = 0; i < count; i++)
@@ -475,7 +475,7 @@ public static class CompressionCodec
     private static List<FieldValue> DecodeFloatValuesGorilla(byte[] data)
     {
         using var ms = new MemoryStream(data);
-        var count = checked((int)Varint.ReadUInt64(ms));
+        var count = ReadCount(ms);
         var result = new List<FieldValue>(count);
         if (count == 0)
             return result;
@@ -542,7 +542,7 @@ public static class CompressionCodec
     private static List<FieldValue> DecodeIntValuesLegacy(byte[] data)
     {
         using var ms = new MemoryStream(data);
-        var count = checked((int)Varint.ReadUInt64(ms));
+        var count = ReadCount(ms);
         var result = new List<FieldValue>(count);
         long previous = 0;
         for (int i = 0; i < count; i++)
@@ -579,12 +579,28 @@ public static class CompressionCodec
         return ms.ToArray();
     }
 
+    /// <summary>
+    /// Read a varint count/length as an int. Corrupt payloads can encode values above int.MaxValue,
+    /// which would otherwise surface as OverflowException — an exception type the segment readers
+    /// do not treat as structural corruption. InvalidDataException routes those files to quarantine
+    /// like every other malformed field.
+    /// </summary>
+    private static int ReadCount(MemoryStream ms)
+    {
+        var value = Varint.ReadUInt64(ms);
+        if (value > int.MaxValue)
+            throw new InvalidDataException($"invalid count in compressed block: {value}");
+        return (int)value;
+    }
+
     private static List<FieldValue> DecodeBoolValuesLegacy(byte[] data)
     {
         using var ms = new MemoryStream(data);
-        var count = checked((int)Varint.ReadUInt64(ms));
+        var count = ReadCount(ms);
         var payload = new byte[ms.Length - ms.Position];
-        _ = ms.Read(payload);
+        // ReadExactly: a short read means a truncated payload; zero-filling would silently
+        // produce wrong values instead of surfacing the corruption.
+        ms.ReadExactly(payload);
         var result = new List<FieldValue>(count);
         for (int i = 0; i < count; i++)
             result.Add(FieldValue.FromBoolean(((payload[i / 8] >> (i % 8)) & 1) == 1));
@@ -625,20 +641,20 @@ public static class CompressionCodec
     private static List<FieldValue> DecodeStringValuesLegacy(byte[] data)
     {
         using var ms = new MemoryStream(data);
-        var count = checked((int)Varint.ReadUInt64(ms));
-        var dictionaryCount = checked((int)Varint.ReadUInt64(ms));
+        var count = ReadCount(ms);
+        var dictionaryCount = ReadCount(ms);
         var dictionary = new string[dictionaryCount];
         for (int i = 0; i < dictionaryCount; i++)
         {
-            var length = checked((int)Varint.ReadUInt64(ms));
+            var length = ReadCount(ms);
             var bytes = new byte[length];
-            _ = ms.Read(bytes);
+            ms.ReadExactly(bytes);
             dictionary[i] = System.Text.Encoding.UTF8.GetString(bytes);
         }
 
         var result = new List<FieldValue>(count);
         for (int i = 0; i < count; i++)
-            result.Add(FieldValue.FromString(dictionary[checked((int)Varint.ReadUInt64(ms))]));
+            result.Add(FieldValue.FromString(dictionary[ReadCount(ms)]));
         return result;
     }
 

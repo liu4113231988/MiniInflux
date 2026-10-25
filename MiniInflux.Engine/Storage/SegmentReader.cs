@@ -51,6 +51,24 @@ public static class SegmentReader
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_quarantined = new(StringComparer.Ordinal);
     private const int MaxQuarantinedEntries = 1024;
 
+    // Generous ceiling for a single length-prefixed string (measurement/tags/field) in a segment:
+    // legitimate values are tiny, anything larger means the length prefix is corrupt.
+    private const int MaxSegmentStringBytes = 16 * 1024 * 1024;
+
+    /// <summary>
+    /// Quarantine a segment only when the failure is positive evidence of structural corruption:
+    /// <see cref="InvalidDataException"/> (bad magic/size/CRC/metadata/length prefix) or
+    /// <see cref="EndOfStreamException"/> (truncated payload). Any other
+    /// <see cref="IOException"/> (Windows sharing violation, transient disk error) leaves a healthy
+    /// file out of quarantine so a later read retries it — quarantining those would silently drop
+    /// data from every subsequent query.
+    /// </summary>
+    private static void QuarantineIfStructural(string path, Exception ex)
+    {
+        if (ex is InvalidDataException or EndOfStreamException)
+            s_quarantined.TryAdd(path, 0);
+    }
+
     public static bool IsQuarantined(string path) => s_quarantined.ContainsKey(path);
     public static IReadOnlyCollection<string> Quarantined => s_quarantined.Keys.ToArray();
     public static void ClearQuarantined(string path) => s_quarantined.TryRemove(path, out _);
@@ -346,8 +364,11 @@ public static class SegmentReader
         catch (Exception ex) when (ex is InvalidDataException or IOException)
         {
             // Truncated payloads surface as EndOfStreamException (an IOException) rather than
-            // InvalidDataException; quarantine both so queries stop re-reading the same file.
-            s_quarantined.TryAdd(path, 0);
+            // InvalidDataException; both indicate a structurally broken file, so quarantine them
+            // so queries stop re-reading the same file. Other IOExceptions (sharing violations,
+            // transient disk errors) are NOT structural: the file may be perfectly healthy, and
+            // quarantining it would silently drop its data from every later query.
+            QuarantineIfStructural(path, ex);
             throw;
         }
     }
@@ -481,7 +502,10 @@ public static class SegmentReader
         }
         catch (Exception ex) when (ex is InvalidDataException or IOException)
         {
-            s_quarantined.TryAdd(path, 0);
+            // Structural corruption (bad magic/size/CRC/metadata, truncated payload) is
+            // quarantined so later reads skip the file. Transient IOExceptions are re-thrown
+            // untouched: the caller skips the segment for this read only and retries next time.
+            QuarantineIfStructural(path, ex);
             throw;
         }
     }
@@ -622,7 +646,15 @@ public static class SegmentReader
     }
 
     private static string ReadString(BinaryReader br)
-    { int len = br.ReadInt32(); return Encoding.UTF8.GetString(br.ReadBytes(len)); }
+    {
+        int len = br.ReadInt32();
+        // Validate the length prefix so a corrupt file fails as InvalidDataException (which
+        // quarantines the file as structural corruption) instead of ArgumentOutOfRangeException
+        // (negative len) or an oversized allocation that escapes the corruption filters.
+        if (len < 0 || len > MaxSegmentStringBytes)
+            throw new InvalidDataException($"invalid segment string length: {len}");
+        return Encoding.UTF8.GetString(br.ReadBytes(len));
+    }
 
     private static SegmentColumnMeta ReadMetadataEntry(BinaryReader br)
     {

@@ -198,7 +198,7 @@ InfluxDB 3 对齐第一阶段，全部完成。
 
 - Manifest 拆分持久化：`SeriesIndex/TagIndex` 等索引改为 `[JsonIgnore]`，恢复时无条件从段元数据重建；`Save()` 从 O(全部 series) 降为 O(shard+CQ)，显著缩小高基数下 manifest 体积。
 - WAL 追加与恢复优化：CRC 计算移出全局锁；大批量恢复按 (db,rp) 分组一次加锁，消除逐点三重加锁。
-- Compaction 流式合并：新增按列选择器解码，按 (measurement,tags,field) 分组分批 k 路归并，峰值内存从"全部输入解码"降到"一批 + 一个输出块"。
+- Compaction 流式合并：新增按列选择器解码，按 (measurement,tags,field) 分组分批 k 路归并，峰值内存从"全部输入解码"降到"一个批次 + 一个输出块"。批预算原为 200 万点（随点宽与输入文件数放大，宽行/多文件仍可达数百 MB）；2026-10 审计后改为 64 MiB 解码字节预算，峰值直接有界（decoded + filtered/merged 副本约为该值的 2–3 倍）。
 - Last Value Cache 免克隆：缓存按引用存点，删除 flush 路径的逐点二次更新。
 - 查询热路径：tag 正则按模式编译缓存（有界 256）、行排序时间只解析一次、`fill(linear)` 从 O(n²) 降为按列二分找邻、分组值对构建复用、分组键不再逐点分配字典。
 
@@ -334,3 +334,18 @@ InfluxDB 3 对齐第一阶段，全部完成。
 - **查询正确性加固**：`SELECT … INTO` 同步写入（消除 sync-over-async）、chunked 查询解析错误改为单错误块返回（不再破坏流式响应）。
 - **认证/存储健壮性**：`tokens.json` 损坏时重命名为 `.corrupt-*` 保留现场并告警（不再静默清空）；token 持久化改用 `FileStream + Flush(true) + Move` 实现 fsync；`TokenStore.Validate` 移除伪常时遍历，直接字典查找。
 - **错误可见性**：`DropDatabase` 目录删除失败记入 `StorageHealth`；`Manifest` 损坏重命名失败记录日志；请求体读取不再 dispose 服务器持有的 `request.Body`。
+
+### 全库审计修复（2026-10-25）
+
+对引擎与应用层做了一次全量静态审计（构建 0 警告 0 错误，修复前后各跑全量测试）。修复项：
+
+- **C1 查询正确性（P0）**：`LIMIT` 下推与逐点字段过滤的组合会少返行——`readLimit` 按未过滤点数截断后，`ApplyFieldFilters` 才收缩结果。现在存在字段过滤时不下推 limit。补 3 个回归测试（含 limit+offset、匹配点超出原始预算的场景）。
+- **C2 存储健壮性（P0）**：瞬时 `IOException`（Windows 共享违例、磁盘抖动）会把健康段写入进程级 quarantine，导致后续查询静默丢数据。现在仅结构校验失败（`InvalidDataException`/`EndOfStreamException`，含新增的长度前缀校验）才隔离；瞬时错误当次跳过并记入 `StorageHealth`，下次读取重试。恢复路径的 `SegmentsCorrupted` 也只统计真正被隔离的文件。补 2 个回归测试（持锁读取不隔离、截断文件仍隔离）。
+- **C3 查询健壮性（P1）**：子查询递归无深度上限，深层嵌套会触发不可捕获的 `StackOverflowException`。执行与权限分类均加 16 层深度上限，超限返回明确错误。
+- **C4 配置正确性（P1，修正审计初判）**：审计初判"两条路径 limit 语义不一致"不成立——所有路径都是先截断后检查。真实缺陷是 `MaxResponseRows=0`（约定为"不限制"）在缓冲路径塌缩成 `Take(0)` 静默返回空结果。统一为 `EffectiveRowLimit(maxResponseRows, queryLimit)`：`<=0` 表示无限、显式 LIMIT 优先，null 时不截断；覆盖全部 11 处行限制计算点。截断语义（既有测试固定）保持不变。
+- **C5 查询健壮性（P1）**：`fill()` 先在内存物化全部桶行、再撞响应行上限（小 step 大区间先 OOM 后报错）。现在按"桶数 × series 数"预算前置拒绝。
+- **查询热路径（P1）**：`EstimateGroupingStateBytes` 不再对全量点集重复建分组字典，改为与 `EstimatePointsBytes` 相同的抽样外推；`BuildGroupByTagKey` 从 LINQ + `string.Join` + 双 `Replace` 改为单趟 `StringBuilder` 构建，无需转义的取值（绝大多数）零中间分配。
+- **compaction 内存（P2）**：合并批预算从 200 万点改为 64 MiB 解码字节，峰值直接有界（原预算随点宽与输入文件数放大）。
+- **文档修订**：`MinSegmentFileBytes`/`MinSegmentFillRatio` 语义、segment 格式版本（v4）、compaction 峰值描述、quarantine 隔离条件、CLI 与 HTTP 备份路径差异，共 6 处与实现不符的描述已更正。
+
+全量测试 541 → 554 项通过（新增 `P0AuditFixTests` 5 项、`P1AuditFixTests` 8 项、修正既有预期 0 项）。

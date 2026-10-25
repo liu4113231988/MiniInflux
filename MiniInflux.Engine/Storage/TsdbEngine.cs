@@ -254,9 +254,12 @@ public sealed class TsdbEngine : IDisposable
                     }
                     catch (Exception ex) when (ex is InvalidDataException or IOException)
                     {
-                        // Metadata reads also throw EndOfStreamException/IOException on truncated
-                        // files; SegmentReader has already quarantined the path, keep counting it.
-                        result.SegmentsCorrupted++;
+                        // Structural failures (bad magic/CRC/metadata, truncated file) are
+                        // quarantined by SegmentReader and counted as corrupted. Transient
+                        // IOExceptions are not quarantined: the file may be readable on the
+                        // next attempt, so don't count them as corrupted segments.
+                        if (SegmentReader.IsQuarantined(segFile))
+                            result.SegmentsCorrupted++;
                     }
                 }
             }
@@ -786,6 +789,14 @@ public sealed class TsdbEngine : IDisposable
         }
         catch (InvalidDataException) { }
         catch (FileNotFoundException) { }
+        catch (IOException ex)
+        {
+            // Transient IO failure (sharing violation, disk hiccup). SegmentReader quarantines
+            // structural corruption before re-throwing, so anything reaching here is a healthy
+            // file that just could not be read this time: skip it for this read only and record
+            // the failure for observability. A later read retries the same file.
+            _health.RecordFailure("segment_read", ex, blocksWrites: false);
+        }
     }
 
     public bool HasSegments(string db, string rp, long? min, long? max) =>
