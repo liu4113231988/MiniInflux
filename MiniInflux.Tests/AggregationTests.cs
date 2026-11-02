@@ -20,6 +20,14 @@ public class AggregationTests : IDisposable
         SeedData();
     }
 
+    private static Point P(string measurement, double value, long timestamp) => new()
+    {
+        Measurement = measurement,
+        Tags = new Dictionary<string, string>(),
+        Fields = new Dictionary<string, FieldValue> { ["v"] = FieldValue.FromDouble(value) },
+        TimestampNs = timestamp
+    };
+
     private void SeedData()
     {
         var points = new List<Point>();
@@ -116,6 +124,41 @@ public class AggregationTests : IDisposable
         Assert.Null(result.Results[0].Error);
         var row = Assert.Single(result.Results[0].Series![0].Values);
         Assert.Equal(10L, Convert.ToInt64(row[1]));
+    }
+
+    [Fact]
+    public async Task Histogram_SpecialValues_NaNExcludedNegativeAndInfinityHandled()
+    {
+        await _engine.WriteAsync("testdb", "autogen",
+        [
+            P("special", -5, 1),
+            P("special", double.NaN, 2),
+            P("special", double.PositiveInfinity, 3),
+            P("special", double.NegativeInfinity, 4),
+            P("special", 0, 5),
+            P("special", 3, 6),
+        ]);
+
+        // Upper bound 3: values <= 3 are {-5, -Inf, 0, 3} => 4. NaN and +Inf are excluded.
+        var r = await _executor.ExecuteAsync(_engine, "testdb", "SELECT histogram(v, 3) FROM special");
+        Assert.Equal(4L, Convert.ToInt64(Assert.Single(r.Results[0].Series![0].Values)[1]));
+
+        // Upper bound -10: only -Inf qualifies => 1.
+        r = await _executor.ExecuteAsync(_engine, "testdb", "SELECT histogram(v, -10) FROM special");
+        Assert.Equal(1L, Convert.ToInt64(Assert.Single(r.Results[0].Series![0].Values)[1]));
+
+        // Upper bound +Inf: every non-NaN value is <= +Inf => 5.
+        r = await _executor.ExecuteAsync(_engine, "testdb", "SELECT histogram(v, Infinity) FROM special");
+        Assert.Equal(5L, Convert.ToInt64(Assert.Single(r.Results[0].Series![0].Values)[1]));
+    }
+
+    [Fact]
+    public async Task Histogram_UpperBoundIsInclusive()
+    {
+        // A value exactly equal to the upper bound must be counted (<=, not <).
+        await _engine.WriteAsync("testdb", "autogen", [P("inc", 7, 1), P("inc", 7, 2), P("inc", 8, 3)]);
+        var r = await _executor.ExecuteAsync(_engine, "testdb", "SELECT histogram(v, 7) FROM inc");
+        Assert.Equal(2L, Convert.ToInt64(Assert.Single(r.Results[0].Series![0].Values)[1]));
     }
 
     [Fact]
