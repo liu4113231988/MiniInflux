@@ -11,7 +11,10 @@ public sealed class TsdbEngine : IDisposable
     public sealed record DescendingFieldReadResult(List<long> Timestamps, List<FieldValue> Values, int SegmentColumnsRead, string? LimitPushdownStopReason);
     public sealed record DescendingFieldsReadResult(List<long> Timestamps, List<FieldValue?[]> Rows, int SegmentColumnsRead, string? LimitPushdownStopReason);
 
-    private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey, long Seq);
+    private sealed record BufferedPoint(CompactPoint Compact, SeriesDescriptor Series, WalPosition Position, SeriesKey SeriesKey, long Seq)
+    {
+        public Point ToPoint() => Compact.ToPoint(Series);
+    }
 
     // Immutable snapshot of a buffer generation handed off to a background flush. Writers keep
     // appending to a fresh active generation while this one is encoded outside the write lock; on
@@ -197,7 +200,9 @@ public sealed class TsdbEngine : IDisposable
                 {
                     _schema.ValidateAndRegister(db, replayPoint.Point.Measurement, [replayPoint.Point]);
                     var seriesKey = SeriesKey.From(replayPoint.Point);
-                    validPoints.Add(new BufferedPoint(replayPoint.Point, replayPoint.Position, seriesKey, Interlocked.Increment(ref _bufferSeq)));
+                    var desc = replayPoint.Point.ToSeriesDescriptor();
+                    var compact = replayPoint.Point.ToCompactPoint(0, desc);
+                    validPoints.Add(new BufferedPoint(compact, desc, replayPoint.Position, seriesKey, Interlocked.Increment(ref _bufferSeq)));
                 }
                 catch (FieldConflictException) { result.SchemaConflictsSkipped++; }
             }
@@ -343,7 +348,12 @@ public sealed class TsdbEngine : IDisposable
         
         var writePoints = pending.Count == pts.Count ? pts : MaterializePendingPoints(pending);
         ValidateSchema(db, writePoints);
-        
+
+        // Build the compact batch (shared series descriptors + per-point value arrays, with per-series
+        // field unions) once and feed it to both the WAL and the memory buffer, so series derivation
+        // and field-union computation happen a single time instead of twice.
+        var (compactPoints, seriesDescs) = BuildCompactBatch(pending);
+
         // Use per-db|rp lock only; the global lock is no longer needed for writes because
         // _locks is a ConcurrentDictionary and _seriesKeys/_bufferedPointCount are updated under the per-key lock.
         var key = K(db, rp);
@@ -363,7 +373,7 @@ public sealed class TsdbEngine : IDisposable
             _walAppendGate.EnterReadLock();
             try
             {
-                var walPosition = _wal.AppendBatch(db, rp, writePoints);
+                var walPosition = _wal.AppendBatch(db, rp, compactPoints, seriesDescs);
                 if (!_buf.TryGetValue(key, out var existing))
                 {
                     existing = [];
@@ -372,7 +382,7 @@ public sealed class TsdbEngine : IDisposable
                 list = existing;
 
                 // 批量添加写入点，减少锁持有时间内的操作
-                AddWrittenPoints(db, key, list, pending, walPosition);
+                AddWrittenPoints(db, key, list, pending, compactPoints, seriesDescs, walPosition);
                 _lastBufferWriteTicks[key] = DateTime.UtcNow.Ticks;
                 UpdateBufferReplayFloor(key, list);
             }
@@ -690,8 +700,8 @@ public sealed class TsdbEngine : IDisposable
         {
             var key = K(db, rp);
             var bufMatched = BufferedCandidates(key, meas, allowedTagsCanonical)
-                .Where(p => Match(p.Point, meas, min, max))
-                .Select(p => p.Point);
+                .Where(p => Match(p, meas, min, max))
+                .Select(p => p.ToPoint());
             if (requestedFields != null)
                 bufMatched = bufMatched.Select(p => new Point
                 {
@@ -860,7 +870,7 @@ public sealed class TsdbEngine : IDisposable
                 return new DescendingSeriesReadResult([], 0, 0, "buffer-empty");
 
             for (var i = 1; i < buffered.Count; i++)
-                if (buffered[i].Point.TimestampNs < buffered[i - 1].Point.TimestampNs)
+                if (buffered[i].Compact.TimestampNs < buffered[i - 1].Compact.TimestampNs)
                     return null;
 
             var result = new Dictionary<long, Point>();
@@ -868,8 +878,10 @@ public sealed class TsdbEngine : IDisposable
             for (var i = buffered.Count - 1; i >= 0; i--)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var point = buffered[i].Point;
-                if (!Match(point, measurement, min, max)) continue;
+                var bp = buffered[i];
+                if (!Match(bp, measurement, min, max)) continue;
+
+                var point = bp.ToPoint();
 
                 if (requestedFields != null)
                 {
@@ -1420,8 +1432,8 @@ public sealed class TsdbEngine : IDisposable
         var result = new List<(string, long, Point)>();
         foreach (var buffered in BufferedCandidates(key, measurement, allowedTagsCanonical))
         {
-            var p = buffered.Point;
-            if (!Match(p, measurement, min, max)) continue;
+            if (!Match(buffered, measurement, min, max)) continue;
+            var p = buffered.ToPoint();
             // Always copy Fields: callers merge segment values into the returned point's Fields
             // outside the read lock, so handing out the live buffer point would corrupt the write
             // buffer. (Previously only the requestedFields projection copied.)
@@ -1752,16 +1764,17 @@ public sealed class TsdbEngine : IDisposable
         {
             foreach (var bp in BufferedCandidates(key, meas, allowedTagsCanonical))
             {
-                if (!Match(bp.Point, meas, min, max)) continue;
+                if (!Match(bp, meas, min, max)) continue;
+                var src = bp.ToPoint();
                 var point = requestedFields == null
-                    ? bp.Point
+                    ? src
                     : new Point
                     {
-                        Measurement = bp.Point.Measurement,
-                        Tags = bp.Point.Tags,
-                        Fields = SelectFields(bp.Point.Fields, requestedFields),
-                        TimestampNs = bp.Point.TimestampNs,
-                        TagsCanonical = bp.Point.TagsCanonical
+                        Measurement = src.Measurement,
+                        Tags = src.Tags,
+                        Fields = SelectFields(src.Fields, requestedFields),
+                        TimestampNs = src.TimestampNs,
+                        TagsCanonical = src.TagsCanonical
                     };
                 buffered.Add((point, bp.SeriesKey));
             }
@@ -1828,12 +1841,12 @@ public sealed class TsdbEngine : IDisposable
             {
                 if (_buf.TryGetValue(key, out var buf))
                     foreach (var p in buf)
-                        if (!r.Contains(p.Point.Measurement))
-                            r.Add(p.Point.Measurement);
+                        if (!r.Contains(p.Series.Measurement))
+                            r.Add(p.Series.Measurement);
                 if (_flushing.TryGetValue(key, out var fg))
                     foreach (var p in fg.Points)
-                        if (!r.Contains(p.Point.Measurement))
-                            r.Add(p.Point.Measurement);
+                        if (!r.Contains(p.Series.Measurement))
+                            r.Add(p.Series.Measurement);
             }
             finally { lk.ExitReadLock(); }
         }
@@ -1897,8 +1910,8 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         {
             var key = K(db, rp);
             var matched = BufferedCandidates(key, meas, allowedTagsCanonical)
-                .Where(p => Match(p.Point, meas, min, max))
-                .Select(p => p.Point);
+                .Where(p => Match(p, meas, min, max))
+                .Select(p => p.ToPoint());
             if (requestedFields != null)
             {
                 matched = matched.Select(p => new Point
@@ -1929,17 +1942,21 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
             var key = K(db, rp);
             foreach (var buffered in BufferedCandidates(key, meas, allowedTagsCanonical))
             {
-                var point = buffered.Point;
-                if (!Match(point, meas, min, max))
+                if (!Match(buffered, meas, min, max))
                     continue;
 
                 matchedPoints++;
-                maxTime = Math.Max(maxTime, point.TimestampNs);
-                foreach (var (field, value) in point.Fields)
+                var ts = buffered.Compact.TimestampNs;
+                maxTime = Math.Max(maxTime, ts);
+                var desc = buffered.Series;
+                var vals = buffered.Compact.Values;
+                for (var f = 0; f < desc.FieldNames.Length; f++)
                 {
+                    if (!vals[f].HasValue) continue;
+                    var field = desc.FieldNames[f];
                     if (requestedFields != null && !requestedFields.Contains(field))
                         continue;
-                    var number = value.AsDouble();
+                    var number = vals[f]!.Value.AsDouble();
                     if (!number.HasValue)
                         continue;
                     fields[field] = fields.TryGetValue(field, out var stats)
@@ -2203,7 +2220,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
                 {
                     if (_buf.TryGetValue(key, out var list))
                     {
-                        var removed = list.RemoveAll(p => p.Point.Measurement == measurement);
+                        var removed = list.RemoveAll(p => p.Series.Measurement == measurement);
                         if (removed > 0) { Interlocked.Add(ref _bufferedPointCount, -removed); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
                         RebuildBufferSeriesIndex(key, list);
                         UpdateBufferReplayFloor(key, list, forceRecalculate: true);
@@ -2295,7 +2312,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
                 {
                     if (_buf.TryGetValue(key, out var list))
                     {
-                        var removed = list.RemoveAll(p => p.Point.Measurement == measurement && tagSet.Contains(p.SeriesKey.TagsCanonical));
+                        var removed = list.RemoveAll(p => p.Series.Measurement == measurement && tagSet.Contains(p.SeriesKey.TagsCanonical));
                         if (removed > 0) { Interlocked.Add(ref _bufferedPointCount, -removed); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
                         RebuildBufferSeriesIndex(key, list);
                         UpdateBufferReplayFloor(key, list, forceRecalculate: true);
@@ -2502,10 +2519,10 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
             {
                 if (_buf.TryGetValue(key, out var list))
                 {
-                    var removed = list.RemoveAll(p => p.Point.Measurement == measurement
-                        && (!minTime.HasValue || p.Point.TimestampNs >= minTime.Value)
-                        && (!maxTime.HasValue || p.Point.TimestampNs <= maxTime.Value)
-                        && predicate(p.Point));
+                    var removed = list.RemoveAll(p => p.Series.Measurement == measurement
+                        && (!minTime.HasValue || p.Compact.TimestampNs >= minTime.Value)
+                        && (!maxTime.HasValue || p.Compact.TimestampNs <= maxTime.Value)
+                        && predicate(p.ToPoint()));
                     if (removed > 0) { Interlocked.Add(ref _bufferedPointCount, -removed); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
                     RebuildBufferSeriesIndex(key, list);
                     UpdateBufferReplayFloor(key, list, forceRecalculate: true);
@@ -2739,7 +2756,13 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         _segmentMetadataCache.TryRemove(path, out _);
     }
 
-    private static bool Match(Point p, string? m, long? min, long? max) => (m == null || p.Measurement == m) && (!min.HasValue || p.TimestampNs >= min) && (!max.HasValue || p.TimestampNs <= max);
+    private static bool Match(BufferedPoint bp, string? m, long? min, long? max)
+    {
+        var ts = bp.Compact.TimestampNs;
+        return (m == null || bp.Series.Measurement == m)
+            && (!min.HasValue || ts >= min.Value)
+            && (!max.HasValue || ts <= max.Value);
+    }
 
     private static bool CouldSegmentMatchFieldFilters(
         IReadOnlyList<SegmentColumnMeta> metas,
@@ -2843,7 +2866,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         if (!force && _minSegmentFileBytes > 0 && l.Count < _maxBufferPoints)
         {
             long est = 0;
-            foreach (var buffered in l) est += EstimateBufferedPointBytes(buffered.Point);
+            foreach (var buffered in l) est += EstimateBufferedPointBytes(buffered.Compact, buffered.Series);
             if (est < _minSegmentFileBytes) return;
         }
 
@@ -2851,7 +2874,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         long flushBytes = 0;
         if (_maxBufferBytes > 0)
             foreach (var buffered in l)
-                flushBytes += EstimateBufferedPointBytes(buffered.Point);
+                flushBytes += EstimateBufferedPointBytes(buffered.Compact, buffered.Series);
 
         // capture flushed points for last-value cache validation before clearing
         var flushedSnapshot = l.ToArray();
@@ -2889,7 +2912,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         var shardRanges = new Dictionary<int, (long Start, long End)>();
         foreach (var buffered in pointsToFlush)
         {
-            var timestampNs = buffered.Point.TimestampNs;
+            var timestampNs = buffered.Compact.TimestampNs;
             var shardId = -1;
             foreach (var (id, range) in shardRanges)
             {
@@ -2907,7 +2930,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
                 points = new List<(Point, SeriesKey)>(Math.Max(1000, pointsToFlush.Count / 10));
                 byShard[shardId] = points;
             }
-            points.Add((buffered.Point, buffered.SeriesKey));
+            points.Add((buffered.ToPoint(), buffered.SeriesKey));
         }
 
         // 并行flush到不同shard（优化的并行写入）
@@ -2945,7 +2968,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         if (_minSegmentFileBytes > 0 && list.Count < _maxBufferPoints)
         {
             long est = 0;
-            foreach (var buffered in list) est += EstimateBufferedPointBytes(buffered.Point);
+            foreach (var buffered in list) est += EstimateBufferedPointBytes(buffered.Compact, buffered.Series);
             if (est < _minSegmentFileBytes) return;
         }
 
@@ -2969,8 +2992,8 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         long snapshotBytes = 0;
         foreach (var bp in list)
         {
-            if (bp.Point.TimestampNs < snapshotMinTs) snapshotMinTs = bp.Point.TimestampNs;
-            snapshotBytes += EstimateBufferedPointBytes(bp.Point);
+            if (bp.Compact.TimestampNs < snapshotMinTs) snapshotMinTs = bp.Compact.TimestampNs;
+            snapshotBytes += EstimateBufferedPointBytes(bp.Compact, bp.Series);
         }
         var fg = new FlushGeneration
         {
@@ -3262,7 +3285,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         if (_maxBufferBytes > 0)
         {
             var bufferedBytes = GetBufferedByteCountInternal();
-            var incomingBytes = incomingPoints.Sum(EstimateBufferedPointBytes);
+            var incomingBytes = incomingPoints.Sum(static p => EstimateBufferedPointBytes(p));
             if (bufferedBytes + incomingBytes > _maxBufferBytes)
                 throw new MemoryLimitExceededException($"memory buffer byte limit exceeded: {bufferedBytes + incomingBytes} > {_maxBufferBytes}");
         }
@@ -3285,20 +3308,34 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         long bytes = 0;
         foreach (var kv in _buf)
             foreach (var p in kv.Value)
-                bytes += EstimateBufferedPointBytes(p.Point);
+                bytes += EstimateBufferedPointBytes(p.Compact, p.Series);
         foreach (var kv in _flushing)
             foreach (var p in kv.Value.Points)
-                bytes += EstimateBufferedPointBytes(p.Point);
+                bytes += EstimateBufferedPointBytes(p.Compact, p.Series);
         Interlocked.Exchange(ref _bufferedByteCount, bytes);
     }
 
+    private static long EstimateBufferedPointBytes(CompactPoint cp, SeriesDescriptor desc)
+    {
+        // CompactPoint struct (~24B) + Values array header (16B) + per-field Nullable<FieldValue>
+        // (~24B each). SeriesDescriptor is shared across points, so its cost is amortized to ~0.
+        long size = 40 + cp.Values.Length * 24L;
+        // String field values are the only variable-length per-point payload.
+        for (var f = 0; f < cp.Values.Length; f++)
+            if (cp.Values[f].HasValue && cp.Values[f]!.Value.Kind == FieldKind.String)
+                size += 24 + (cp.Values[f]!.Value.String?.Length ?? 0) * 2L;
+        return size;
+    }
+
+    // Pre-compaction estimate for incoming Point batches (write-limit checks run before the
+    // points are converted to compact form). Mirrors the compact formula so the byte budget
+    // stays consistent before and after conversion.
     private static long EstimateBufferedPointBytes(Point point)
     {
-        long size = 96 + EstimateStringBytes(point.Measurement) + 8;
-        foreach (var tag in point.Tags)
-            size += 32 + EstimateStringBytes(tag.Key) + EstimateStringBytes(tag.Value);
+        long size = 40 + point.Fields.Count * 24L;
         foreach (var field in point.Fields)
-            size += 48 + EstimateStringBytes(field.Key) + EstimateFieldValueBytes(field.Value);
+            if (field.Value.Kind == FieldKind.String)
+                size += 24 + (field.Value.String?.Length ?? 0) * 2L;
         return size;
     }
 
@@ -3367,18 +3404,85 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         Interlocked.Add(ref _bufferedPointCount, points.Count);
         if (_maxBufferBytes > 0)
             foreach (var point in points)
-                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(point.Point));
+                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(point.Compact, point.Series));
         // WAL replay also populates last-value cache so post-restart last() is fast
         var sep = key.IndexOf('|');
         if (sep > 0)
         {
             var db = key[..sep];
             var rp = key[(sep + 1)..];
-            foreach (var p in points) _lastValueCache.Update(db, rp, p.Point);
+            foreach (var p in points) _lastValueCache.Update(db, rp, p.ToPoint());
         }
     }
 
-    private void AddWrittenPoints(string db, string key, List<BufferedPoint> list, List<PendingPoint> points, WalPosition position)
+    private static (CompactPoint[] Points, SeriesDescriptor[] Series) BuildCompactBatch(List<PendingPoint> pending)
+    {
+        var seriesMap = new Dictionary<SeriesKey, int>();
+        var builders = new List<SeriesFieldBuilder>();
+        for (var i = 0; i < pending.Count; i++)
+        {
+            var p = pending[i];
+            if (!seriesMap.TryGetValue(p.SeriesKey, out var idx))
+            {
+                idx = builders.Count;
+                seriesMap[p.SeriesKey] = idx;
+                builders.Add(new SeriesFieldBuilder(p.Point));
+            }
+            else
+            {
+                builders[idx].MergeFields(p.Point);
+            }
+        }
+
+        var series = new SeriesDescriptor[builders.Count];
+        for (var s = 0; s < builders.Count; s++)
+            series[s] = builders[s].Build();
+
+        var compact = new CompactPoint[pending.Count];
+        for (var i = 0; i < pending.Count; i++)
+        {
+            var sidx = seriesMap[pending[i].SeriesKey];
+            compact[i] = pending[i].Point.ToCompactPoint(sidx, series[sidx]);
+        }
+        return (compact, series);
+    }
+
+    private sealed class SeriesFieldBuilder
+    {
+        private readonly string _measurement;
+        private readonly string[] _tagKeys;
+        private readonly string[] _tagValues;
+        private readonly List<string> _fieldNames;
+        private readonly List<FieldKind> _fieldKinds;
+
+        public SeriesFieldBuilder(Point first)
+        {
+            _measurement = first.Measurement;
+            _tagKeys = new string[first.Tags.Count];
+            _tagValues = new string[first.Tags.Count];
+            var i = 0;
+            foreach (var t in first.Tags) { _tagKeys[i] = t.Key; _tagValues[i] = t.Value; i++; }
+            _fieldNames = new List<string>(first.Fields.Count);
+            _fieldKinds = new List<FieldKind>(first.Fields.Count);
+            foreach (var f in first.Fields) { _fieldNames.Add(f.Key); _fieldKinds.Add(f.Value.Kind); }
+        }
+
+        public void MergeFields(Point p)
+        {
+            foreach (var f in p.Fields)
+            {
+                var exists = false;
+                for (var k = 0; k < _fieldNames.Count; k++)
+                    if (_fieldNames[k] == f.Key) { exists = true; break; }
+                if (!exists) { _fieldNames.Add(f.Key); _fieldKinds.Add(f.Value.Kind); }
+            }
+        }
+
+        public SeriesDescriptor Build() =>
+            new(_measurement, _tagKeys, _tagValues, _fieldNames.ToArray(), _fieldKinds.ToArray());
+    }
+
+    private void AddWrittenPoints(string db, string key, List<BufferedPoint> list, List<PendingPoint> pending, CompactPoint[] compactPoints, SeriesDescriptor[] seriesDescs, WalPosition position)
     {
         using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.BufferAppend);
         if (!_bufBySeries.TryGetValue(key, out var bySeries))
@@ -3387,25 +3491,28 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
             _bufBySeries[key] = bySeries;
         }
 
-        list.EnsureCapacity(list.Count + points.Count);
+        list.EnsureCapacity(list.Count + pending.Count);
+        var bufferedStart = list.Count;
         var seenSeries = new HashSet<SeriesKey>();
         var newSeries = new List<(SeriesKey Key, Point Point)>();
-        for (var i = 0; i < points.Count; i++)
+        for (var i = 0; i < pending.Count; i++)
         {
-            var pending = points[i];
-            var buffered = new BufferedPoint(pending.Point, position, pending.SeriesKey, Interlocked.Increment(ref _bufferSeq));
+            var p = pending[i];
+            // SeriesDescriptor is shared across all points of the same series in this batch.
+            var desc = seriesDescs[compactPoints[i].SeriesIndex];
+            var buffered = new BufferedPoint(compactPoints[i], desc, position, p.SeriesKey, Interlocked.Increment(ref _bufferSeq));
             list.Add(buffered);
-            if (!bySeries.TryGetValue(pending.SeriesKey, out var seriesPoints))
+            if (!bySeries.TryGetValue(p.SeriesKey, out var seriesPoints))
             {
                 seriesPoints = [];
-                bySeries[pending.SeriesKey] = seriesPoints;
+                bySeries[p.SeriesKey] = seriesPoints;
             }
             seriesPoints.Add(buffered);
 
             // Only feed genuinely new series into the manifest indexes; re-indexing every series
             // of every batch costs a global manifest lock + O(series x tags) work per batch.
-            if (seenSeries.Add(pending.SeriesKey))
-                newSeries.Add((pending.SeriesKey, pending.Point));
+            if (seenSeries.Add(p.SeriesKey))
+                newSeries.Add((p.SeriesKey, p.Point));
         }
 
         // Resolve new series under the shared gate: HashSet.Add is not thread-safe and concurrently
@@ -3424,14 +3531,17 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         if (indexPoints != null)
             _manifest.UpdateIndexes(db, indexPoints);
 
-        Interlocked.Add(ref _bufferedPointCount, points.Count);
+        Interlocked.Add(ref _bufferedPointCount, pending.Count);
         if (_maxBufferBytes > 0)
-            for (var i = 0; i < points.Count; i++)
-                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(points[i].Point));
+            for (var i = 0; i < pending.Count; i++)
+            {
+                var bp = list[bufferedStart + i];
+                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(bp.Compact, bp.Series));
+            }
 
         // write-path last-value cache update (flush later validates via segment footer maxTime)
         var rp = key.Length > db.Length + 1 ? key[(db.Length + 1)..] : "autogen";
-        _lastValueCache.UpdateMany(db, rp, points.Select(static p => p.Point));
+        _lastValueCache.UpdateMany(db, rp, pending.Select(static p => p.Point));
     }
 
     private IEnumerable<BufferedPoint> BufferedCandidates(string key, string? measurement, HashSet<string>? allowedTagsCanonical)
@@ -3620,17 +3730,18 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
         foreach (var bp in flushed)
         {
             var sk = bp.SeriesKey;
-            if (!maxBySeries.TryGetValue(sk, out var curMax) || bp.Point.TimestampNs > curMax)
+            var ts = bp.Compact.TimestampNs;
+            if (!maxBySeries.TryGetValue(sk, out var curMax) || ts > curMax)
             {
-                maxBySeries[sk] = bp.Point.TimestampNs;
-                latestBySeries[sk] = bp.Point;
+                maxBySeries[sk] = ts;
+                latestBySeries[sk] = bp.ToPoint();
             }
-            else if (bp.Point.TimestampNs == curMax)
+            else if (ts == curMax)
             {
                 // same timestamp merge fields LWW
                 var existing = latestBySeries[sk];
                 var merged = new Dictionary<string, FieldValue>(existing.Fields, StringComparer.Ordinal);
-                foreach (var kv in bp.Point.Fields) merged[kv.Key] = kv.Value;
+                foreach (var kv in bp.ToPoint().Fields) merged[kv.Key] = kv.Value;
                 latestBySeries[sk] = new Point { Measurement = existing.Measurement, Tags = existing.Tags, Fields = merged, TimestampNs = existing.TimestampNs, TagsCanonical = existing.TagsCanonical };
             }
         }

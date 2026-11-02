@@ -359,4 +359,55 @@ public class P1QuerySemanticsTests : IDisposable
         Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(value) },
         TimestampNs = timestampNs
     };
+
+    // ---- compact-row field-union regression ----
+
+    [Fact]
+    public async Task SameSeries_DifferentFieldSubsets_PreservesAllFields()
+    {
+        // Two points of the same series, each carrying a different field. The compact-row buffer
+        // builds a per-series field UNION so neither field is silently dropped when the series
+        // descriptor is seeded from the first point. Covers both the in-memory buffer and the
+        // flushed segment path.
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1000);
+        await engine.WriteAsync("testdb", "autogen",
+        [
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(1.0) },
+                TimestampNs = 1_000_000_000L
+            },
+            new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "server01" },
+                Fields = new Dictionary<string, FieldValue> { ["temp"] = FieldValue.FromDouble(42.0) },
+                TimestampNs = 2_000_000_000L
+            }
+        ]);
+
+        var result = await new QueryExecutor().ExecuteAsync(engine, "testdb", "SELECT value, temp FROM cpu");
+        Assert.Null(result.Results[0].Error);
+        var s = Assert.Single(result.Results[0].Series!);
+        Assert.Contains("value", s.Columns);
+        Assert.Contains("temp", s.Columns);
+        var vi = s.Columns.IndexOf("value");
+        var ti = s.Columns.IndexOf("temp");
+        Assert.Equal(2, s.Values.Count);
+        Assert.Equal(1.0, Convert.ToDouble(s.Values[0][vi]));
+        Assert.Null(s.Values[0][ti]);
+        Assert.Null(s.Values[1][vi]);
+        Assert.Equal(42.0, Convert.ToDouble(s.Values[1][ti]));
+
+        // After flush the field union must survive into the segment encoding.
+        engine.FlushAll();
+        var result2 = await new QueryExecutor().ExecuteAsync(engine, "testdb", "SELECT value, temp FROM cpu");
+        Assert.Null(result2.Results[0].Error);
+        var s2 = Assert.Single(result2.Results[0].Series!);
+        Assert.Contains("value", s2.Columns);
+        Assert.Contains("temp", s2.Columns);
+        Assert.Equal(2, s2.Values.Count);
+    }
 }

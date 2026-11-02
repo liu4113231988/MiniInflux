@@ -211,6 +211,48 @@ public sealed class WalManager : IDisposable
         return position;
     }
 
+    /// <summary>
+    /// Append a batch already in compact form (shared series descriptors + per-point value arrays).
+    /// The write path builds the compact batch once and feeds both the WAL and the memory buffer,
+    /// so series derivation and field-union computation happen a single time.
+    /// </summary>
+    public WalPosition AppendBatch(string db, string rp, IReadOnlyList<CompactPoint> points, IReadOnlyList<SeriesDescriptor> series)
+    {
+        using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalAppend);
+        if (points.Count == 0) return WalPosition.Start;
+        using var writer = new PooledBufferWriter(EstimatePayloadSizeCompact(db, rp, points, series));
+        using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalEncode))
+            WriteRecordPayloadCompact(writer, db, rp, points, series);
+        var payloadSpan = writer.WrittenSpan;
+        uint crc;
+        using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalCrc))
+            crc = Crc32.Compute(payloadSpan);
+        using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalLockWait))
+            Monitor.Enter(_lock);
+        WalPosition position;
+        try
+        {
+            try
+            {
+                if (_disposed) throw new ObjectDisposedException(nameof(WalManager));
+
+                position = WriteRecord(payloadSpan, crc);
+
+                if (_currentFileSize >= _maxFileBytes)
+                    RotateLocked();
+
+                _health.RecordWriteSuccess();
+            }
+            catch (Exception ex)
+            {
+                _health.RecordFailure("wal_append", ex, blocksWrites: true);
+                throw;
+            }
+        }
+        finally { Monitor.Exit(_lock); }
+        return position;
+    }
+
     private const byte BinaryMagicV1 = 0x01;
 
     /// <summary>
@@ -311,6 +353,68 @@ public sealed class WalManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Compact-form variant of <see cref="WriteRecordPayload"/>: reads the shared series table from
+    /// <paramref name="series"/> and per-point values from <see cref="CompactPoint.Values"/>. A null
+    /// entry in Values means that field is absent, which becomes an unset bit in the field mask.
+    /// </summary>
+    private static void WriteRecordPayloadCompact(PooledBufferWriter writer, string db, string rp, IReadOnlyList<CompactPoint> points, IReadOnlyList<SeriesDescriptor> series)
+    {
+        writer.WriteByte(BinaryMagicV1);
+        writer.WriteString16(db);
+        writer.WriteString16(rp);
+
+        writer.WriteUInt16((ushort)series.Count);
+        foreach (var desc in series)
+        {
+            writer.WriteString16(desc.Measurement);
+            writer.WriteByte((byte)desc.TagKeys.Length);
+            for (var t = 0; t < desc.TagKeys.Length; t++)
+            {
+                writer.WriteString16(desc.TagKeys[t]);
+                writer.WriteString16(desc.TagValues[t]);
+            }
+            writer.WriteByte((byte)desc.FieldNames.Length);
+            for (var f = 0; f < desc.FieldNames.Length; f++)
+            {
+                writer.WriteString16(desc.FieldNames[f]);
+                writer.WriteByte((byte)desc.FieldKinds[f]);
+            }
+        }
+
+        writer.WriteUInt32((uint)points.Count);
+        // field_count is stored as u8 (<=255), so the per-point field mask fits in 32 bytes.
+        // Allocate once outside the loop (CA2014) and reset each iteration.
+        Span<byte> mask = stackalloc byte[32];
+        for (var i = 0; i < points.Count; i++)
+        {
+            var cp = points[i];
+            var desc = series[cp.SeriesIndex];
+            writer.WriteUInt16((ushort)cp.SeriesIndex);
+            writer.WriteVarintZigzag(cp.TimestampNs);
+            var fieldCount = desc.FieldNames.Length;
+            var maskBytes = (fieldCount + 7) / 8;
+            var maskSlice = mask[..maskBytes];
+            maskSlice.Clear();
+            for (var f = 0; f < fieldCount; f++)
+                if (cp.Values[f].HasValue)
+                    maskSlice[f >> 3] |= (byte)(1 << (f & 7));
+            writer.WriteBytes(maskSlice);
+            for (var f = 0; f < fieldCount; f++)
+            {
+                if (!cp.Values[f].HasValue) continue;
+                var v = cp.Values[f]!.Value;
+                switch (v.Kind)
+                {
+                    case FieldKind.Float: writer.WriteDouble(v.Float); break;
+                    case FieldKind.Integer: writer.WriteVarintZigzag(v.Integer); break;
+                    case FieldKind.Boolean: writer.WriteByte(v.Boolean ? (byte)1 : (byte)0); break;
+                    case FieldKind.String: writer.WriteString16(v.String ?? ""); break;
+                }
+            }
+        }
+    }
+
     private WalPosition WriteRecord(ReadOnlySpan<byte> payload, uint crc)
     {
         using var timing = WriteDiagnostics.Measure(WriteDiagnostics.Stage.WalFileWrite);
@@ -329,6 +433,12 @@ public sealed class WalManager : IDisposable
     {
         // Binary payload is much smaller than text; 40 B/point covers series index + varint
         // timestamp + a couple of numeric fields with headroom for the shared series table.
+        var size = (db.Length + rp.Length) * 2 + 16 + points.Count * 40;
+        return size;
+    }
+
+    private static int EstimatePayloadSizeCompact(string db, string rp, IReadOnlyList<CompactPoint> points, IReadOnlyList<SeriesDescriptor> series)
+    {
         var size = (db.Length + rp.Length) * 2 + 16 + points.Count * 40;
         return size;
     }

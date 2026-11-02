@@ -82,7 +82,7 @@ public class P2ConvergenceTests : IDisposable
             compactionIntervalMs: 0,
             rpCheckIntervalMs: 0,
             maxBufferPoints: 1_000_000,
-            maxBufferBytes: 20_000); // ~25 pts/batch x ~326 B ≈ 8 KB; flush at >=16 KB
+            maxBufferBytes: 4000); // compact model: ~64 B/point x 25 = 1.6 KB/batch; flush at >=3.2 KB (50 pts)
 
         long timestamp = 0;
         for (var batch = 0; batch < 4; batch++)
