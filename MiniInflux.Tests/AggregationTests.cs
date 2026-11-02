@@ -147,7 +147,7 @@ public class AggregationTests : IDisposable
         var result = await _executor.ExecuteAsync(_engine, "testdb",
             "SELECT holt_winters(value, 3, 6) FROM cpu");
         Assert.Null(result.Results[0].Error);
-        Assert.Equal(0, result.Results[0].Series![0].Values.Count);
+        Assert.Empty(result.Results[0].Series![0].Values);
     }
 
     [Fact]
@@ -156,7 +156,7 @@ public class AggregationTests : IDisposable
         var result = await _executor.ExecuteAsync(_engine, "testdb",
             "SELECT holt_winters(value, 3, 0) FROM cpu");
         Assert.Null(result.Results[0].Error);
-        Assert.Equal(0, result.Results[0].Series![0].Values.Count);
+        Assert.Empty(result.Results[0].Series![0].Values);
     }
 
     [Fact]
@@ -165,7 +165,7 @@ public class AggregationTests : IDisposable
         var result = await _executor.ExecuteAsync(_engine, "testdb",
             "SELECT holt_winters(value, 3, -1) FROM cpu");
         Assert.Null(result.Results[0].Error);
-        Assert.Equal(0, result.Results[0].Series![0].Values.Count);
+        Assert.Empty(result.Results[0].Series![0].Values);
     }
 
     [Fact]

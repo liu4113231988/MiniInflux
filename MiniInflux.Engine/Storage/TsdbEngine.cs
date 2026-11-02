@@ -366,7 +366,7 @@ public class TsdbEngine : IDisposable
             // Cardinality check inside the write lock to avoid a TOCTOU race.
             CheckCardinalityLocked(db, pending);
             // CheckBufferLimit inside the lock to prevent concurrent writes from exceeding limits.
-            CheckBufferLimit(writePoints);
+            CheckBufferLimit(compactPoints);
             
             // 优化的写入批处理：更大的写入批次减少WAL开销
             List<BufferedPoint> list;
@@ -2866,7 +2866,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         if (!force && _minSegmentFileBytes > 0 && l.Count < _maxBufferPoints)
         {
             long est = 0;
-            foreach (var buffered in l) est += EstimateBufferedPointBytes(buffered.Compact, buffered.Series);
+            foreach (var buffered in l) est += EstimateBufferedPointBytes(buffered.Compact);
             if (est < _minSegmentFileBytes) return;
         }
 
@@ -2874,7 +2874,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         long flushBytes = 0;
         if (_maxBufferBytes > 0)
             foreach (var buffered in l)
-                flushBytes += EstimateBufferedPointBytes(buffered.Compact, buffered.Series);
+                flushBytes += EstimateBufferedPointBytes(buffered.Compact);
 
         // capture flushed points for last-value cache validation before clearing
         var flushedSnapshot = l.ToArray();
@@ -2968,7 +2968,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         if (_minSegmentFileBytes > 0 && list.Count < _maxBufferPoints)
         {
             long est = 0;
-            foreach (var buffered in list) est += EstimateBufferedPointBytes(buffered.Compact, buffered.Series);
+            foreach (var buffered in list) est += EstimateBufferedPointBytes(buffered.Compact);
             if (est < _minSegmentFileBytes) return;
         }
 
@@ -2993,7 +2993,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         foreach (var bp in list)
         {
             if (bp.Compact.TimestampNs < snapshotMinTs) snapshotMinTs = bp.Compact.TimestampNs;
-            snapshotBytes += EstimateBufferedPointBytes(bp.Compact, bp.Series);
+            snapshotBytes += EstimateBufferedPointBytes(bp.Compact);
         }
         var fg = new FlushGeneration
         {
@@ -3273,19 +3273,23 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         if (total > _maxSeriesPerDb) throw new CardinalityLimitExceededException($"series cardinality limit exceeded for database '{db}': {total} > {_maxSeriesPerDb}");
     }
 
-    private void CheckBufferLimit(List<Point> incomingPoints)
+    private void CheckBufferLimit(CompactPoint[] incoming)
     {
         if (_maxBufferPoints > 0)
         {
             var bufferedPoints = GetBufferedPointCountInternal();
-            if (bufferedPoints + incomingPoints.Count > _maxBufferPoints)
-                throw new MemoryLimitExceededException($"memory buffer point limit exceeded: {bufferedPoints + incomingPoints.Count} > {_maxBufferPoints}");
+            if (bufferedPoints + incoming.Length > _maxBufferPoints)
+                throw new MemoryLimitExceededException($"memory buffer point limit exceeded: {bufferedPoints + incoming.Length} > {_maxBufferPoints}");
         }
 
         if (_maxBufferBytes > 0)
         {
             var bufferedBytes = GetBufferedByteCountInternal();
-            var incomingBytes = incomingPoints.Sum(static p => EstimateBufferedPointBytes(p));
+            // Use the compact-form estimate (field-union width) so the incoming estimate uses the
+            // same口径 as the buffered-byte counter, making MaxBufferBytes trigger near the config.
+            long incomingBytes = 0;
+            for (var i = 0; i < incoming.Length; i++)
+                incomingBytes += EstimateBufferedPointBytes(incoming[i]);
             if (bufferedBytes + incomingBytes > _maxBufferBytes)
                 throw new MemoryLimitExceededException($"memory buffer byte limit exceeded: {bufferedBytes + incomingBytes} > {_maxBufferBytes}");
         }
@@ -3308,34 +3312,23 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         long bytes = 0;
         foreach (var kv in _buf)
             foreach (var p in kv.Value)
-                bytes += EstimateBufferedPointBytes(p.Compact, p.Series);
+                bytes += EstimateBufferedPointBytes(p.Compact);
         foreach (var kv in _flushing)
             foreach (var p in kv.Value.Points)
-                bytes += EstimateBufferedPointBytes(p.Compact, p.Series);
+                bytes += EstimateBufferedPointBytes(p.Compact);
         Interlocked.Exchange(ref _bufferedByteCount, bytes);
     }
 
-    private static long EstimateBufferedPointBytes(CompactPoint cp, SeriesDescriptor desc)
+    private static long EstimateBufferedPointBytes(CompactPoint cp)
     {
         // CompactPoint struct (~24B) + Values array header (16B) + per-field Nullable<FieldValue>
-        // (~24B each). SeriesDescriptor is shared across points, so its cost is amortized to ~0.
+        // (~24B each). Values.Length is the series field-union width, so this matches the bytes
+        // actually accounted for when the point is buffered (same口径 as the flush counter).
         long size = 40 + cp.Values.Length * 24L;
         // String field values are the only variable-length per-point payload.
         for (var f = 0; f < cp.Values.Length; f++)
             if (cp.Values[f].HasValue && cp.Values[f]!.Value.Kind == FieldKind.String)
                 size += 24 + (cp.Values[f]!.Value.String?.Length ?? 0) * 2L;
-        return size;
-    }
-
-    // Pre-compaction estimate for incoming Point batches (write-limit checks run before the
-    // points are converted to compact form). Mirrors the compact formula so the byte budget
-    // stays consistent before and after conversion.
-    private static long EstimateBufferedPointBytes(Point point)
-    {
-        long size = 40 + point.Fields.Count * 24L;
-        foreach (var field in point.Fields)
-            if (field.Value.Kind == FieldKind.String)
-                size += 24 + (field.Value.String?.Length ?? 0) * 2L;
         return size;
     }
 
@@ -3404,7 +3397,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         Interlocked.Add(ref _bufferedPointCount, points.Count);
         if (_maxBufferBytes > 0)
             foreach (var point in points)
-                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(point.Compact, point.Series));
+                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(point.Compact));
         // WAL replay also populates last-value cache so post-restart last() is fast
         var sep = key.IndexOf('|');
         if (sep > 0)
@@ -3536,7 +3529,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
             for (var i = 0; i < pending.Count; i++)
             {
                 var bp = list[bufferedStart + i];
-                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(bp.Compact, bp.Series));
+                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(bp.Compact));
             }
 
         // write-path last-value cache update (flush later validates via segment footer maxTime)
