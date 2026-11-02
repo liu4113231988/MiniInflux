@@ -53,8 +53,9 @@ public sealed class WriteQueue : IDisposable
 
     /// <summary>
     /// Enqueue a write request. Throws ChannelClosedException if the queue is shutting down.
-    /// Times out after 5 seconds if the queue is full (backpressure).
+    /// Times out after 5 seconds if the queue is full (backpressure), throwing WriteQueueFullException.
     /// Throws WriteQueueFullException when the configured points/bytes budget would be exceeded.
+    /// Throws OperationCanceledException when the caller's token is cancelled (not retryable).
     /// </summary>
     public async Task<bool> EnqueueAsync(string db, string rp, List<Point> points, CancellationToken ct = default)
     {
@@ -86,30 +87,41 @@ public sealed class WriteQueue : IDisposable
 
         Interlocked.Increment(ref _pendingRequests);
         using var registration = ct.Register(static state => ((TaskCompletionSource<bool>)state!).TrySetCanceled(), tcs);
+
+        // `enqueued` records whether WriteAsync successfully handed the item to the channel.
+        // Budget/pending ownership: if enqueued, the worker's ProcessBatch finally releases them;
+        // otherwise this method must release them exactly once.
+        bool enqueued = false;
         try
         {
             await channel.Writer.WriteAsync(request, timeoutCts.Token);
+            enqueued = true;
             return await tcs.Task;
         }
         catch (OperationCanceledException)
         {
-            // If the request never entered the channel the worker won't process it, so release
-            // the budget and pending counter here. If it was already enqueued before cancellation
-            // the worker releases them in ProcessBatch's finally block.
-            if (!channel.Reader.TryPeek(out var peeked) || !ReferenceEquals(peeked, request))
+            if (!enqueued)
             {
+                // WriteAsync never delivered the item; release budget here.
                 Interlocked.Add(ref _queuedPoints, -pointCount);
                 Interlocked.Add(ref _queuedBytes, -estimatedBytes);
                 Interlocked.Decrement(ref _pendingRequests);
+
+                // Caller cancellation must surface as OperationCanceledException so callers don't
+                // retry (which could double-write). A queue-full timeout is retryable.
+                if (ct.IsCancellationRequested)
+                    throw;
+                throw new WriteQueueFullException("write queue full; retry later");
             }
-            throw new WriteQueueFullException("Write queue is full or shutting down");
+            // Item already enqueued: worker owns budget release. Caller cancelled while waiting.
+            throw;
         }
         catch (ChannelClosedException)
         {
             Interlocked.Add(ref _queuedPoints, -pointCount);
             Interlocked.Add(ref _queuedBytes, -estimatedBytes);
             Interlocked.Decrement(ref _pendingRequests);
-            throw new WriteQueueFullException("Write queue is shutting down");
+            throw new WriteQueueFullException("write queue is shutting down");
         }
     }
 
@@ -208,6 +220,12 @@ public sealed class WriteQueue : IDisposable
     public long PendingRequests => Math.Max(0, Interlocked.Read(ref _pendingRequests));
     public long QueuedPoints => Math.Max(0, Interlocked.Read(ref _queuedPoints));
     public long QueuedBytes => Math.Max(0, Interlocked.Read(ref _queuedBytes));
+
+    // Raw counters for tests: the public properties clamp negatives to 0, which would hide a
+    // double-release bug. These expose the true underlying values.
+    internal long PendingRequestsRaw => Interlocked.Read(ref _pendingRequests);
+    internal long QueuedPointsRaw => Interlocked.Read(ref _queuedPoints);
+    internal long QueuedBytesRaw => Interlocked.Read(ref _queuedBytes);
 
     private static long EstimateQueuedBytes(List<Point> points)
     {

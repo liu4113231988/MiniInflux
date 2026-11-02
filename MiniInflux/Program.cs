@@ -1421,6 +1421,11 @@ async Task<IResult> WritePointsAsync(HttpRequest request, string db, string? rp,
                 ? Results.Json(new V2ErrorResponse("unavailable", ex.Message), AppJsonContext.Default.V2ErrorResponse, statusCode: 503)
                 : Results.StatusCode(503);
         }
+        catch (OperationCanceledException)
+        {
+            // Client aborted the request; not retryable, no parse failure.
+            return Results.StatusCode(499);
+        }
         catch (IOException ex)
         {
             runtimeLogger.LogError(ex, "write rejected because storage is unavailable db={Db} rp={Rp}", db, rp ?? "autogen");

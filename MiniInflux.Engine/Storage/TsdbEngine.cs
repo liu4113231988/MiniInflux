@@ -4,7 +4,7 @@ using MiniInflux.Net10.Protocol;
 
 namespace MiniInflux.Net10.Storage;
 
-public sealed class TsdbEngine : IDisposable
+public class TsdbEngine : IDisposable
 {
     public sealed record SegmentMetadataQueryResult(List<SegmentColumnMeta> Metas, int FooterHits, int FullReads);
     public sealed record DescendingSeriesReadResult(List<Point> Points, int SegmentColumnsRead, int PointsMaterialized, string? LimitPushdownStopReason);
@@ -306,7 +306,7 @@ public sealed class TsdbEngine : IDisposable
     // completed task, so this avoids the sync-over-async anti-pattern without duplicating logic.
     public void Write(string db, string rp, List<Point> pts) => WriteInternalAsync(db, rp, pts).GetAwaiter().GetResult();
 
-    public Task WriteInternalAsync(string db, string rp, List<Point> pts)
+    public virtual Task WriteInternalAsync(string db, string rp, List<Point> pts)
     {
         _writeCatalogGate.EnterReadLock();
         try
