@@ -211,14 +211,104 @@ public sealed class WalManager : IDisposable
         return position;
     }
 
+    private const byte BinaryMagicV1 = 0x01;
+
+    /// <summary>
+    /// Binary v1 payload layout (frame header [len:4][crc:4] is unchanged):
+    ///   magic: u8 = 0x01
+    ///   db: u16 len + utf8
+    ///   rp: u16 len + utf8
+    ///   series_count: u16
+    ///   per series: measurement(u16+utf8), tag_count(u8), per tag(key,val u16+utf8),
+    ///               field_count(u8), per field(name u16+utf8, kind u8)  -- union of fields seen
+    ///   point_count: u32
+    ///   per point: series_index(u16), timestamp(varint-zigzag),
+    ///              field_mask(ceil(field_count/8) bytes, bit i = field i present),
+    ///              for each set bit in mask: value in series-field order
+    ///              (float: f64 LE, integer: varint-zigzag, bool: u8, string: u16+utf8)
+    /// The field mask handles points in the same series that carry different field subsets.
+    /// </summary>
     private static void WriteRecordPayload(PooledBufferWriter writer, string db, string rp, IReadOnlyList<Point> points)
     {
-        WriteUtf8(writer, db);
-        writer.WriteByte((byte)'\t');
-        WriteUtf8(writer, rp);
-        writer.WriteByte((byte)'\t');
+        writer.WriteByte(BinaryMagicV1);
+        writer.WriteString16(db);
+        writer.WriteString16(rp);
+
+        var seriesList = new List<(SeriesKey Key, Point Sample, List<(string Name, FieldKind Kind)> Fields)>();
+        var seriesIndex = new Dictionary<SeriesKey, int>();
+        var pointSeries = new int[points.Count];
         for (var i = 0; i < points.Count; i++)
-            AppendLineProtocolUtf8(writer, points[i]);
+        {
+            var p = points[i];
+            var key = SeriesKey.From(p);
+            if (!seriesIndex.TryGetValue(key, out var idx))
+            {
+                idx = seriesList.Count;
+                seriesIndex[key] = idx;
+                var fields = new List<(string, FieldKind)>(p.Fields.Count);
+                foreach (var f in p.Fields) fields.Add((f.Key, f.Value.Kind));
+                seriesList.Add((key, p, fields));
+            }
+            else
+            {
+                // Merge any new field names into this series' field table (preserve insertion order).
+                var entry = seriesList[idx];
+                foreach (var f in p.Fields)
+                {
+                    var exists = false;
+                    for (var k = 0; k < entry.Fields.Count; k++)
+                        if (entry.Fields[k].Name == f.Key) { exists = true; break; }
+                    if (!exists) entry.Fields.Add((f.Key, f.Value.Kind));
+                }
+            }
+            pointSeries[i] = idx;
+        }
+
+        writer.WriteUInt16((ushort)seriesList.Count);
+        foreach (var entry in seriesList)
+        {
+            writer.WriteString16(entry.Sample.Measurement);
+            writer.WriteByte((byte)entry.Sample.Tags.Count);
+            foreach (var t in entry.Sample.Tags)
+            {
+                writer.WriteString16(t.Key);
+                writer.WriteString16(t.Value);
+            }
+            writer.WriteByte((byte)entry.Fields.Count);
+            foreach (var (name, kind) in entry.Fields)
+            {
+                writer.WriteString16(name);
+                writer.WriteByte((byte)kind);
+            }
+        }
+
+        writer.WriteUInt32((uint)points.Count);
+        for (var i = 0; i < points.Count; i++)
+        {
+            var p = points[i];
+            var sidx = pointSeries[i];
+            writer.WriteUInt16((ushort)sidx);
+            writer.WriteVarintZigzag(p.TimestampNs);
+            var fields = seriesList[sidx].Fields;
+            var maskBytes = (fields.Count + 7) / 8;
+            var mask = new byte[maskBytes];
+            for (var f = 0; f < fields.Count; f++)
+                if (p.Fields.ContainsKey(fields[f].Name))
+                    mask[f >> 3] |= (byte)(1 << (f & 7));
+            writer.WriteBytes(mask);
+            for (var f = 0; f < fields.Count; f++)
+            {
+                if ((mask[f >> 3] & (1 << (f & 7))) == 0) continue;
+                var v = p.Fields[fields[f].Name];
+                switch (v.Kind)
+                {
+                    case FieldKind.Float: writer.WriteDouble(v.Float); break;
+                    case FieldKind.Integer: writer.WriteVarintZigzag(v.Integer); break;
+                    case FieldKind.Boolean: writer.WriteByte(v.Boolean ? (byte)1 : (byte)0); break;
+                    case FieldKind.String: writer.WriteString16(v.String ?? ""); break;
+                }
+            }
+        }
     }
 
     private WalPosition WriteRecord(ReadOnlySpan<byte> payload, uint crc)
@@ -237,7 +327,9 @@ public sealed class WalManager : IDisposable
 
     private static int EstimatePayloadSize(string db, string rp, IReadOnlyList<Point> points)
     {
-        var size = (db.Length + rp.Length + 2) * 2 + points.Count * 96;
+        // Binary payload is much smaller than text; 40 B/point covers series index + varint
+        // timestamp + a couple of numeric fields with headroom for the shared series table.
+        var size = (db.Length + rp.Length) * 2 + 16 + points.Count * 40;
         return size;
     }
 
@@ -260,15 +352,45 @@ public sealed class WalManager : IDisposable
             _written++;
         }
 
-        public void WriteUtf8(string value)
-        {
-            _written += Encoding.UTF8.GetBytes(value, Ensure(value.Length * 3));
-        }
-
         public void WriteBytes(ReadOnlySpan<byte> value)
         {
             value.CopyTo(Ensure(value.Length));
             _written += value.Length;
+        }
+
+        public void WriteUInt16(ushort value)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(Ensure(2), value);
+            _written += 2;
+        }
+
+        public void WriteUInt32(uint value)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(Ensure(4), value);
+            _written += 4;
+        }
+
+        public void WriteDouble(double value)
+        {
+            BinaryPrimitives.WriteDoubleLittleEndian(Ensure(8), value);
+            _written += 8;
+        }
+
+        public void WriteString16(string value)
+        {
+            var byteCount = Encoding.UTF8.GetByteCount(value);
+            WriteUInt16((ushort)byteCount);
+            _written += Encoding.UTF8.GetBytes(value, Ensure(byteCount));
+        }
+
+        public void WriteVarintZigzag(long value)
+        {
+            var zz = (ulong)((value << 1) ^ (value >> 63));
+            var span = Ensure(10);
+            var n = 0;
+            while (zz >= 0x80) { span[n++] = (byte)(zz | 0x80); zz >>= 7; }
+            span[n++] = (byte)zz;
+            _written += n;
         }
 
         public void Advance(int count)
@@ -301,111 +423,6 @@ public sealed class WalManager : IDisposable
         }
 
         public void Dispose() => ArrayPool<byte>.Shared.Return(_buffer);
-    }
-
-    private static void WriteUtf8(PooledBufferWriter writer, string? s)
-    {
-        if (string.IsNullOrEmpty(s)) return;
-        writer.WriteUtf8(s);
-    }
-
-    private static void AppendLineProtocolUtf8(PooledBufferWriter writer, Point p)
-    {
-        WriteUtf8(writer, p.Measurement);
-        foreach (var tag in p.Tags)
-        {
-            writer.WriteByte((byte)',');
-            WriteUtf8(writer, tag.Key);
-            writer.WriteByte((byte)'=');
-            WriteUtf8(writer, tag.Value);
-        }
-        writer.WriteByte((byte)' ');
-        var first = true;
-        foreach (var field in p.Fields)
-        {
-            if (!first) writer.WriteByte((byte)',');
-            first = false;
-            WriteUtf8(writer, field.Key);
-            writer.WriteByte((byte)'=');
-            AppendFieldValueUtf8(writer, field.Value);
-        }
-        writer.WriteByte((byte)' ');
-        WriteInt64(writer, p.TimestampNs);
-        writer.WriteByte((byte)'\n');
-    }
-
-    private static void WriteInt64(PooledBufferWriter writer, long value)
-    {
-        // Utf8Formatter writes the invariant decimal representation straight into the payload
-        // span — no intermediate string allocation per point.
-        var span = writer.GetSpan(20);
-        System.Buffers.Text.Utf8Formatter.TryFormat(value, span, out var written);
-        writer.Advance(written);
-    }
-
-    private static void AppendFieldValueUtf8(PooledBufferWriter writer, FieldValue v)
-    {
-        switch (v.Kind)
-        {
-            case FieldKind.Integer:
-                WriteInt64(writer, v.Integer);
-                writer.WriteByte((byte)'i');
-                break;
-            case FieldKind.Float:
-            {
-                // 'G' for double is shortest-round-trippable on .NET (same text ToString()
-                // produces), so WAL replay parses back the identical value.
-                var span = writer.GetSpan(32);
-                System.Buffers.Text.Utf8Formatter.TryFormat(v.Float, span, out var written);
-                writer.Advance(written);
-                break;
-            }
-            case FieldKind.Boolean:
-                writer.WriteBytes(v.Boolean ? "true"u8 : "false"u8);
-                break;
-            case FieldKind.String:
-                writer.WriteByte((byte)'"');
-                WriteUtf8(writer, v.String);
-                writer.WriteByte((byte)'"');
-                break;
-        }
-    }
-
-    private static void AppendLineProtocol(StringBuilder sb, Point p)
-    {
-        sb.Append(p.Measurement);
-        foreach (var tag in p.Tags)
-            sb.Append(',').Append(tag.Key).Append('=').Append(tag.Value);
-
-        sb.Append(' ');
-        var first = true;
-        foreach (var field in p.Fields)
-        {
-            if (!first) sb.Append(',');
-            first = false;
-            sb.Append(field.Key).Append('=');
-            AppendFieldValue(sb, field.Value);
-        }
-        sb.Append(' ').Append(p.TimestampNs).Append('\n');
-    }
-
-    private static void AppendFieldValue(StringBuilder sb, FieldValue v)
-    {
-        switch (v.Kind)
-        {
-            case FieldKind.Integer:
-                sb.Append(v.Integer).Append('i');
-                break;
-            case FieldKind.Float:
-                sb.Append(v.Float.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                break;
-            case FieldKind.Boolean:
-                sb.Append(v.Boolean ? "true" : "false");
-                break;
-            case FieldKind.String:
-                sb.Append('"').Append(v.String).Append('"');
-                break;
-        }
     }
 
     private void RotateLocked()
@@ -545,36 +562,150 @@ public sealed class WalManager : IDisposable
             if (fs.Length - fs.Position < 8) break;
             var length = br.ReadInt32();
             var expectedCrc = br.ReadUInt32();
-            if (fs.Length - fs.Position < length) break;
+            if (length < 0 || fs.Length - fs.Position < length) break;
 
             var payload = br.ReadBytes(length);
             var actualCrc = Crc32.Compute(payload);
             if (actualCrc != expectedCrc)
-                break; // Stop reading this file on CRC mismatch (common after crash: partial last write). Keep already-parsed records.
+                break; // CRC mismatch: torn/corrupt record, stop at the last safe record.
 
-            var line = Encoding.UTF8.GetString(payload).TrimEnd('\n');
-            if (string.IsNullOrEmpty(line)) continue;
+            if (payload.Length == 0) continue;
 
-            var parts = line.Split('\t', 3);
-            if (parts.Length < 3) continue;
-
-            var db = parts[0];
-            var rp = parts[1];
-            var lineProtocol = parts[2];
-
+            var position = new WalPosition(fileId, recordStart);
             try
             {
-                var points = LineProtocolParser.ParseMany(lineProtocol, TimestampPrecision.Parse("ns"));
-                var position = new WalPosition(fileId, recordStart);
-                foreach (var point in points)
-                    result.Add(new WalReplayPoint(db, rp, point, position));
+                var magic = payload[0];
+                if (magic == BinaryMagicV1)
+                {
+                    var (db, rp, points) = DecodeBinaryPayload(payload);
+                    foreach (var point in points)
+                        result.Add(new WalReplayPoint(db, rp, point, position));
+                }
+                else if (magic >= 0x20 || magic == (byte)'\t')
+                {
+                    // Legacy text payload: "db\trp\tline-protocol\n"
+                    var line = Encoding.UTF8.GetString(payload).TrimEnd('\n');
+                    if (string.IsNullOrEmpty(line)) continue;
+                    var parts = line.Split('\t', 3);
+                    if (parts.Length < 3) continue;
+                    var points = LineProtocolParser.ParseMany(parts[2], TimestampPrecision.Parse("ns"));
+                    foreach (var point in points)
+                        result.Add(new WalReplayPoint(parts[0], parts[1], point, position));
+                }
+                else
+                {
+                    // Unknown payload version: stop to avoid misinterpreting future formats.
+                    break;
+                }
             }
             catch
             {
-                // Skip malformed records during replay
+                // A frame-valid but unparseable payload is treated like corruption: stop this
+                // file rather than skip, because skipping could silently drop later records.
+                break;
             }
         }
         return result;
+    }
+
+    private static (string Db, string Rp, List<Point> Points) DecodeBinaryPayload(byte[] payload)
+    {
+        var span = payload.AsSpan();
+        var pos = 1; // skip magic byte
+        var db = ReadString16(span, ref pos);
+        var rp = ReadString16(span, ref pos);
+        var seriesCount = ReadUInt16(span, ref pos);
+
+        var series = new (string Measurement, string[] TagKeys, string[] TagVals, string[] FieldNames, FieldKind[] Kinds)[seriesCount];
+        for (var s = 0; s < seriesCount; s++)
+        {
+            var meas = ReadString16(span, ref pos);
+            var tagCount = span[pos++];
+            var tk = new string[tagCount]; var tv = new string[tagCount];
+            for (var t = 0; t < tagCount; t++) { tk[t] = ReadString16(span, ref pos); tv[t] = ReadString16(span, ref pos); }
+            var fcount = span[pos++];
+            var fn = new string[fcount]; var fk = new FieldKind[fcount];
+            for (var f = 0; f < fcount; f++) { fn[f] = ReadString16(span, ref pos); fk[f] = (FieldKind)span[pos++]; }
+            series[s] = (meas, tk, tv, fn, fk);
+        }
+
+        var pointCount = ReadUInt32(span, ref pos);
+        var points = new List<Point>((int)pointCount);
+        for (var i = 0; i < pointCount; i++)
+        {
+            var sidx = ReadUInt16(span, ref pos);
+            if (sidx >= series.Length) throw new InvalidDataException("series index out of range");
+            var ts = ReadVarintZigzag(span, ref pos);
+            var s = series[sidx];
+            var maskBytes = (s.FieldNames.Length + 7) / 8;
+            if (pos + maskBytes > span.Length) throw new InvalidDataException("payload truncated at field mask");
+            var mask = span.Slice(pos, maskBytes);
+            pos += maskBytes;
+            var tags = new Dictionary<string, string>(s.TagKeys.Length);
+            for (var t = 0; t < s.TagKeys.Length; t++) tags[s.TagKeys[t]] = s.TagVals[t];
+            var fields = new Dictionary<string, FieldValue>(s.FieldNames.Length);
+            for (var f = 0; f < s.FieldNames.Length; f++)
+            {
+                if ((mask[f >> 3] & (1 << (f & 7))) == 0) continue;
+                FieldValue fv = s.Kinds[f] switch
+                {
+                    FieldKind.Float => FieldValue.FromDouble(ReadDouble(span, ref pos)),
+                    FieldKind.Integer => FieldValue.FromInteger(ReadVarintZigzag(span, ref pos)),
+                    FieldKind.Boolean => FieldValue.FromBoolean(span[pos++] == 1),
+                    FieldKind.String => FieldValue.FromString(ReadString16(span, ref pos)),
+                    _ => throw new InvalidDataException($"unknown field kind {(byte)s.Kinds[f]}")
+                };
+                fields[s.FieldNames[f]] = fv;
+            }
+            points.Add(new Point { Measurement = s.Measurement, Tags = tags, Fields = fields, TimestampNs = ts });
+        }
+        return (db, rp, points);
+    }
+
+    private static ushort ReadUInt16(ReadOnlySpan<byte> span, ref int pos)
+    {
+        if (pos + 2 > span.Length) throw new InvalidDataException("payload truncated at u16");
+        var v = BinaryPrimitives.ReadUInt16LittleEndian(span[pos..]);
+        pos += 2;
+        return v;
+    }
+
+    private static uint ReadUInt32(ReadOnlySpan<byte> span, ref int pos)
+    {
+        if (pos + 4 > span.Length) throw new InvalidDataException("payload truncated at u32");
+        var v = BinaryPrimitives.ReadUInt32LittleEndian(span[pos..]);
+        pos += 4;
+        return v;
+    }
+
+    private static double ReadDouble(ReadOnlySpan<byte> span, ref int pos)
+    {
+        if (pos + 8 > span.Length) throw new InvalidDataException("payload truncated at f64");
+        var v = BinaryPrimitives.ReadDoubleLittleEndian(span[pos..]);
+        pos += 8;
+        return v;
+    }
+
+    private static string ReadString16(ReadOnlySpan<byte> span, ref int pos)
+    {
+        var len = ReadUInt16(span, ref pos);
+        if (pos + len > span.Length) throw new InvalidDataException("payload truncated at string");
+        var s = Encoding.UTF8.GetString(span.Slice(pos, len));
+        pos += len;
+        return s;
+    }
+
+    private static long ReadVarintZigzag(ReadOnlySpan<byte> span, ref int pos)
+    {
+        ulong result = 0; int shift = 0; byte b;
+        do
+        {
+            if (pos >= span.Length) throw new InvalidDataException("payload truncated at varint");
+            b = span[pos++];
+            result |= (ulong)(b & 0x7f) << shift;
+            shift += 7;
+        } while ((b & 0x80) != 0);
+        return (long)((result >> 1) ^ (~(result & 1) + 1));
     }
 
     private static int Compare(WalPosition left, WalPosition right)
