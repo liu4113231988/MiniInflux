@@ -98,6 +98,39 @@ public class AggregationTests : IDisposable
     }
 
     [Fact]
+    public async Task Histogram_ReturnsCountOfValuesAtOrBelowUpperBound()
+    {
+        // Seed values are 1..10; values <= 5 are {1,2,3,4,5} => 5.
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT histogram(value, 5) FROM cpu");
+        Assert.Null(result.Results[0].Error);
+        var row = Assert.Single(result.Results[0].Series![0].Values);
+        Assert.Equal(5L, Convert.ToInt64(row[1]));
+    }
+
+    [Fact]
+    public async Task Histogram_WithUpperBoundAboveAllValues_ReturnsTotalCount()
+    {
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT histogram(value, 100) FROM cpu");
+        Assert.Null(result.Results[0].Error);
+        var row = Assert.Single(result.Results[0].Series![0].Values);
+        Assert.Equal(10L, Convert.ToInt64(row[1]));
+    }
+
+    [Fact]
+    public async Task HoltWinters_WithEnoughSeasons_ReturnsRequestedForecastCount()
+    {
+        // 10 points, season length 4 => at least two full seasons; request 3 predictions.
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT holt_winters(value, 3, 4) FROM cpu");
+        Assert.Null(result.Results[0].Error);
+        var values = result.Results[0].Series![0].Values;
+        Assert.Equal(3, values.Count);
+        Assert.All(values, row => Assert.NotNull(row[1]));
+    }
+
+    [Fact]
     public async Task CountStar_ReturnsPointCount()
     {
         _engine.FlushAll();

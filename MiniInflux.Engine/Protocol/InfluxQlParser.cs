@@ -18,7 +18,7 @@ public enum TagOp { Eq, Neq, Regex, NotRegex }
 public enum FieldOp { Gt, Gte, Lt, Lte, Eq, Neq }
 public enum FillMode { None, Null, Zero, Previous, Linear, Number }
 
-public sealed record SelectItem(string Func, string Field, string Alias, double Param = 0, long? UnitNs = null)
+public sealed record SelectItem(string Func, string Field, string Alias, double Param = 0, long? UnitNs = null, double Param2 = 0)
 {
     public bool IsDistinct { get; init; }
     public bool IsCountDistinct { get; init; }
@@ -1010,10 +1010,7 @@ public static class InfluxQlParser
                 var f = x[..p].Trim().ToLowerInvariant();
                 var inner = x[(p + 1)..^1].Trim();
 
-                // These functions are not implemented; fail the query instead of returning a
-                // silently empty/null column.
-                if (f is "holt_winters" or "holt_winters_with_monthly" or "histogram")
-                    throw new NotSupportedException($"{f.ToUpperInvariant()} is not supported");
+                // Holt-Winters / histogram are implemented below; no longer rejected here.
 
                 // Handle COUNT(DISTINCT field)
                 if (f == "count" && inner.StartsWith("DISTINCT ", StringComparison.OrdinalIgnoreCase))
@@ -1035,6 +1032,7 @@ public static class InfluxQlParser
                     throw new NotSupportedException("nested aggregate functions are not supported");
                 var fld2 = Unq(args[0]);
                 double param = 0;
+                double param2 = 0;
                 long? unitNs = null;
                 if (args.Length > 1)
                 {
@@ -1044,9 +1042,15 @@ public static class InfluxQlParser
                     else
                         unitNs = DurationToNs(second);
                 }
+                // Holt-Winters takes a third numeric argument (seasonality period).
+                if (args.Length > 2 && f is "holt_winters" or "holt_winters_with_monthly")
+                {
+                    if (double.TryParse(args[2].Trim(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var m))
+                        param2 = m;
+                }
                 var aliasSuffix = args.Length > 1 ? "_" + args[1].Trim().Replace("\"", "").Replace("'", "") : "";
                 var alias = explicitAlias ?? $"{f}_{fld2}{aliasSuffix}";
-                items.Add(new SelectItem(f, fld2, alias, param, unitNs));
+                items.Add(new SelectItem(f, fld2, alias, param, unitNs, param2));
             }
             else
             {

@@ -321,6 +321,7 @@ public sealed class QueryExecutor
             if (CanStreamRawSelectResponse(e, db, parsed))
             {
                 response = ExecuteStreamingRawSelectResponse(e, db, parsed, report, token);
+                FormatTimeColumns(response.Results[0].Series);
             }
             else
             {
@@ -464,6 +465,7 @@ public sealed class QueryExecutor
                 if (done)
                     yield break;
 
+                FormatTimeColumns(current!.Results[0].Series);
                 yield return current!;
             }
         }
@@ -577,7 +579,7 @@ public sealed class QueryExecutor
             QueryKind.DropSeries => DropSeriesResult(e, db, q),
             QueryKind.DropShard => DropShard(e, q),
             QueryKind.Delete => DeleteResult(e, db, q),
-            QueryKind.Select => Select(e, db, q, cancellationToken, report, depth),
+            QueryKind.Select => FormatTimeColumns(Select(e, db, q, cancellationToken, report, depth)),
             QueryKind.Explain => ExplainQuery(e, db, q, cancellationToken, report),
             QueryKind.ShowQueries => ShowQueries(),
             QueryKind.KillQuery => KillQueryResult(q),
@@ -1286,7 +1288,7 @@ public sealed class QueryExecutor
         foreach (var p in pts)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var row = new List<object?>(rowCapacity) { Time(p.TimestampNs) };
+            var row = new List<object?>(rowCapacity) { p.TimestampNs };
             foreach (var t in tags)
                 row.Add(p.Tags.TryGetValue(t, out var v)
                     ? v
@@ -1381,7 +1383,7 @@ public sealed class QueryExecutor
                     cancellationToken.ThrowIfCancellationRequested();
                     inputBytes += EstimatePointBytes(point);
                     scanned++;
-                    var row = new List<object?>(columns.Count) { Time(point.TimestampNs) };
+                    var row = new List<object?>(columns.Count) { point.TimestampNs };
                     foreach (var tag in tagKeys)
                         row.Add(point.Tags.TryGetValue(tag, out var value) ? value : null);
                     foreach (var field in fields)
@@ -1415,7 +1417,7 @@ public sealed class QueryExecutor
                         scanned++;
                         pointsMaterialized++;
                         inputBytes += EstimatePointBytes(point);
-                        var row = new List<object?>(columns.Count) { Time(point.TimestampNs) };
+                        var row = new List<object?>(columns.Count) { point.TimestampNs };
                         foreach (var tag in tagKeys)
                             row.Add(tags.TryGetValue(tag, out var value) ? value : null);
                         foreach (var field in fields)
@@ -1431,7 +1433,7 @@ public sealed class QueryExecutor
                 for (var i = 0; i < read.Timestamps.Count; i++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    var row = new List<object?>(columns.Count) { Time(read.Timestamps[i]) };
+                    var row = new List<object?>(columns.Count) { read.Timestamps[i] };
                     foreach (var tag in tagKeys)
                         row.Add(tags.TryGetValue(tag, out var value) ? value : null);
                     foreach (var value in read.Rows[i])
@@ -1613,7 +1615,7 @@ public sealed class QueryExecutor
                 seriesMap[seriesKey] = series;
             }
 
-            var row = new List<object?> { Time(key.BucketTime ?? group.MaxTime) };
+            var row = new List<object?> { key.BucketTime ?? group.MaxTime };
             for (var i = 0; i < items.Count; i++)
                 row.Add(group.States[i].Value(items[i].Func));
             series.Values.Add(row);
@@ -1756,7 +1758,7 @@ public sealed class QueryExecutor
             var skipped = 0;
             foreach (var point in ordered)
             {
-                var row = new List<object?>(columns.Count) { Time(point.TimestampNs) };
+                var row = new List<object?>(columns.Count) { point.TimestampNs };
                 foreach (var field in fields)
                     row.Add(point.Fields.TryGetValue(field, out var value) ? value.ToObject() : null);
 
@@ -2081,7 +2083,7 @@ public sealed class QueryExecutor
 
         if (!items.Any(IsRowExpandingGroupFunction))
         {
-            var row = new List<object?> { Time(bucketTimeNs ?? 0) };
+            var row = new List<object?> { bucketTimeNs ?? 0L };
             foreach (var it in items)
             {
                 var pairs = PairsFor(it.Field);
@@ -2115,8 +2117,8 @@ public sealed class QueryExecutor
         var allTimes = timelines.SelectMany(t => t.Keys).Distinct().Order().ToList();
         if (allTimes.Count == 0)
         {
-            var fallbackTime = bucketTimeNs ?? 0;
-            var row = new List<object?> { Time(fallbackTime) };
+            var fallbackTime = bucketTimeNs ?? 0L;
+            var row = new List<object?> { fallbackTime };
             foreach (var timeline in timelines)
                 row.Add(timeline.TryGetValue(fallbackTime, out var value) ? value : null);
             return [row];
@@ -2126,7 +2128,7 @@ public sealed class QueryExecutor
         foreach (var time in allTimes)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var row = new List<object?> { Time(time) };
+            var row = new List<object?> { time };
             foreach (var timeline in timelines)
                 row.Add(timeline.TryGetValue(time, out var value) ? value : null);
             rows.Add(row);
@@ -2269,7 +2271,7 @@ public sealed class QueryExecutor
         {
             Name = "result",
             Columns = ["time", "written"],
-            Values = [new List<object?> { Time(0), written }]
+            Values = [new List<object?> { 0L, written }]
         }];
     }
 
@@ -2849,7 +2851,7 @@ public sealed class QueryExecutor
                         continue;
                     }
                 }
-                var row = new List<object?> { Time(t) };
+                var row = new List<object?> { t };
                 for (int i = 0; i < items.Count; i++)
                 {
                     row.Add(q.Fill switch
@@ -3108,7 +3110,7 @@ public sealed class QueryExecutor
             var cols = new List<string> { "time" };
             cols.AddRange(tagKeys);
             cols.AddRange(fieldColumns);
-            var row = new List<object?>(cols.Count) { Time(latest.TimestampNs) };
+            var row = new List<object?>(cols.Count) { latest.TimestampNs };
             foreach (var tag in tagKeys)
                 row.Add(latest.Tags.TryGetValue(tag, out var tagValue) ? tagValue : null);
             foreach (var field in fieldList)
@@ -3128,7 +3130,7 @@ public sealed class QueryExecutor
             var latest = kv.Value.OrderByDescending(p => p.TimestampNs).First();
             var cols = new List<string> { "time" };
             cols.AddRange(fieldColumns);
-            var row = new List<object?>(cols.Count) { Time(latest.TimestampNs) };
+            var row = new List<object?>(cols.Count) { latest.TimestampNs };
             foreach (var field in fieldList) row.Add(latest.Fields.TryGetValue(field, out var fv) ? fv.ToObject() : null);
             result.Add(new QuerySeries { Name = resultMeasurement, Tags = kv.Key.Count > 0 ? kv.Key : null, Columns = cols, Values = [row] });
         }
@@ -3231,7 +3233,7 @@ public sealed class QueryExecutor
         foreach (var time in allTimes)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var row = new List<object?> { Time(time) };
+            var row = new List<object?> { time };
             foreach (var timeline in timelines)
                 row.Add(timeline.TryGetValue(time, out var value) ? value : null);
             rows.Add(row);
@@ -3367,6 +3369,10 @@ public sealed class QueryExecutor
                 var elapsedUnitNs = item.UnitNs ?? 1_000_000_000L;
                 for (int i = 1; i < values.Count; i++) result[values[i].TimestampNs] = (values[i].TimestampNs - values[i - 1].TimestampNs) / (double)elapsedUnitNs;
                 break;
+            case "holt_winters":
+            case "holt_winters_with_monthly":
+                CalcHoltWinters(values, (int)item.Param, Math.Max(2, (int)item.Param2), result);
+                break;
             default:
                 var pairs = BuildValuePairs(pts, item.Field);
                 result[values[^1].TimestampNs] = Calc(pairs.Select(p => p.Value).ToList(), item.Func, item.Param, pairs.Select(p => p.TimestampNs).ToList(), item.UnitNs, item.IsCountDistinct);
@@ -3415,8 +3421,74 @@ public sealed class QueryExecutor
             "cumulative_sum" => nums.Count == 0 ? null : nums.Sum(),
             "moving_average" => nums.Count == 0 ? null : nums.Average(),
             "integral" => timestamps == null ? null : CalcIntegral(timestamps, nums, effectiveUnitNs),
+            "histogram" => nums.Count == 0 ? 0L : (long)nums.Count(v => v <= param),
             _ => null
         };
+    }
+
+    /// <summary>
+    /// Holt-Winters multiplicative forecasting. Produces <paramref name="predictions"/> future
+    /// values at timestamps continuing from the last input point, spaced by the average interval.
+    /// Falls back to a naive last-value forecast when there are fewer than two full seasons.
+    /// </summary>
+    static void CalcHoltWinters(List<(long TimestampNs, double Value)> values, int predictions, int seasonLength, SortedDictionary<long, object?> result)
+    {
+        if (values.Count == 0 || predictions <= 0) return;
+        var m = Math.Max(2, Math.Min(seasonLength, values.Count));
+        var ys = values.Select(v => v.Value).ToArray();
+        var n = ys.Length;
+
+        // Average interval between consecutive points, used to space the forecast timestamps.
+        long intervalNs = 0;
+        if (n >= 2)
+        {
+            long total = 0;
+            for (var i = 1; i < n; i++) total += values[i].TimestampNs - values[i - 1].TimestampNs;
+            intervalNs = total / (n - 1);
+        }
+        if (intervalNs <= 0) intervalNs = 1_000_000_000L;
+        var lastTs = values[^1].TimestampNs;
+
+        // Need at least two full seasons to initialize the seasonal components.
+        if (n < 2 * m)
+        {
+            // Naive fallback: repeat the last value.
+            for (var h = 1; h <= predictions; h++)
+                result[lastTs + h * intervalNs] = ys[^1];
+            return;
+        }
+
+        // Initial level = average of the first season.
+        var level = 0.0;
+        for (var i = 0; i < m; i++) level += ys[i];
+        level /= m;
+
+        // Initial trend = (avg second season - avg first season) / m.
+        var season2 = 0.0;
+        for (var i = m; i < 2 * m; i++) season2 += ys[i];
+        season2 /= m;
+        var trend = (season2 - level) / m;
+
+        // Initial seasonal indices (multiplicative).
+        var seasonal = new double[m];
+        for (var i = 0; i < m; i++) seasonal[i] = ys[i] / (level != 0 ? level : 1.0);
+
+        const double alpha = 0.4, beta = 0.1, gamma = 0.3;
+        for (var t = m; t < n; t++)
+        {
+            var prevLevel = level;
+            var sIdx = t % m;
+            level = alpha * (ys[t] / seasonal[sIdx]) + (1 - alpha) * (prevLevel + trend);
+            trend = beta * (level - prevLevel) + (1 - beta) * trend;
+            seasonal[sIdx] = gamma * (ys[t] / level) + (1 - gamma) * seasonal[sIdx];
+        }
+
+        for (var h = 1; h <= predictions; h++)
+        {
+            var sIdx = (n - m + (h - 1)) % m;
+            var forecast = (level + h * trend) * seasonal[sIdx];
+            result[lastTs + h * intervalNs] = forecast;
+        }
     }
 
     static double StdDev(List<double> nums)
@@ -3616,7 +3688,7 @@ public sealed class QueryExecutor
         var items = q.Select.Where(s => s.Func != "").ToList();
         if (items.Count == 0) return null;
         if (items.Any(item => item.IsCountDistinct)) return null;
-        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt" or "exp" or "log" or "log2" or "ln" or "sin" or "cos" or "tan" or "atan2"))
+        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt" or "exp" or "log" or "log2" or "ln" or "sin" or "cos" or "tan" or "atan2" or "holt_winters" or "holt_winters_with_monthly" or "histogram"))
             return null;
         if (q.FieldFilters.Count > 0) return null;
 
@@ -3644,7 +3716,7 @@ public sealed class QueryExecutor
             report.ScannedPoints += metas.Sum(m => (long)m.PointCount);
         }
 
-        var row = new List<object?> { Time(MaxTime(metas, dedupedBufferPoints)) };
+        var row = new List<object?> { MaxTime(metas, dedupedBufferPoints) };
         foreach (var item in aggregateItems)
         {
             var relevantMetas = metas.Where(m => m.Field == item.Field).ToList();
@@ -3702,7 +3774,7 @@ public sealed class QueryExecutor
         report.ScannedPoints += countResult.ScannedPoints;
         report.UsedAggregatePushdown = true;
 
-        var row = new List<object?> { Time(countResult.MaxTimestampNs) };
+        var row = new List<object?> { countResult.MaxTimestampNs };
         foreach (var item in aggregateItems)
             row.Add(countResult.FieldCounts.TryGetValue(item.Field, out var count) ? (object?)count : 0L);
 
@@ -3734,7 +3806,7 @@ public sealed class QueryExecutor
             return null;
         if (items.Any(item => item.IsCountDistinct))
             return null;
-        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt" or "exp" or "log" or "log2" or "ln" or "sin" or "cos" or "tan" or "atan2"))
+        if (items.Any(i => i.Func is "difference" or "non_negative_difference" or "derivative" or "non_negative_derivative" or "moving_average" or "cumulative_sum" or "elapsed" or "top" or "bottom" or "sample" or "integral" or "percentile" or "median" or "stddev" or "spread" or "first" or "last" or "mode" or "abs" or "ceil" or "floor" or "round" or "sqrt" or "exp" or "log" or "log2" or "ln" or "sin" or "cos" or "tan" or "atan2" or "holt_winters" or "holt_winters_with_monthly" or "histogram"))
             return null;
         if (q.FieldFilters.Count > 0)
             return null;
@@ -3795,7 +3867,7 @@ public sealed class QueryExecutor
             groupMetas ??= [];
             groupBufferPoints ??= [];
 
-            var row = new List<object?> { Time(MaxTime(groupMetas, groupBufferPoints)) };
+            var row = new List<object?> { MaxTime(groupMetas, groupBufferPoints) };
             foreach (var item in aggregateItems)
             {
                 var relevantMetas = groupMetas.Where(m => m.Field == item.Field).ToList();
@@ -4490,7 +4562,7 @@ public sealed class QueryExecutor
 
     static List<object?> BuildRawRow(Point point, List<string> tags, List<string> fields)
     {
-        var row = new List<object?>(1 + tags.Count + fields.Count) { Time(point.TimestampNs) };
+        var row = new List<object?>(1 + tags.Count + fields.Count) { point.TimestampNs };
         foreach (var tag in tags)
             row.Add(point.Tags.TryGetValue(tag, out var value)
                 ? value
@@ -4644,6 +4716,27 @@ public sealed class QueryExecutor
     {
         var (quotient, _) = FloorDivRem(timestampNs - offset, step);
         return quotient * step + offset;
+    }
+
+    /// <summary>
+    /// Converts in-row time values from long nanoseconds to RFC3339 strings for the final
+    /// response. Internal processing (sort, fill, merge) keeps timestamps as long ns to avoid
+    /// the RFC3339 parse/format round-trip; this runs once after the series list is finalized.
+    /// </summary>
+    static List<QuerySeries>? FormatTimeColumns(List<QuerySeries>? series)
+    {
+        if (series == null) return null;
+        foreach (var s in series)
+        {
+            if (s.Columns.Count == 0 || !string.Equals(s.Columns[0], "time", StringComparison.OrdinalIgnoreCase))
+                continue;
+            foreach (var row in s.Values)
+            {
+                if (row.Count > 0 && row[0] is long ns)
+                    row[0] = Time(ns);
+            }
+        }
+        return series;
     }
 
     static string Time(long ns)

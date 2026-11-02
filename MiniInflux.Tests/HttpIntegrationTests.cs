@@ -132,6 +132,34 @@ public sealed class HttpIntegrationTests : IClassFixture<MiniInfluxAppFactory>
         return content;
     }
 
+    [Fact]
+    public async Task DebugVars_ReturnsFlatNumericJson()
+    {
+        using var client = _factory.CreateClient();
+        using var response = await client.GetAsync("/debug/vars");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        Assert.Equal(JsonValueKind.Object, root.ValueKind);
+        Assert.True(root.TryGetProperty("write_points_total", out _));
+        Assert.True(root.TryGetProperty("query_total", out _));
+        Assert.True(root.TryGetProperty("memory_buffer_points", out _));
+    }
+
+    [Fact]
+    public async Task DebugRequests_ReturnsArrayOfInFlightRequests()
+    {
+        using var client = _factory.CreateClient();
+        using var response = await client.GetAsync("/debug/requests");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(body);
+        Assert.Equal(JsonValueKind.Array, doc.RootElement.ValueKind);
+    }
+
     private sealed class UnknownLengthContent(string payload) : HttpContent
     {
         protected override Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context) =>

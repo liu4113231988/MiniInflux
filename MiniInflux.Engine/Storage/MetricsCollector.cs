@@ -107,6 +107,58 @@ public sealed class MetricsCollector
     public long CompactionCount => Interlocked.Read(ref _compactionCount);
 
     /// <summary>
+    /// Flat counters/gauges for the /debug/vars endpoint (expvar-style).
+    /// Kept numeric so the payload stays AOT-friendly (Dictionary&lt;string, long&gt;).
+    /// </summary>
+    public Dictionary<string, long> CollectVars()
+    {
+        var stats = CollectStats();
+        return new Dictionary<string, long>(StringComparer.Ordinal)
+        {
+            ["write_points_total"] = stats.WritePointsTotal,
+            ["query_total"] = stats.QueryTotal,
+            ["query_errors_total"] = stats.QueryErrorTotal,
+            ["query_timeouts_total"] = stats.QueryTimeoutTotal,
+            ["query_rows_returned_total"] = stats.QueryRowsReturnedTotal,
+            ["query_scanned_points_total"] = stats.QueryScannedPointsTotal,
+            ["query_estimated_input_bytes_total"] = stats.QueryEstimatedInputBytesTotal,
+            ["query_estimated_result_bytes_total"] = stats.QueryEstimatedResultBytesTotal,
+            ["last_query_estimated_peak_bytes"] = stats.LastQueryEstimatedPeakBytes,
+            ["continuous_query_runs_total"] = stats.ContinuousQueryRunsTotal,
+            ["continuous_query_errors_total"] = stats.ContinuousQueryErrorsTotal,
+            ["continuous_query_buckets_total"] = stats.ContinuousQueryBucketsTotal,
+            ["continuous_query_recompute_buckets_total"] = stats.ContinuousQueryRecomputeBucketsTotal,
+            ["last_continuous_query_duration_ms"] = stats.LastContinuousQueryDurationMs,
+            ["segment_files"] = stats.SegmentCount,
+            ["compaction_running"] = stats.CompactionRunning ? 1 : 0,
+            ["compaction_total"] = stats.CompactionCount,
+            ["compaction_tasks_total"] = stats.CompactionTasksTotal,
+            ["compaction_segments_merged_total"] = stats.CompactionSegmentsMergedTotal,
+            ["compaction_queued_tasks"] = stats.CompactionQueuedTasks,
+            ["compaction_backlog_tasks"] = stats.CompactionBacklogTasks,
+            ["compaction_backlog_bytes"] = stats.CompactionBacklogBytes,
+            ["compaction_input_bytes_total"] = stats.CompactionInputBytesTotal,
+            ["compaction_output_bytes_total"] = stats.CompactionOutputBytesTotal,
+            ["compaction_duration_ms_total"] = stats.CompactionDurationMsTotal,
+            ["memory_buffer_points"] = stats.MemoryBufferPoints,
+            ["memory_buffer_bytes"] = stats.MemoryBufferBytes,
+            ["flush_snapshot_points"] = stats.FlushSnapshotPoints,
+            ["flush_snapshot_bytes"] = stats.FlushSnapshotBytes,
+            ["write_queue_pending_requests"] = stats.WriteQueuePendingRequests,
+            ["write_queue_queued_points"] = stats.WriteQueueQueuedPoints,
+            ["write_queue_queued_bytes"] = stats.WriteQueueQueuedBytes,
+            ["quarantined_segments"] = stats.QuarantinedSegments,
+            ["gc_collection_count_gen0"] = stats.Gc?.CollectionCountGen0 ?? 0,
+            ["gc_collection_count_gen1"] = stats.Gc?.CollectionCountGen1 ?? 0,
+            ["gc_collection_count_gen2"] = stats.Gc?.CollectionCountGen2 ?? 0,
+            ["gc_heap_size_bytes"] = stats.Gc?.HeapSizeBytes ?? 0,
+            ["gc_committed_bytes"] = stats.Gc?.TotalCommittedBytes ?? 0,
+            ["gc_working_set_bytes"] = stats.Gc?.WorkingSetBytes ?? 0,
+            ["gc_pause_duration_ms_total"] = (long)(stats.Gc?.PauseDurationMsTotal ?? 0)
+        };
+    }
+
+    /// <summary>
     /// Collect all stats for /debug/stats endpoint.
     /// </summary>
     public DebugStats CollectStats()

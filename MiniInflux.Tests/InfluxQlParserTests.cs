@@ -170,13 +170,11 @@ public class InfluxQlParserTests
             InfluxQlParser.Parse("SELECT value FROM /cpu.*/"));
     }
 
-    [Theory]
-    [InlineData("SELECT holt_winters(mean(value), 4) FROM cpu GROUP BY time(1h)")]
-    [InlineData("SELECT holt_winters_with_monthly(value, 4) FROM cpu GROUP BY time(1h)")]
-    [InlineData("SELECT histogram(value, 10) FROM cpu GROUP BY time(1h)")]
-    public void Parse_UnsupportedFunction_ThrowsNotSupported(string query)
+    [Fact]
+    public void Parse_NestedAggregateFunction_ThrowsNotSupported()
     {
-        Assert.Throws<NotSupportedException>(() => InfluxQlParser.Parse(query));
+        Assert.Throws<NotSupportedException>(() =>
+            InfluxQlParser.Parse("SELECT holt_winters(mean(value), 4) FROM cpu GROUP BY time(1h)"));
     }
 
     [Fact]

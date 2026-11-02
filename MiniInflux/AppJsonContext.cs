@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using MiniInflux.Net10;
 using MiniInflux.Net10.Query;
 using MiniInflux.Net10.Storage;
 
@@ -34,4 +35,5 @@ using MiniInflux.Net10.Storage;
 [JsonSerializable(typeof(Dictionary<string, System.Text.Json.JsonElement>))]
 [JsonSerializable(typeof(Dictionary<string, int>))]
 [JsonSerializable(typeof(Dictionary<string, long>))]
+[JsonSerializable(typeof(List<ActiveRequestSnapshot>))]
 internal partial class AppJsonContext : JsonSerializerContext { }

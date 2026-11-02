@@ -140,6 +140,7 @@ builder.Services.AddSingleton(tokenStore);
 builder.Services.AddSingleton(authenticationGuard);
 builder.Services.AddSingleton(new MetricsCollector(engine, writeQueue, runtimeLoggerFactory.CreateLogger<MetricsCollector>()));
 builder.Services.AddSingleton(new AccessLogWriter(options.Http.AccessLogPath));
+builder.Services.AddSingleton<RequestTracker>();
 builder.Services.AddSingleton<ContinuousQueryRunner>();
 builder.Services.AddHostedService<ContinuousQueryHostedService>();
 
@@ -181,6 +182,23 @@ app.Use(async (context, next) =>
         headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains";
 
     await next();
+});
+
+// In-flight request tracking for /debug/requests. Registered early (after security headers)
+// so every application request is captured; removed in finally so faults never leak entries.
+app.Use(async (context, next) =>
+{
+    var tracker = context.RequestServices.GetRequiredService<RequestTracker>();
+    var id = context.TraceIdentifier;
+    tracker.Start(id, context.Request.Method, context.Request.Path);
+    try
+    {
+        await next();
+    }
+    finally
+    {
+        tracker.End(id);
+    }
 });
 
 if (options.Http.LogEnabled)
@@ -318,6 +336,22 @@ app.MapGet("/debug/stats", (HttpRequest request, MetricsCollector metrics) =>
         return authResult;
     var stats = metrics.CollectStats();
     return Results.Json(stats, AppJsonContext.Default.DebugStats);
+});
+
+app.MapGet("/debug/vars", (HttpRequest request, MetricsCollector metrics) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
+        return authResult;
+    var vars = metrics.CollectVars();
+    return Results.Json(vars, AppJsonContext.Default.DictionaryStringInt64);
+});
+
+app.MapGet("/debug/requests", (HttpRequest request, RequestTracker tracker) =>
+{
+    if (!EnsureAuthorized(request, options, authenticationGuard, runtimeLogger, out var authResult, requiredPermission: "read"))
+        return authResult;
+    var active = tracker.GetActive();
+    return Results.Json(active, AppJsonContext.Default.ListActiveRequestSnapshot);
 });
 
 app.MapGet("/metrics", (HttpRequest request, MetricsCollector metrics) =>
