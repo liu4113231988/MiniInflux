@@ -131,6 +131,44 @@ public class AggregationTests : IDisposable
     }
 
     [Fact]
+    public async Task HoltWinters_ExactlyTwoSeasons_ReturnsForecast()
+    {
+        // 10 points, season length 5 => exactly two full seasons.
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT holt_winters(value, 2, 5) FROM cpu");
+        Assert.Null(result.Results[0].Error);
+        Assert.Equal(2, result.Results[0].Series![0].Values.Count);
+    }
+
+    [Fact]
+    public async Task HoltWinters_OnePointShortOfTwoSeasons_ReturnsEmpty()
+    {
+        // 10 points, season length 6 => need 12, one short => no forecast (no last-value fallback).
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT holt_winters(value, 3, 6) FROM cpu");
+        Assert.Null(result.Results[0].Error);
+        Assert.Equal(0, result.Results[0].Series![0].Values.Count);
+    }
+
+    [Fact]
+    public async Task HoltWinters_SeasonLengthZero_ReturnsEmpty()
+    {
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT holt_winters(value, 3, 0) FROM cpu");
+        Assert.Null(result.Results[0].Error);
+        Assert.Equal(0, result.Results[0].Series![0].Values.Count);
+    }
+
+    [Fact]
+    public async Task HoltWinters_NegativeSeasonLength_ReturnsEmpty()
+    {
+        var result = await _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT holt_winters(value, 3, -1) FROM cpu");
+        Assert.Null(result.Results[0].Error);
+        Assert.Equal(0, result.Results[0].Series![0].Values.Count);
+    }
+
+    [Fact]
     public async Task CountStar_ReturnsPointCount()
     {
         _engine.FlushAll();

@@ -3372,7 +3372,7 @@ public sealed class QueryExecutor
                 break;
             case "holt_winters":
             case "holt_winters_with_monthly":
-                CalcHoltWinters(values, (int)item.Param, Math.Max(2, (int)item.Param2), result);
+                CalcHoltWinters(values, (int)item.Param, (int)item.Param2, result);
                 break;
             default:
                 var pairs = BuildValuePairs(pts, item.Field);
@@ -3430,12 +3430,13 @@ public sealed class QueryExecutor
     /// <summary>
     /// Holt-Winters multiplicative forecasting. Produces <paramref name="predictions"/> future
     /// values at timestamps continuing from the last input point, spaced by the average interval.
-    /// Falls back to a naive last-value forecast when there are fewer than two full seasons.
+    /// Returns an empty result (no forecast) when season_length is invalid or there are fewer
+    /// than two full seasons of data, matching InfluxDB behavior.
     /// </summary>
     static void CalcHoltWinters(List<(long TimestampNs, double Value)> values, int predictions, int seasonLength, SortedDictionary<long, object?> result)
     {
-        if (values.Count == 0 || predictions <= 0) return;
-        var m = Math.Max(2, Math.Min(seasonLength, values.Count));
+        if (values.Count == 0 || predictions <= 0 || seasonLength < 1) return;
+        var m = Math.Min(seasonLength, values.Count);
         var ys = values.Select(v => v.Value).ToArray();
         var n = ys.Length;
 
@@ -3452,12 +3453,7 @@ public sealed class QueryExecutor
 
         // Need at least two full seasons to initialize the seasonal components.
         if (n < 2 * m)
-        {
-            // Naive fallback: repeat the last value.
-            for (var h = 1; h <= predictions; h++)
-                result[lastTs + h * intervalNs] = ys[^1];
             return;
-        }
 
         // Initial level = average of the first season.
         var level = 0.0;
