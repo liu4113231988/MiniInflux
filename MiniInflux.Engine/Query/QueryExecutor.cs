@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -309,13 +310,13 @@ public sealed class QueryExecutor
             ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
             : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var queryId = RegisterActiveQuery(q, db, linkedCts);
-        var previousZone = t_timeZone;
+        var previousZone = t_timeZone.Value;
         try
         {
             var token = linkedCts.Token;
 
             var parsed = ParseAndBind(q, queryParams);
-            t_timeZone = ResolveTimeZone(parsed.GroupByTimeZone);
+            t_timeZone.Value = ResolveTimeZone(parsed.GroupByTimeZone);
             using var segmentRead = parsed.Kind == QueryKind.Select ? e.AcquireSegmentRead(token) : null;
             QueryResponse response;
             if (CanStreamRawSelectResponse(e, db, parsed))
@@ -381,7 +382,7 @@ public sealed class QueryExecutor
         }
         finally
         {
-            t_timeZone = previousZone;
+            t_timeZone.Value = previousZone;
             UnregisterActiveQuery(queryId);
         }
     }
@@ -4676,12 +4677,14 @@ public sealed class QueryExecutor
             throw new InvalidOperationException("missing required parameter db");
     }
 
-    [ThreadStatic]
-    private static Dictionary<(long Ns, string? Zone), string>? _timeCache;
+    // Shared, thread-safe timestamp-format cache. The zone id is part of the key so queries with
+    // different tz() never collide. ConcurrentDictionary avoids the per-thread [ThreadStatic] cache
+    // that lost hits (and risked corruption) when async continuations moved across threads.
+    private static readonly ConcurrentDictionary<(long Ns, string? Zone), string> _timeCache = new();
 
-    /// <summary>Output time zone for the query currently executing on this thread (GROUP BY ... tz()).</summary>
-    [ThreadStatic]
-    private static TimeZoneInfo? t_timeZone;
+    /// <summary>Output time zone for the query currently executing on this async flow (GROUP BY ... tz()).
+    /// AsyncLocal flows across await boundaries (unlike [ThreadStatic]) while staying isolated per query.</summary>
+    private static readonly AsyncLocal<TimeZoneInfo?> t_timeZone = new();
 
     static TimeZoneInfo? ResolveTimeZone(string? id)
     {
@@ -4741,11 +4744,10 @@ public sealed class QueryExecutor
 
     static string Time(long ns)
     {
-        var zone = t_timeZone;
+        var zone = t_timeZone.Value;
         // Cache formatted timestamps — effective for GROUP BY time where many rows share bucket boundaries.
-        var cache = _timeCache ??= new Dictionary<(long, string?), string>(128);
         var key = (ns, zone?.Id);
-        if (cache.TryGetValue(key, out var cached))
+        if (_timeCache.TryGetValue(key, out var cached))
             return cached;
 
         var (seconds, nanos) = FloorDivRem(ns, 1_000_000_000L);
@@ -4762,8 +4764,8 @@ public sealed class QueryExecutor
         }
 
         // Bound cache size to prevent unbounded growth for unique-timestamp queries.
-        if (cache.Count < 4096)
-            cache[key] = result;
+        if (_timeCache.Count < 4096)
+            _timeCache.TryAdd(key, result);
 
         return result;
     }

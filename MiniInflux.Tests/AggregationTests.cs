@@ -259,6 +259,56 @@ public class AggregationTests : IDisposable
     }
 
     [Fact]
+    public async Task GroupByTime_ConcurrentDifferentTimeZones_EachKeepsOwnZone()
+    {
+        // Two queries with different tz() must not cross-contaminate each other's time output.
+        var shanghai = Task.Run(() => _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT mean(value) FROM cpu GROUP BY time(10s) tz('Asia/Shanghai')"));
+        var utc = Task.Run(() => _executor.ExecuteAsync(_engine, "testdb",
+            "SELECT mean(value) FROM cpu GROUP BY time(10s)"));
+
+        var results = await Task.WhenAll(shanghai, utc);
+
+        var shRow = results[0].Results[0].Series![0].Values[0];
+        Assert.Equal("1970-01-01T08:00:00.000000000+08:00", shRow[0]);
+
+        var utcRow = results[1].Results[0].Series![0].Values[0];
+        Assert.Equal("1970-01-01T00:00:00.000000000Z", utcRow[0]);
+    }
+
+    [Fact]
+    public async Task TimeCache_ConcurrentDifferentZonesAndTimestamps_NoCorruption()
+    {
+        // Hammer the shared timestamp cache from many threads with mixed zones; every row must
+        // keep the offset that matches its own query's tz().
+        var zones = new[] { null, "Asia/Shanghai", "America/New_York", "Asia/Tokyo" };
+        var tasks = new List<Task>();
+        for (var i = 0; i < 64; i++)
+        {
+            var zone = zones[i % zones.Length];
+            tasks.Add(Task.Run(() =>
+            {
+                var tzClause = zone is null ? "" : $" tz('{zone}')";
+                var result = _executor.ExecuteAsync(_engine, "testdb",
+                    $"SELECT mean(value) FROM cpu GROUP BY time(10s){tzClause}").GetAwaiter().GetResult();
+                Assert.Null(result.Results[0].Error);
+                var row = result.Results[0].Series![0].Values[0];
+                var expected = zone switch
+                {
+                    null => "1970-01-01T00:00:00.000000000Z",
+                    "Asia/Shanghai" => "1970-01-01T08:00:00.000000000+08:00",
+                    "America/New_York" => "1969-12-31T19:00:00.000000000-05:00",
+                    "Asia/Tokyo" => "1970-01-01T09:00:00.000000000+09:00",
+                    _ => throw new InvalidOperationException()
+                };
+                Assert.Equal(expected, row[0]);
+            }));
+        }
+
+        await Task.WhenAll(tasks);
+    }
+
+    [Fact]
     public async Task Select_RawPointBeforeEpoch_FormatsNegativeTimestamp()
     {
         await _engine.WriteAsync("testdb", "autogen",

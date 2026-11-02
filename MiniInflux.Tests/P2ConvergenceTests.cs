@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Reflection;
 using System.Text;
@@ -34,8 +35,8 @@ public class P2ConvergenceTests : IDisposable
     [Fact]
     public void TimeCache_StaysBounded_AfterManyUniqueTimestamps()
     {
-        // The cache is [ThreadStatic]; run everything on one dedicated thread so the
-        // reflection reads observe the same dictionary the Time() calls populate.
+        // The cache is a shared static ConcurrentDictionary; run on a dedicated thread so the
+        // reflection reads observe the same instance the Time() calls populate.
         Exception? failure = null;
         var thread = new Thread(() =>
         {
@@ -52,7 +53,7 @@ public class P2ConvergenceTests : IDisposable
                 for (long i = 0; i < 6000; i++)
                     timeMethod.Invoke(null, [i * 1_000_000_000L + i]);
 
-                var cache = (Dictionary<(long Ns, string? Zone), string>)cacheField.GetValue(null)!;
+                var cache = (ConcurrentDictionary<(long Ns, string? Zone), string>)cacheField.GetValue(null)!;
                 Assert.True(cache.Count <= 4096,
                     $"_timeCache grew to {cache.Count} entries; expected bounded at 4096");
             }
