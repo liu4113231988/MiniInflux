@@ -13,6 +13,7 @@ using MiniInflux.Net10.Storage;
 [JsonSerializable(typeof(HealthResponse))]
 [JsonSerializable(typeof(RetentionPolicyInfo))]
 [JsonSerializable(typeof(DebugStats))]
+[JsonSerializable(typeof(GcStats))]
 [JsonSerializable(typeof(ContinuousQueryMetrics))]
 [JsonSerializable(typeof(List<ContinuousQueryMetrics>))]
 [JsonSerializable(typeof(AdminSessionResponse))]

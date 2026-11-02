@@ -88,6 +88,11 @@ public sealed class TsdbEngine : IDisposable
     // a concurrent DELETE has already purged from the buffer; tombstone GC uses this floor to avoid
     // retiring coverage for data those snapshots will still write to segments.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _flushSnapshotMinTs = new(StringComparer.Ordinal);
+    // Points/bytes currently held by in-flight async flush snapshots. They stay in the buffer
+    // (and thus in _bufferedPointCount/_bufferedByteCount) until the flush publishes, so these
+    // counters let observability split "active buffer" from "snapshot being encoded".
+    private long _flushSnapshotPointCount;
+    private long _flushSnapshotByteCount;
     private readonly LastValueCache _lastValueCache;
     private Timer? _rpExpiryTimer;
     private Timer? _compactionTimer;
@@ -1831,6 +1836,9 @@ public long GetBufferedByteCount()
 return Interlocked.Read(ref _bufferedByteCount);
 }
 
+public long GetFlushSnapshotPointCount() => Interlocked.Read(ref _flushSnapshotPointCount);
+public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotByteCount);
+
     public LastValueCache LastValueCache => _lastValueCache;
 
     public bool TryGetLastValue(string db, string rp, string measurement, string tagsCanonical, out Point point)
@@ -2926,16 +2934,22 @@ return Interlocked.Read(ref _bufferedByteCount);
         var snapshot = list.ToArray();
         var maxSeq = snapshot[^1].Seq; // seq is assigned in append order, so the last one is max
         long snapshotMinTs = long.MaxValue;
+        long snapshotBytes = 0;
         foreach (var bp in snapshot)
+        {
             if (bp.Point.TimestampNs < snapshotMinTs)
                 snapshotMinTs = bp.Point.TimestampNs;
+            snapshotBytes += EstimateBufferedPointBytes(bp.Point);
+        }
         _flushSnapshotMinTs[key] = snapshotMinTs;
-        _flushInFlight[key] = Task.Run(() => FlushSnapshotAsync(db, rp, key, snapshot, maxSeq));
+        Interlocked.Add(ref _flushSnapshotPointCount, snapshot.Length);
+        Interlocked.Add(ref _flushSnapshotByteCount, snapshotBytes);
+        _flushInFlight[key] = Task.Run(() => FlushSnapshotAsync(db, rp, key, snapshot, maxSeq, snapshotBytes));
     }
 
     private const int AsyncFlushMinPoints = 4096;
 
-    private void FlushSnapshotAsync(string db, string rp, string key, BufferedPoint[] snapshot, long maxSeq)
+    private void FlushSnapshotAsync(string db, string rp, string key, BufferedPoint[] snapshot, long maxSeq, long snapshotBytes)
     {
         try
         {
@@ -2996,8 +3010,8 @@ return Interlocked.Read(ref _bufferedByteCount);
         finally
         {
             _flushInFlight.TryRemove(key, out _);
-            // Snapshot points are either in segments or back in the buffer by now, so the floor
-            // tracking is done either way (the buffer accounts for them after a failed flush).
+            Interlocked.Add(ref _flushSnapshotPointCount, -snapshot.Length);
+            Interlocked.Add(ref _flushSnapshotByteCount, -snapshotBytes);
             _flushSnapshotMinTs.TryRemove(key, out _);
         }
     }

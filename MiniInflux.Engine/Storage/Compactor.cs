@@ -35,6 +35,9 @@ public sealed class Compactor
     private long _totalRuns;
     private long _totalTasks;
     private long _totalSegmentsMerged;
+    private long _totalInputBytes;
+    private long _totalOutputBytes;
+    private long _totalDurationMs;
     private int _running;
     private int _paused;
     private int _queuedTasks;
@@ -72,6 +75,7 @@ public sealed class Compactor
         if (Volatile.Read(ref _paused) == 1) return 0;
         if (!Monitor.TryEnter(_compactionLock)) return 0;
         Interlocked.Exchange(ref _running, 1);
+        var runSw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             // A backup may have paused compaction while this thread waited for the lock.
@@ -117,6 +121,7 @@ public sealed class Compactor
         }
         finally
         {
+            Interlocked.Add(ref _totalDurationMs, runSw.ElapsedMilliseconds);
             Interlocked.Exchange(ref _queuedTasks, 0);
             Interlocked.Exchange(ref _running, 0);
             Monitor.Exit(_compactionLock);
@@ -153,14 +158,32 @@ public sealed class Compactor
     {
         var running = Interlocked.CompareExchange(ref _running, 0, 0) == 1;
         var queued = Interlocked.CompareExchange(ref _queuedTasks, 0, 0);
+        int backlogTasks;
+        long backlogBytes = 0;
+        if (running)
+        {
+            backlogTasks = queued;
+        }
+        else
+        {
+            var tasks = BuildTasks();
+            backlogTasks = tasks.Count;
+            foreach (var t in tasks)
+                foreach (var f in t.Files)
+                    backlogBytes += f.Length;
+        }
         return new CompactionStatsSnapshot
         {
             TotalRuns = Interlocked.Read(ref _totalRuns),
             TotalTasks = Interlocked.Read(ref _totalTasks),
             TotalSegmentsMerged = Interlocked.Read(ref _totalSegmentsMerged),
+            TotalInputBytes = Interlocked.Read(ref _totalInputBytes),
+            TotalOutputBytes = Interlocked.Read(ref _totalOutputBytes),
+            TotalDurationMs = Interlocked.Read(ref _totalDurationMs),
             Running = running,
             QueuedTasks = queued,
-            BacklogTasks = running ? queued : BuildTasks().Count,
+            BacklogTasks = backlogTasks,
+            BacklogBytes = backlogBytes,
             LastRunUtc = _lastRunUtc
         };
     }
@@ -834,8 +857,16 @@ public sealed class Compactor
         foreach (var source in sourceFiles)
             TryDelete(source.Path);
 
+        long inputBytes = 0;
+        foreach (var source in sourceFiles) inputBytes += source.Length;
+        long outputBytes = 0;
+        foreach (var p in mergedPaths)
+            outputBytes += SafeLength(p);
+
         Interlocked.Increment(ref _totalTasks);
         Interlocked.Add(ref _totalSegmentsMerged, sourceFiles.Count);
+        Interlocked.Add(ref _totalInputBytes, inputBytes);
+        Interlocked.Add(ref _totalOutputBytes, outputBytes);
         return true;
     }
 
@@ -979,8 +1010,12 @@ public sealed class CompactionStatsSnapshot
     public long TotalRuns { get; set; }
     public long TotalTasks { get; set; }
     public long TotalSegmentsMerged { get; set; }
+    public long TotalInputBytes { get; set; }
+    public long TotalOutputBytes { get; set; }
+    public long TotalDurationMs { get; set; }
     public bool Running { get; set; }
     public int QueuedTasks { get; set; }
     public int BacklogTasks { get; set; }
+    public long BacklogBytes { get; set; }
     public DateTimeOffset? LastRunUtc { get; set; }
 }

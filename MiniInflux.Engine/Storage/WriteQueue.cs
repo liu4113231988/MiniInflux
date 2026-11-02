@@ -6,24 +6,34 @@ namespace MiniInflux.Net10.Storage;
 /// <summary>
 /// Represents a write request to be processed by the write queue.
 /// </summary>
-public sealed record WriteRequest(string Db, string Rp, List<Point> Points, TaskCompletionSource<bool> Completion);
+public sealed record WriteRequest(
+    string Db, string Rp, List<Point> Points, int PointCount, long EstimatedBytes,
+    TaskCompletionSource<bool> Completion);
 
 /// <summary>
-/// Bounded write queue with backpressure. Uses Channel to limit concurrent writes.
+/// Bounded write queue with backpressure. Uses Channel to limit concurrent writes and optional
+/// point/byte budgets to cap the in-flight memory held by queued (not yet processed) requests.
 /// </summary>
 public sealed class WriteQueue : IDisposable
 {
     private readonly Channel<WriteRequest> _channel;
     private readonly TsdbEngine _engine;
     private readonly int _batchSize;
+    private readonly long _maxQueuedPoints;
+    private readonly long _maxQueuedBytes;
     private readonly Task _worker;
     private readonly CancellationTokenSource _cts = new();
     private long _pendingRequests;
+    private long _queuedPoints;
+    private long _queuedBytes;
 
-    public WriteQueue(TsdbEngine engine, int capacity = 100_000, int batchSize = 10_000)
+    public WriteQueue(TsdbEngine engine, int capacity = 100_000, int batchSize = 10_000,
+        long maxQueuedPoints = 0, long maxQueuedBytes = 0)
     {
         _engine = engine;
         _batchSize = batchSize;
+        _maxQueuedPoints = maxQueuedPoints;
+        _maxQueuedBytes = maxQueuedBytes;
         _channel = Channel.CreateBounded<WriteRequest>(new BoundedChannelOptions(capacity)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -35,11 +45,28 @@ public sealed class WriteQueue : IDisposable
     /// <summary>
     /// Enqueue a write request. Throws ChannelClosedException if the queue is shutting down.
     /// Times out after 5 seconds if the queue is full (backpressure).
+    /// Throws WriteQueueFullException when the configured points/bytes budget would be exceeded.
     /// </summary>
     public async Task<bool> EnqueueAsync(string db, string rp, List<Point> points, CancellationToken ct = default)
     {
+        var pointCount = points.Count;
+        var estimatedBytes = EstimateQueuedBytes(points);
+
+        // Reserve the points/bytes budget before touching the channel so overload is reported
+        // immediately instead of blocking. The budget is released by the worker once processed,
+        // or by this method if the request never reaches the worker.
+        long curPoints = Interlocked.Add(ref _queuedPoints, pointCount);
+        long curBytes = Interlocked.Add(ref _queuedBytes, estimatedBytes);
+        if ((_maxQueuedPoints > 0 && curPoints > _maxQueuedPoints) ||
+            (_maxQueuedBytes > 0 && curBytes > _maxQueuedBytes))
+        {
+            Interlocked.Add(ref _queuedPoints, -pointCount);
+            Interlocked.Add(ref _queuedBytes, -estimatedBytes);
+            throw new WriteQueueFullException("write queue points/bytes limit exceeded; retry later");
+        }
+
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var request = new WriteRequest(db, rp, points, tcs);
+        var request = new WriteRequest(db, rp, points, pointCount, estimatedBytes, tcs);
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
@@ -53,15 +80,21 @@ public sealed class WriteQueue : IDisposable
         }
         catch (OperationCanceledException)
         {
-            // Request never entered the channel — the worker won't process it, so decrement here.
-            // If the request was already enqueued before cancellation, the worker will process it
-            // and decrement _pendingRequests in ProcessBatch's finally block.
+            // If the request never entered the channel the worker won't process it, so release
+            // the budget and pending counter here. If it was already enqueued before cancellation
+            // the worker releases them in ProcessBatch's finally block.
             if (!_channel.Reader.TryPeek(out var peeked) || !ReferenceEquals(peeked, request))
+            {
+                Interlocked.Add(ref _queuedPoints, -pointCount);
+                Interlocked.Add(ref _queuedBytes, -estimatedBytes);
                 Interlocked.Decrement(ref _pendingRequests);
+            }
             throw new WriteQueueFullException("Write queue is full or shutting down");
         }
         catch (ChannelClosedException)
         {
+            Interlocked.Add(ref _queuedPoints, -pointCount);
+            Interlocked.Add(ref _queuedBytes, -estimatedBytes);
             Interlocked.Decrement(ref _pendingRequests);
             throw new WriteQueueFullException("Write queue is shutting down");
         }
@@ -85,8 +118,6 @@ public sealed class WriteQueue : IDisposable
         }
         catch (OperationCanceledException) { /* shutdown: fall through and drain */ }
 
-        // Process remaining items and resolve every completion source; otherwise a caller that
-        // already enqueued a request would await its TCS forever after Dispose cancels the worker.
         try
         {
             while (_channel.Reader.TryRead(out var remaining))
@@ -112,7 +143,6 @@ public sealed class WriteQueue : IDisposable
                 requests = [];
                 grouped[key] = requests;
             }
-
             requests.Add(req);
         }
 
@@ -147,15 +177,49 @@ public sealed class WriteQueue : IDisposable
                 }
             }
         }
-        finally { Interlocked.Add(ref _pendingRequests, -batch.Count); }
+        finally
+        {
+            long points = 0, bytes = 0;
+            foreach (var req in batch)
+            {
+                points += req.PointCount;
+                bytes += req.EstimatedBytes;
+            }
+            Interlocked.Add(ref _queuedPoints, -points);
+            Interlocked.Add(ref _queuedBytes, -bytes);
+            Interlocked.Add(ref _pendingRequests, -batch.Count);
+        }
     }
 
     public long PendingRequests => Math.Max(0, Interlocked.Read(ref _pendingRequests));
+    public long QueuedPoints => Math.Max(0, Interlocked.Read(ref _queuedPoints));
+    public long QueuedBytes => Math.Max(0, Interlocked.Read(ref _queuedBytes));
+
+    private static long EstimateQueuedBytes(List<Point> points)
+    {
+        long size = 0;
+        foreach (var p in points)
+        {
+            long s = 96 + EstimateStringBytes(p.Measurement) + 8;
+            foreach (var tag in p.Tags)
+                s += 32 + EstimateStringBytes(tag.Key) + EstimateStringBytes(tag.Value);
+            foreach (var field in p.Fields)
+                s += 48 + EstimateStringBytes(field.Key) + EstimateFieldValueBytes(field.Value);
+            size += s;
+        }
+        return size;
+    }
+
+    private static long EstimateStringBytes(string? s) => string.IsNullOrEmpty(s) ? 0 : (long)s.Length * 2 + 24;
+    private static long EstimateFieldValueBytes(FieldValue v) => v.Kind switch
+    {
+        FieldKind.String => EstimateStringBytes(v.String),
+        FieldKind.Boolean => 1,
+        _ => 8
+    };
 
     public void Dispose()
     {
-        // Complete the channel first so the worker drains and resolves queued completions; only
-        // cancel afterwards to unblock a worker that is stuck on a slow write.
         _channel.Writer.Complete();
         try { _worker.Wait(TimeSpan.FromSeconds(5)); } catch { /* best effort */ }
         try { _cts.Cancel(); } catch (ObjectDisposedException) { }

@@ -144,14 +144,23 @@ public sealed class MetricsCollector
             CompactionCount = compaction.TotalRuns > 0 ? compaction.TotalRuns : CompactionCount,
             CompactionQueuedTasks = compaction.QueuedTasks,
             CompactionBacklogTasks = compaction.BacklogTasks,
+            CompactionBacklogBytes = compaction.BacklogBytes,
+            CompactionInputBytesTotal = compaction.TotalInputBytes,
+            CompactionOutputBytesTotal = compaction.TotalOutputBytes,
+            CompactionDurationMsTotal = compaction.TotalDurationMs,
             CompactionTasksTotal = compaction.TotalTasks,
             CompactionSegmentsMergedTotal = compaction.TotalSegmentsMerged,
             SeriesCardinality = cardinality,
             MemoryBufferPoints = _engine.GetBufferedPointCount(),
             MemoryBufferBytes = _engine.GetBufferedByteCount(),
+            FlushSnapshotPoints = _engine.GetFlushSnapshotPointCount(),
+            FlushSnapshotBytes = _engine.GetFlushSnapshotByteCount(),
             WriteQueuePendingRequests = _writeQueue?.PendingRequests ?? 0,
+            WriteQueueQueuedPoints = _writeQueue?.QueuedPoints ?? 0,
+            WriteQueueQueuedBytes = _writeQueue?.QueuedBytes ?? 0,
             QueryDurationBuckets = durationBuckets,
-            ContinuousQueryMetrics = GetContinuousQueryMetricsSnapshot()
+            ContinuousQueryMetrics = GetContinuousQueryMetricsSnapshot(),
+            Gc = CollectGcStats()
         };
     }
 
@@ -334,9 +343,59 @@ public sealed class MetricsCollector
         sb.AppendLine("# HELP mini_influx_buffer_bytes Estimated number of bytes in memory buffer.");
         sb.AppendLine("# TYPE mini_influx_buffer_bytes gauge");
         sb.AppendLine($"mini_influx_buffer_bytes {stats.MemoryBufferBytes}");
+        sb.AppendLine("# HELP mini_influx_flush_snapshot_points Points held by in-flight async flush snapshots.");
+        sb.AppendLine("# TYPE mini_influx_flush_snapshot_points gauge");
+        sb.AppendLine($"mini_influx_flush_snapshot_points {stats.FlushSnapshotPoints}");
+        sb.AppendLine("# HELP mini_influx_flush_snapshot_bytes Estimated bytes held by in-flight async flush snapshots.");
+        sb.AppendLine("# TYPE mini_influx_flush_snapshot_bytes gauge");
+        sb.AppendLine($"mini_influx_flush_snapshot_bytes {stats.FlushSnapshotBytes}");
         sb.AppendLine("# HELP mini_influx_write_queue_pending_requests Writes waiting for or running in the queue.");
         sb.AppendLine("# TYPE mini_influx_write_queue_pending_requests gauge");
         sb.AppendLine($"mini_influx_write_queue_pending_requests {stats.WriteQueuePendingRequests}");
+        sb.AppendLine("# HELP mini_influx_write_queue_queued_points Points currently queued (not yet processed).");
+        sb.AppendLine("# TYPE mini_influx_write_queue_queued_points gauge");
+        sb.AppendLine($"mini_influx_write_queue_queued_points {stats.WriteQueueQueuedPoints}");
+        sb.AppendLine("# HELP mini_influx_write_queue_queued_bytes Estimated bytes currently queued (not yet processed).");
+        sb.AppendLine("# TYPE mini_influx_write_queue_queued_bytes gauge");
+        sb.AppendLine($"mini_influx_write_queue_queued_bytes {stats.WriteQueueQueuedBytes}");
+
+        sb.AppendLine("# HELP mini_influx_compaction_input_bytes_total Total bytes read by compaction from source segments.");
+        sb.AppendLine("# TYPE mini_influx_compaction_input_bytes_total counter");
+        sb.AppendLine($"mini_influx_compaction_input_bytes_total {stats.CompactionInputBytesTotal}");
+        sb.AppendLine("# HELP mini_influx_compaction_output_bytes_total Total bytes written by compaction to merged segments.");
+        sb.AppendLine("# TYPE mini_influx_compaction_output_bytes_total counter");
+        sb.AppendLine($"mini_influx_compaction_output_bytes_total {stats.CompactionOutputBytesTotal}");
+        sb.AppendLine("# HELP mini_influx_compaction_duration_ms_total Total time spent in compaction runs.");
+        sb.AppendLine("# TYPE mini_influx_compaction_duration_ms_total counter");
+        sb.AppendLine($"mini_influx_compaction_duration_ms_total {stats.CompactionDurationMsTotal}");
+        sb.AppendLine("# HELP mini_influx_compaction_backlog_bytes Estimated bytes of segments awaiting compaction.");
+        sb.AppendLine("# TYPE mini_influx_compaction_backlog_bytes gauge");
+        sb.AppendLine($"mini_influx_compaction_backlog_bytes {stats.CompactionBacklogBytes}");
+
+        if (stats.Gc is { } gc)
+        {
+            sb.AppendLine("# HELP mini_influx_gc_collection_count_gen0 GC gen-0 collection count.");
+            sb.AppendLine("# TYPE mini_influx_gc_collection_count_gen0 counter");
+            sb.AppendLine($"mini_influx_gc_collection_count_gen0 {gc.CollectionCountGen0}");
+            sb.AppendLine("# HELP mini_influx_gc_collection_count_gen1 GC gen-1 collection count.");
+            sb.AppendLine("# TYPE mini_influx_gc_collection_count_gen1 counter");
+            sb.AppendLine($"mini_influx_gc_collection_count_gen1 {gc.CollectionCountGen1}");
+            sb.AppendLine("# HELP mini_influx_gc_collection_count_gen2 GC gen-2 collection count.");
+            sb.AppendLine("# TYPE mini_influx_gc_collection_count_gen2 counter");
+            sb.AppendLine($"mini_influx_gc_collection_count_gen2 {gc.CollectionCountGen2}");
+            sb.AppendLine("# HELP mini_influx_gc_heap_size_bytes GC managed heap size in bytes.");
+            sb.AppendLine("# TYPE mini_influx_gc_heap_size_bytes gauge");
+            sb.AppendLine($"mini_influx_gc_heap_size_bytes {gc.HeapSizeBytes}");
+            sb.AppendLine("# HELP mini_influx_gc_committed_bytes GC committed memory in bytes.");
+            sb.AppendLine("# TYPE mini_influx_gc_committed_bytes gauge");
+            sb.AppendLine($"mini_influx_gc_committed_bytes {gc.TotalCommittedBytes}");
+            sb.AppendLine("# HELP mini_influx_gc_pause_duration_ms_total Total GC pause duration in milliseconds.");
+            sb.AppendLine("# TYPE mini_influx_gc_pause_duration_ms_total counter");
+            sb.AppendLine($"mini_influx_gc_pause_duration_ms_total {gc.PauseDurationMsTotal:0.###}");
+            sb.AppendLine("# HELP mini_influx_process_working_set_bytes Process working set in bytes.");
+            sb.AppendLine("# TYPE mini_influx_process_working_set_bytes gauge");
+            sb.AppendLine($"mini_influx_process_working_set_bytes {gc.WorkingSetBytes}");
+        }
 
         var health = _engine.Health;
         sb.AppendLine("# HELP mini_influx_storage_write_available Whether the WAL-backed write path is available.");
@@ -361,6 +420,25 @@ public sealed class MetricsCollector
     {
         var root = Path.GetPathRoot(Path.GetFullPath(_engine.RootPath));
         return string.IsNullOrWhiteSpace(root) ? 0 : new DriveInfo(root).AvailableFreeSpace;
+    }
+
+    private static GcStats CollectGcStats()
+    {
+        var mem = GC.GetGCMemoryInfo();
+        double pauseMs = 0;
+        foreach (var t in mem.PauseDurations) pauseMs += t.TotalMilliseconds;
+        var proc = System.Diagnostics.Process.GetCurrentProcess();
+        return new GcStats
+        {
+            CollectionCountGen0 = GC.CollectionCount(0),
+            CollectionCountGen1 = GC.CollectionCount(1),
+            CollectionCountGen2 = GC.CollectionCount(2),
+            TotalCommittedBytes = mem.TotalCommittedBytes,
+            HeapSizeBytes = mem.HeapSizeBytes,
+            PauseDurationMsTotal = pauseMs,
+            WorkingSetBytes = proc.WorkingSet64,
+            PagedMemoryBytes = proc.PagedMemorySize64
+        };
     }
 }
 
@@ -393,10 +471,31 @@ public sealed class DebugStats
     public Dictionary<string, int> SeriesCardinality { get; set; } = new();
     public long MemoryBufferPoints { get; set; }
     public long MemoryBufferBytes { get; set; }
+    public long FlushSnapshotPoints { get; set; }
+    public long FlushSnapshotBytes { get; set; }
     public long WriteQueuePendingRequests { get; set; }
+    public long WriteQueueQueuedPoints { get; set; }
+    public long WriteQueueQueuedBytes { get; set; }
+    public long CompactionBacklogBytes { get; set; }
+    public long CompactionInputBytesTotal { get; set; }
+    public long CompactionOutputBytesTotal { get; set; }
+    public long CompactionDurationMsTotal { get; set; }
     public Dictionary<string, long> QueryDurationBuckets { get; set; } = new();
     public List<ContinuousQueryMetrics> ContinuousQueryMetrics { get; set; } = [];
     public int QuarantinedSegments { get; set; }
+    public GcStats? Gc { get; set; }
+}
+
+public sealed class GcStats
+{
+    public long CollectionCountGen0 { get; set; }
+    public long CollectionCountGen1 { get; set; }
+    public long CollectionCountGen2 { get; set; }
+    public long TotalCommittedBytes { get; set; }
+    public long HeapSizeBytes { get; set; }
+    public double PauseDurationMsTotal { get; set; }
+    public long WorkingSetBytes { get; set; }
+    public long PagedMemoryBytes { get; set; }
 }
 
 public sealed class ContinuousQueryMetrics

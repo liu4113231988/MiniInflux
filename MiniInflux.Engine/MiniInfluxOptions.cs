@@ -82,7 +82,9 @@ public sealed class MiniInfluxOptions
             {
                 QueueCapacity = ReadInt(config, 100_000, "Write:QueueCapacity"),
                 BatchSize = ReadInt(config, 10_000, "Write:BatchSize"),
-                MaxRequestBodyBytes = ReadLong(config, 26_214_400, "Write:MaxRequestBodyBytes")
+                MaxRequestBodyBytes = ReadLong(config, 26_214_400, "Write:MaxRequestBodyBytes"),
+                QueueMaxPoints = ReadLong(config, 0, "Write:QueueMaxPoints"),
+                QueueMaxBytes = ReadLong(config, 0, "Write:QueueMaxBytes")
             },
             Storage = new StorageOptions
             {
@@ -279,6 +281,10 @@ public sealed class WriteOptions
     public int QueueCapacity { get; init; } = 100_000;
     public int BatchSize { get; init; } = 10_000;
     public long MaxRequestBodyBytes { get; init; } = 26_214_400;
+    // 0 = unlimited. Caps the in-flight (queued but not yet processed) points/bytes so a stalled
+    // engine cannot let the queue grow unbounded. Overload returns HTTP 429.
+    public long QueueMaxPoints { get; init; }
+    public long QueueMaxBytes { get; init; }
 }
 
 public sealed class StorageOptions

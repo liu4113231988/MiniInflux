@@ -82,6 +82,69 @@ public sealed class WriteQueueTests : IDisposable
         Assert.Equal(256, engine.ReadAllPoints("db", "autogen", "cpu", null, null).Count);
     }
 
+    [Fact]
+    public async Task EnqueueAsync_ExceedsPointsBudget_ThrowsImmediatelyWithoutWriting()
+    {
+        using var engine = new TsdbEngine(_dataPath, flushIntervalMs: 0, compactionIntervalMs: 0);
+        using var queue = new WriteQueue(engine, capacity: 100, batchSize: 1, maxQueuedPoints: 5);
+
+        var points = Enumerable.Range(1, 10)
+            .Select(i => new Point
+            {
+                Measurement = "cpu",
+                Tags = [],
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromInteger(i) },
+                TimestampNs = i
+            })
+            .ToList();
+
+        await Assert.ThrowsAsync<WriteQueueFullException>(() => queue.EnqueueAsync("db", "autogen", points));
+        Assert.Equal(0, engine.GetBufferedPointCount());
+        Assert.Equal(0, queue.QueuedPoints);
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_ExceedsBytesBudget_ThrowsImmediatelyWithoutWriting()
+    {
+        using var engine = new TsdbEngine(_dataPath, flushIntervalMs: 0, compactionIntervalMs: 0);
+        using var queue = new WriteQueue(engine, capacity: 100, batchSize: 1, maxQueuedBytes: 64);
+
+        var points = Enumerable.Range(1, 50)
+            .Select(i => new Point
+            {
+                Measurement = "cpu",
+                Tags = [],
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromInteger(i) },
+                TimestampNs = i
+            })
+            .ToList();
+
+        await Assert.ThrowsAsync<WriteQueueFullException>(() => queue.EnqueueAsync("db", "autogen", points));
+        Assert.Equal(0, engine.GetBufferedPointCount());
+        Assert.Equal(0, queue.QueuedBytes);
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_WithinBudget_WritesAndResetsCounters()
+    {
+        using var engine = new TsdbEngine(_dataPath, flushIntervalMs: 0, compactionIntervalMs: 0);
+        using var queue = new WriteQueue(engine, capacity: 100, batchSize: 1, maxQueuedPoints: 1000, maxQueuedBytes: 10_000_000);
+
+        var point = new Point
+        {
+            Measurement = "cpu",
+            Tags = [],
+            Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromInteger(1) },
+            TimestampNs = 1
+        };
+
+        await queue.EnqueueAsync("db", "autogen", [point]);
+
+        Assert.True(SpinWait.SpinUntil(() => queue.QueuedPoints == 0, TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, queue.QueuedBytes);
+        Assert.Equal(1, engine.GetBufferedPointCount());
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_dataPath))

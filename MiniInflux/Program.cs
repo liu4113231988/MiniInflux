@@ -127,7 +127,8 @@ var engine = new TsdbEngine(
     logger: runtimeLogger);
 
 builder.Services.AddSingleton(engine);
-var writeQueue = new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize);
+var writeQueue = new WriteQueue(engine, options.Write.QueueCapacity, options.Write.BatchSize,
+    options.Write.QueueMaxPoints, options.Write.QueueMaxBytes);
 builder.Services.AddSingleton(writeQueue);
 builder.Services.AddSingleton(new QueryExecutor(
     options.Storage.MaxResponseRows,
