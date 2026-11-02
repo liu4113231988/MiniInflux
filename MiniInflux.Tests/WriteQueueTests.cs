@@ -145,6 +145,30 @@ public sealed class WriteQueueTests : IDisposable
         Assert.Equal(1, engine.GetBufferedPointCount());
     }
 
+    [Fact]
+    public async Task EnqueueAsync_MultipleDatabases_WritesAllWithoutDeadlock()
+    {
+        using var engine = new TsdbEngine(_dataPath, flushThreshold: 100, flushIntervalMs: 0, compactionIntervalMs: 0);
+        // Multiple workers route by db hash; different dbs may land on different workers.
+        using var queue = new WriteQueue(engine, capacity: 1000, batchSize: 50, workerCount: 4);
+
+        var writes = new List<Task>();
+        for (var db = 0; db < 8; db++)
+            for (var i = 0; i < 50; i++)
+                writes.Add(queue.EnqueueAsync($"db{db}", "autogen", [new Point
+                {
+                    Measurement = "cpu",
+                    Tags = [],
+                    Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(i) },
+                    TimestampNs = i
+                }]));
+
+        await Task.WhenAll(writes).WaitAsync(TimeSpan.FromSeconds(15));
+
+        for (var db = 0; db < 8; db++)
+            Assert.Equal(50, engine.ReadAllPoints($"db{db}", "autogen", "cpu", null, null).Count);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_dataPath))

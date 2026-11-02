@@ -11,35 +11,44 @@ public sealed record WriteRequest(
     TaskCompletionSource<bool> Completion);
 
 /// <summary>
-/// Bounded write queue with backpressure. Uses Channel to limit concurrent writes and optional
-/// point/byte budgets to cap the in-flight memory held by queued (not yet processed) requests.
+/// Bounded write queue with backpressure. Writes are routed by database hash to a fixed pool of
+/// workers: the same database always lands on the same worker (so its writes stay ordered), while
+/// different databases can be processed in parallel. Optional point/byte budgets cap the in-flight
+/// memory held by queued (not yet processed) requests.
 /// </summary>
 public sealed class WriteQueue : IDisposable
 {
-    private readonly Channel<WriteRequest> _channel;
+    private readonly Channel<WriteRequest>[] _channels;
     private readonly TsdbEngine _engine;
     private readonly int _batchSize;
     private readonly long _maxQueuedPoints;
     private readonly long _maxQueuedBytes;
-    private readonly Task _worker;
+    private readonly Task[] _workers;
     private readonly CancellationTokenSource _cts = new();
     private long _pendingRequests;
     private long _queuedPoints;
     private long _queuedBytes;
 
     public WriteQueue(TsdbEngine engine, int capacity = 100_000, int batchSize = 10_000,
-        long maxQueuedPoints = 0, long maxQueuedBytes = 0)
+        long maxQueuedPoints = 0, long maxQueuedBytes = 0, int workerCount = 0)
     {
         _engine = engine;
         _batchSize = batchSize;
         _maxQueuedPoints = maxQueuedPoints;
         _maxQueuedBytes = maxQueuedBytes;
-        _channel = Channel.CreateBounded<WriteRequest>(new BoundedChannelOptions(capacity)
+        var workers = workerCount > 0 ? workerCount : Math.Max(1, Environment.ProcessorCount);
+        _channels = new Channel<WriteRequest>[workers];
+        _workers = new Task[workers];
+        for (var i = 0; i < workers; i++)
         {
-            FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = true
-        });
-        _worker = Task.Run(ProcessAsync);
+            _channels[i] = Channel.CreateBounded<WriteRequest>(new BoundedChannelOptions(capacity)
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleReader = true
+            });
+            var index = i;
+            _workers[i] = Task.Run(() => ProcessAsync(index));
+        }
     }
 
     /// <summary>
@@ -65,6 +74,10 @@ public sealed class WriteQueue : IDisposable
             throw new WriteQueueFullException("write queue points/bytes limit exceeded; retry later");
         }
 
+        // Route by database: same db always hits the same worker so its writes stay ordered;
+        // different dbs spread across workers and run in parallel.
+        var channel = _channels[(uint)db.GetHashCode() % _channels.Length];
+
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var request = new WriteRequest(db, rp, points, pointCount, estimatedBytes, tcs);
 
@@ -75,7 +88,7 @@ public sealed class WriteQueue : IDisposable
         using var registration = ct.Register(static state => ((TaskCompletionSource<bool>)state!).TrySetCanceled(), tcs);
         try
         {
-            await _channel.Writer.WriteAsync(request, timeoutCts.Token);
+            await channel.Writer.WriteAsync(request, timeoutCts.Token);
             return await tcs.Task;
         }
         catch (OperationCanceledException)
@@ -83,7 +96,7 @@ public sealed class WriteQueue : IDisposable
             // If the request never entered the channel the worker won't process it, so release
             // the budget and pending counter here. If it was already enqueued before cancellation
             // the worker releases them in ProcessBatch's finally block.
-            if (!_channel.Reader.TryPeek(out var peeked) || !ReferenceEquals(peeked, request))
+            if (!channel.Reader.TryPeek(out var peeked) || !ReferenceEquals(peeked, request))
             {
                 Interlocked.Add(ref _queuedPoints, -pointCount);
                 Interlocked.Add(ref _queuedBytes, -estimatedBytes);
@@ -100,15 +113,16 @@ public sealed class WriteQueue : IDisposable
         }
     }
 
-    private async Task ProcessAsync()
+    private async Task ProcessAsync(int workerIndex)
     {
+        var channel = _channels[workerIndex];
         var batch = new List<WriteRequest>(_batchSize);
 
         try
         {
-            while (await _channel.Reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
+            while (await channel.Reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
             {
-                while (batch.Count < _batchSize && _channel.Reader.TryRead(out var next))
+                while (batch.Count < _batchSize && channel.Reader.TryRead(out var next))
                     batch.Add(next);
                 if (batch.Count == 0) continue;
 
@@ -120,7 +134,7 @@ public sealed class WriteQueue : IDisposable
 
         try
         {
-            while (_channel.Reader.TryRead(out var remaining))
+            while (channel.Reader.TryRead(out var remaining))
                 batch.Add(remaining);
             if (batch.Count > 0)
                 await ProcessBatch(batch);
@@ -220,10 +234,11 @@ public sealed class WriteQueue : IDisposable
 
     public void Dispose()
     {
-        _channel.Writer.Complete();
-        try { _worker.Wait(TimeSpan.FromSeconds(5)); } catch { /* best effort */ }
+        foreach (var ch in _channels)
+            ch.Writer.TryComplete();
+        try { Task.WaitAll(_workers, TimeSpan.FromSeconds(5)); } catch { /* best effort */ }
         try { _cts.Cancel(); } catch (ObjectDisposedException) { }
-        try { _worker.Wait(TimeSpan.FromSeconds(5)); } catch { /* best effort */ }
+        try { Task.WaitAll(_workers, TimeSpan.FromSeconds(5)); } catch { /* best effort */ }
         _cts.Dispose();
     }
 }

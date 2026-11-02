@@ -2171,7 +2171,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
             _ensuredDbRp.TryRemove(ensured, out _);
         _lastValueCache.ClearDb(db);
         _globalLock.EnterWriteLock();
-        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { _bufferedPointCount -= _buf[k].Count; } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); // Do NOT dispose the removed lock: another thread may have obtained it via GetLock's
+        try { foreach (var k in _buf.Keys.Where(k => k.StartsWith(db + "|")).ToList()) { if (_buf[k].Count > 0) { Interlocked.Add(ref _bufferedPointCount, -_buf[k].Count); } _buf.TryRemove(k, out _); _bufBySeries.TryRemove(k, out _); // Do NOT dispose the removed lock: another thread may have obtained it via GetLock's
         // GetOrAdd right before the removal, and disposing it would pull an ObjectDisposedException
         // out from under that thread. The lock object is tiny and GC-collectable once unreferenced.
         _locks.TryRemove(k, out _); _bufferReplayFloors.TryRemove(k, out _); _lastBufferWriteTicks.TryRemove(k, out _); } if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
@@ -2204,7 +2204,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
                     if (_buf.TryGetValue(key, out var list))
                     {
                         var removed = list.RemoveAll(p => p.Point.Measurement == measurement);
-                        if (removed > 0) { _bufferedPointCount -= removed; if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
+                        if (removed > 0) { Interlocked.Add(ref _bufferedPointCount, -removed); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
                         RebuildBufferSeriesIndex(key, list);
                         UpdateBufferReplayFloor(key, list, forceRecalculate: true);
                     }
@@ -2296,7 +2296,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
                     if (_buf.TryGetValue(key, out var list))
                     {
                         var removed = list.RemoveAll(p => p.Point.Measurement == measurement && tagSet.Contains(p.SeriesKey.TagsCanonical));
-                        if (removed > 0) { _bufferedPointCount -= removed; if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
+                        if (removed > 0) { Interlocked.Add(ref _bufferedPointCount, -removed); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
                         RebuildBufferSeriesIndex(key, list);
                         UpdateBufferReplayFloor(key, list, forceRecalculate: true);
                     }
@@ -2506,7 +2506,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
                         && (!minTime.HasValue || p.Point.TimestampNs >= minTime.Value)
                         && (!maxTime.HasValue || p.Point.TimestampNs <= maxTime.Value)
                         && predicate(p.Point));
-                    if (removed > 0) { _bufferedPointCount -= removed; if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
+                    if (removed > 0) { Interlocked.Add(ref _bufferedPointCount, -removed); if (_maxBufferBytes > 0) RecalculateBufferedBytes(); }
                     RebuildBufferSeriesIndex(key, list);
                     UpdateBufferReplayFloor(key, list, forceRecalculate: true);
                 }
@@ -2861,9 +2861,9 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         // stale or missing, so re-asserting every flushed point here is redundant work.
         ValidateLastValueCacheFromFooter(db, rp, flushedSnapshot);
 
-        _bufferedPointCount -= flushCount;
+        Interlocked.Add(ref _bufferedPointCount, -flushCount);
         if (_maxBufferBytes > 0)
-            _bufferedByteCount -= flushBytes;
+            Interlocked.Add(ref _bufferedByteCount, -flushBytes);
         l.Clear();
         var key = K(db, rp);
         _lastBufferWriteTicks.TryRemove(key, out _);
@@ -3027,8 +3027,8 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
                 {
                     // Retire the whole generation: the active buffer already holds only points appended
                     // after the swap, so no per-point scan or series-index rebuild is needed.
-                    _bufferedPointCount -= fg.Points.Count;
-                    if (_maxBufferBytes > 0) _bufferedByteCount -= fg.SnapshotBytes;
+                    Interlocked.Add(ref _bufferedPointCount, -fg.Points.Count);
+                    if (_maxBufferBytes > 0) Interlocked.Add(ref _bufferedByteCount, -fg.SnapshotBytes);
                 }
                 else
                 {
@@ -3270,14 +3270,13 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
 
     private long GetBufferedPointCountInternal()
     {
-        // Caller is expected to hold _globalLock (read or write). Counter maintained incrementally.
-        return _bufferedPointCount;
+        // Counter maintained incrementally with Interlocked; reads must be atomic too.
+        return Interlocked.Read(ref _bufferedPointCount);
     }
 
     private long GetBufferedByteCountInternal()
     {
-        // Caller is expected to hold _globalLock (read or write). Counter maintained incrementally.
-        return _bufferedByteCount;
+        return Interlocked.Read(ref _bufferedByteCount);
     }
 
     private void RecalculateBufferedBytes()
@@ -3290,7 +3289,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         foreach (var kv in _flushing)
             foreach (var p in kv.Value.Points)
                 bytes += EstimateBufferedPointBytes(p.Point);
-        _bufferedByteCount = bytes;
+        Interlocked.Exchange(ref _bufferedByteCount, bytes);
     }
 
     private static long EstimateBufferedPointBytes(Point point)
@@ -3365,10 +3364,10 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
             seriesPoints.Add(point);
         }
 
-        _bufferedPointCount += points.Count;
+        Interlocked.Add(ref _bufferedPointCount, points.Count);
         if (_maxBufferBytes > 0)
             foreach (var point in points)
-                _bufferedByteCount += EstimateBufferedPointBytes(point.Point);
+                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(point.Point));
         // WAL replay also populates last-value cache so post-restart last() is fast
         var sep = key.IndexOf('|');
         if (sep > 0)
@@ -3425,10 +3424,10 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         if (indexPoints != null)
             _manifest.UpdateIndexes(db, indexPoints);
 
-        _bufferedPointCount += points.Count;
+        Interlocked.Add(ref _bufferedPointCount, points.Count);
         if (_maxBufferBytes > 0)
             for (var i = 0; i < points.Count; i++)
-                _bufferedByteCount += EstimateBufferedPointBytes(points[i].Point);
+                Interlocked.Add(ref _bufferedByteCount, EstimateBufferedPointBytes(points[i].Point));
 
         // write-path last-value cache update (flush later validates via segment footer maxTime)
         var rp = key.Length > db.Length + 1 ? key[(db.Length + 1)..] : "autogen";
