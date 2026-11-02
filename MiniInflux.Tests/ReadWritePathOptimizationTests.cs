@@ -111,6 +111,66 @@ public class ReadWritePathOptimizationTests : IDisposable
     }
 
     [Fact]
+    public async Task AsyncFlush_DoubleBuffer_ActiveOverridesFlushingAndCountersReset()
+    {
+        // batch1 is large enough to trigger the async (background) flush path. While it is
+        // encoding, batch2 appends to the fresh active generation. A point shared by both at the
+        // same timestamp must resolve LWW to batch2's value (active wins over flushing).
+        const int batch1 = 8000;
+        const long sharedTs = 42_000_000_000L;
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 100,
+            flushIntervalMs: 0, compactionIntervalMs: 0, rpCheckIntervalMs: 0);
+
+        var pts1 = new List<Point>(batch1);
+        for (var i = 0; i < batch1; i++)
+            pts1.Add(new Point
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "h1" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(i) },
+                TimestampNs = (i + 1) * 1_000_000_000L
+            });
+        // Inject a known value at the shared timestamp into the flushing generation.
+        pts1[41] = new Point
+        {
+            Measurement = "cpu",
+            Tags = new Dictionary<string, string> { ["host"] = "h1" },
+            Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(-1) },
+            TimestampNs = sharedTs
+        };
+        await engine.WriteAsync("db", "autogen", pts1);
+
+        // Second batch writes into the active generation while batch1 may still be flushing.
+        var pts2 = new List<Point>
+        {
+            new()
+            {
+                Measurement = "cpu",
+                Tags = new Dictionary<string, string> { ["host"] = "h1" },
+                Fields = new Dictionary<string, FieldValue> { ["value"] = FieldValue.FromDouble(999) },
+                TimestampNs = sharedTs
+            }
+        };
+        await engine.WriteAsync("db", "autogen", pts2);
+
+        // Both generations' points are visible; the shared timestamp resolves to the active value.
+        var all = engine.ReadAllPoints("db", "autogen", "cpu", null, null);
+        // batch1 has 8000 distinct timestamps; the shared one is deduped against batch2's point.
+        Assert.Equal(batch1, all.Count);
+        var shared = all.Single(p => p.TimestampNs == sharedTs);
+        Assert.Equal(999.0, shared.Fields["value"].Float);
+
+        engine.FlushAll();
+        Assert.Equal(0, engine.GetBufferedPointCount());
+        Assert.Equal(0, engine.GetFlushSnapshotPointCount());
+
+        // After flush the LWW result persists in segments.
+        var after = engine.ReadAllPoints("db", "autogen", "cpu", null, null)
+            .Single(p => p.TimestampNs == sharedTs);
+        Assert.Equal(999.0, after.Fields["value"].Float);
+    }
+
+    [Fact]
     public async Task EnumeratePoints_StreamingMerge_MatchesReadAllPoints()
     {
         using var engine = new TsdbEngine(_testDir, flushThreshold: 20,

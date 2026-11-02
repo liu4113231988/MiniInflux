@@ -12,6 +12,21 @@ public sealed class TsdbEngine : IDisposable
     public sealed record DescendingFieldsReadResult(List<long> Timestamps, List<FieldValue?[]> Rows, int SegmentColumnsRead, string? LimitPushdownStopReason);
 
     private sealed record BufferedPoint(Point Point, WalPosition Position, SeriesKey SeriesKey, long Seq);
+
+    // Immutable snapshot of a buffer generation handed off to a background flush. Writers keep
+    // appending to a fresh active generation while this one is encoded outside the write lock; on
+    // success it is retired as a whole (no per-point scan, no series-index rebuild). Reads consult
+    // both the active generation and any in-flight flushing generation so LWW semantics hold.
+    private sealed class FlushGeneration
+    {
+        public List<BufferedPoint> Points = [];
+        public Dictionary<SeriesKey, List<BufferedPoint>> BySeries = new();
+        public WalPosition ReplayFloor;
+        public long MinTimestamp;
+        public long SnapshotBytes;
+        public Task Task = Task.CompletedTask;
+    }
+
     private sealed class PendingPoint(Point point, SeriesKey seriesKey)
     {
         public Point Point = point;
@@ -84,10 +99,12 @@ public sealed class TsdbEngine : IDisposable
     // seeing them and crash recovery is unaffected.
     private readonly long _minFreeDiskBytes;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Task> _flushInFlight = new(StringComparer.Ordinal);
-    // Min timestamp held by each in-flight flush snapshot, per db|rp. Snapshots may carry points that
-    // a concurrent DELETE has already purged from the buffer; tombstone GC uses this floor to avoid
-    // retiring coverage for data those snapshots will still write to segments.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _flushSnapshotMinTs = new(StringComparer.Ordinal);
+    // Bounds concurrent background flushes so a burst of writes across many (db|rp) keys cannot
+    // saturate the disk or thread pool. Flush is disk-bound; a small fixed cap is enough.
+    private readonly SemaphoreSlim _flushConcurrencyGate = new(Math.Min(Environment.ProcessorCount, 4));
+    // Immutable flushing generation per (db|rp), swapped with the active buffer under the write
+    // lock, encoded outside the lock, and retired as a whole on success.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, FlushGeneration> _flushing = new(StringComparer.Ordinal);
     // Points/bytes currently held by in-flight async flush snapshots. They stay in the buffer
     // (and thus in _bufferedPointCount/_bufferedByteCount) until the flush publishes, so these
     // counters let observability split "active buffer" from "snapshot being encoded".
@@ -672,20 +689,17 @@ public sealed class TsdbEngine : IDisposable
         try
         {
             var key = K(db, rp);
-            if (_buf.TryGetValue(key, out var l))
-            {
-                var bufMatched = BufferedCandidates(key, l, meas, allowedTagsCanonical)
-                    .Where(p => Match(p.Point, meas, min, max))
-                    .Select(p => p.Point);
-                if (requestedFields != null)
-                    bufMatched = bufMatched.Select(p => new Point
-                    {
-                        Measurement = p.Measurement, Tags = p.Tags, TimestampNs = p.TimestampNs,
-                        Fields = SelectFields(p.Fields, requestedFields),
-                        TagsCanonical = p.TagsCanonical
-                    });
-                buffered.AddRange(bufMatched);
-            }
+            var bufMatched = BufferedCandidates(key, meas, allowedTagsCanonical)
+                .Where(p => Match(p.Point, meas, min, max))
+                .Select(p => p.Point);
+            if (requestedFields != null)
+                bufMatched = bufMatched.Select(p => new Point
+                {
+                    Measurement = p.Measurement, Tags = p.Tags, TimestampNs = p.TimestampNs,
+                    Fields = SelectFields(p.Fields, requestedFields),
+                    TagsCanonical = p.TagsCanonical
+                });
+            buffered.AddRange(bufMatched);
         }
         finally { lk.ExitReadLock(); }
 
@@ -837,7 +851,12 @@ public sealed class TsdbEngine : IDisposable
         lk.EnterReadLock();
         try
         {
-            if (!_bufBySeries.TryGetValue(key, out var bySeries) || !bySeries.TryGetValue(seriesKey, out var buffered))
+            var buffered = new List<BufferedPoint>();
+            if (_flushing.TryGetValue(key, out var fg) && fg.BySeries.TryGetValue(seriesKey, out var flushPts))
+                buffered.AddRange(flushPts);
+            if (_bufBySeries.TryGetValue(key, out var bySeries) && bySeries.TryGetValue(seriesKey, out var activePts))
+                buffered.AddRange(activePts);
+            if (buffered.Count == 0)
                 return new DescendingSeriesReadResult([], 0, 0, "buffer-empty");
 
             for (var i = 1; i < buffered.Count; i++)
@@ -983,9 +1002,12 @@ public sealed class TsdbEngine : IDisposable
         lk.EnterReadLock();
         try
         {
-            if (_bufBySeries.TryGetValue(key, out var bySeries)
-                && bySeries.TryGetValue(seriesKey, out var buffered)
-                && buffered.Count > 0)
+            if ((_bufBySeries.TryGetValue(key, out var bySeries)
+                    && bySeries.TryGetValue(seriesKey, out var buffered)
+                    && buffered.Count > 0)
+                || (_flushing.TryGetValue(key, out var fg)
+                    && fg.BySeries.TryGetValue(seriesKey, out var flushBuffered)
+                    && flushBuffered.Count > 0))
                 return null;
         }
         finally { lk.ExitReadLock(); }
@@ -1055,9 +1077,12 @@ public sealed class TsdbEngine : IDisposable
         lk.EnterReadLock();
         try
         {
-            if (_bufBySeries.TryGetValue(key, out var bySeries)
-                && bySeries.TryGetValue(seriesKey, out var buffered)
-                && buffered.Count > 0)
+            if ((_bufBySeries.TryGetValue(key, out var bySeries)
+                    && bySeries.TryGetValue(seriesKey, out var buffered)
+                    && buffered.Count > 0)
+                || (_flushing.TryGetValue(key, out var fg)
+                    && fg.BySeries.TryGetValue(seriesKey, out var flushBuffered)
+                    && flushBuffered.Count > 0))
                 return null;
         }
         finally { lk.ExitReadLock(); }
@@ -1393,8 +1418,7 @@ public sealed class TsdbEngine : IDisposable
         HashSet<string>? requestedFields, HashSet<string>? allowedTagsCanonical)
     {
         var result = new List<(string, long, Point)>();
-        if (!_buf.TryGetValue(key, out var list)) return result;
-        foreach (var buffered in BufferedCandidates(key, list, measurement, allowedTagsCanonical))
+        foreach (var buffered in BufferedCandidates(key, measurement, allowedTagsCanonical))
         {
             var p = buffered.Point;
             if (!Match(p, measurement, min, max)) continue;
@@ -1726,23 +1750,20 @@ public sealed class TsdbEngine : IDisposable
         lk.EnterReadLock();
         try
         {
-            if (_buf.TryGetValue(key, out var list))
+            foreach (var bp in BufferedCandidates(key, meas, allowedTagsCanonical))
             {
-                foreach (var bp in BufferedCandidates(key, list, meas, allowedTagsCanonical))
-                {
-                    if (!Match(bp.Point, meas, min, max)) continue;
-                    var point = requestedFields == null
-                        ? bp.Point
-                        : new Point
-                        {
-                            Measurement = bp.Point.Measurement,
-                            Tags = bp.Point.Tags,
-                            Fields = SelectFields(bp.Point.Fields, requestedFields),
-                            TimestampNs = bp.Point.TimestampNs,
-                            TagsCanonical = bp.Point.TagsCanonical
-                        };
-                    buffered.Add((point, bp.SeriesKey));
-                }
+                if (!Match(bp.Point, meas, min, max)) continue;
+                var point = requestedFields == null
+                    ? bp.Point
+                    : new Point
+                    {
+                        Measurement = bp.Point.Measurement,
+                        Tags = bp.Point.Tags,
+                        Fields = SelectFields(bp.Point.Fields, requestedFields),
+                        TimestampNs = bp.Point.TimestampNs,
+                        TagsCanonical = bp.Point.TagsCanonical
+                    };
+                buffered.Add((point, bp.SeriesKey));
             }
         }
         finally { lk.ExitReadLock(); }
@@ -1795,7 +1816,10 @@ public sealed class TsdbEngine : IDisposable
         var r = _manifest.ListMeasurements(db).Concat(_schema.ListMeasurements(db)).Distinct(StringComparer.Ordinal).ToList();
         // WAL-only writes to non-default retention policies must be visible too, not just the
         // default RP's buffer.
-        var bufferedKeys = _buf.Keys.Where(key => key.StartsWith(db + "|", StringComparison.Ordinal)).ToList();
+        var bufferedKeys = _buf.Keys.Where(key => key.StartsWith(db + "|", StringComparison.Ordinal))
+            .Concat(_flushing.Keys.Where(key => key.StartsWith(db + "|", StringComparison.Ordinal)))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
         foreach (var key in bufferedKeys)
         {
             var lk = GetLock(key);
@@ -1804,6 +1828,10 @@ public sealed class TsdbEngine : IDisposable
             {
                 if (_buf.TryGetValue(key, out var buf))
                     foreach (var p in buf)
+                        if (!r.Contains(p.Point.Measurement))
+                            r.Add(p.Point.Measurement);
+                if (_flushing.TryGetValue(key, out var fg))
+                    foreach (var p in fg.Points)
                         if (!r.Contains(p.Point.Measurement))
                             r.Add(p.Point.Measurement);
             }
@@ -1868,23 +1896,20 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         try
         {
             var key = K(db, rp);
-            if (_buf.TryGetValue(key, out var list))
+            var matched = BufferedCandidates(key, meas, allowedTagsCanonical)
+                .Where(p => Match(p.Point, meas, min, max))
+                .Select(p => p.Point);
+            if (requestedFields != null)
             {
-                var matched = BufferedCandidates(key, list, meas, allowedTagsCanonical)
-                    .Where(p => Match(p.Point, meas, min, max))
-                    .Select(p => p.Point);
-                if (requestedFields != null)
+                matched = matched.Select(p => new Point
                 {
-                    matched = matched.Select(p => new Point
-                    {
-                        Measurement = p.Measurement,
-                        Tags = p.Tags,
-                        TimestampNs = p.TimestampNs,
-                        Fields = p.Fields.Where(f => requestedFields.Contains(f.Key)).ToDictionary(f => f.Key, f => f.Value)
-                    });
-                }
-                res.AddRange(matched);
+                    Measurement = p.Measurement,
+                    Tags = p.Tags,
+                    TimestampNs = p.TimestampNs,
+                    Fields = p.Fields.Where(f => requestedFields.Contains(f.Key)).ToDictionary(f => f.Key, f => f.Value)
+                });
             }
+            res.AddRange(matched);
         }
         finally { lk.ExitReadLock(); }
         return res;
@@ -1902,10 +1927,7 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         try
         {
             var key = K(db, rp);
-            if (!_buf.TryGetValue(key, out var list))
-                return new BufferedStatsSnapshot(0, 0, fields);
-
-            foreach (var buffered in BufferedCandidates(key, list, meas, allowedTagsCanonical))
+            foreach (var buffered in BufferedCandidates(key, meas, allowedTagsCanonical))
             {
                 var point = buffered.Point;
                 if (!Match(point, meas, min, max))
@@ -2412,16 +2434,22 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
 
-        var bufferedKeys = _buf.Keys.Where(key => key.StartsWith(db + "|", StringComparison.Ordinal)).ToList();
+        var bufferedKeys = _buf.Keys.Where(key => key.StartsWith(db + "|", StringComparison.Ordinal))
+            .Concat(_flushing.Keys.Where(key => key.StartsWith(db + "|", StringComparison.Ordinal)))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
         foreach (var key in bufferedKeys)
         {
             var lk = GetLock(key);
             lk.EnterReadLock();
             try
             {
-                if (!_buf.TryGetValue(key, out var points)) continue;
-                foreach (var point in points)
-                    rebuilt.Add(point.SeriesKey);
+                if (_buf.TryGetValue(key, out var points))
+                    foreach (var point in points)
+                        rebuilt.Add(point.SeriesKey);
+                if (_flushing.TryGetValue(key, out var fg))
+                    foreach (var point in fg.Points)
+                        rebuilt.Add(point.SeriesKey);
             }
             finally { lk.ExitReadLock(); }
         }
@@ -2904,8 +2932,9 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
 
     /// <summary>
     /// Schedule a background flush of the current buffer contents. Caller must hold the per-key
-    /// write lock. The buffer itself is left in place: points remain visible to reads and the WAL
-    /// replay floor keeps covering them until the flush completes and removes them by sequence.
+    /// write lock. The active generation is swapped out for a fresh empty one and handed to a
+    /// background task; points stay visible to reads (active + flushing) and the WAL replay floor
+    /// keeps covering them until the flush retires the generation.
     /// </summary>
     private void TryScheduleAsyncFlush(string db, string rp, string key, List<BufferedPoint> list)
     {
@@ -2931,31 +2960,61 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         }
 
         using var snapshotTiming = WriteDiagnostics.Measure(WriteDiagnostics.Stage.FlushSnapshot);
-        var snapshot = list.ToArray();
-        var maxSeq = snapshot[^1].Seq; // seq is assigned in append order, so the last one is max
+        // Swap the active generation out for a fresh empty one under the write lock. The retired
+        // generation (points, series index, replay floor) becomes immutable and is encoded outside
+        // the lock; cleanup is just dropping the reference.
+        var bySeries = _bufBySeries.TryGetValue(key, out var existingBySeries) ? existingBySeries : new Dictionary<SeriesKey, List<BufferedPoint>>();
+        var replayFloor = _bufferReplayFloors.TryGetValue(key, out var floor) ? floor : default;
         long snapshotMinTs = long.MaxValue;
         long snapshotBytes = 0;
-        foreach (var bp in snapshot)
+        foreach (var bp in list)
         {
-            if (bp.Point.TimestampNs < snapshotMinTs)
-                snapshotMinTs = bp.Point.TimestampNs;
+            if (bp.Point.TimestampNs < snapshotMinTs) snapshotMinTs = bp.Point.TimestampNs;
             snapshotBytes += EstimateBufferedPointBytes(bp.Point);
         }
-        _flushSnapshotMinTs[key] = snapshotMinTs;
-        Interlocked.Add(ref _flushSnapshotPointCount, snapshot.Length);
+        var fg = new FlushGeneration
+        {
+            Points = list,
+            BySeries = bySeries,
+            ReplayFloor = replayFloor,
+            MinTimestamp = snapshotMinTs,
+            SnapshotBytes = snapshotBytes
+        };
+
+        _buf[key] = [];
+        _bufBySeries[key] = new Dictionary<SeriesKey, List<BufferedPoint>>();
+        _bufferReplayFloors.TryRemove(key, out _);
+        _lastBufferWriteTicks.TryRemove(key, out _);
+        _flushing[key] = fg;
+
+        Interlocked.Add(ref _flushSnapshotPointCount, list.Count);
         Interlocked.Add(ref _flushSnapshotByteCount, snapshotBytes);
-        _flushInFlight[key] = Task.Run(() => FlushSnapshotAsync(db, rp, key, snapshot, maxSeq, snapshotBytes));
+        var task = Task.Run(() => FlushSnapshotAsync(db, rp, key, fg));
+        fg.Task = task;
+        _flushInFlight[key] = task;
     }
 
     private const int AsyncFlushMinPoints = 4096;
 
-    private void FlushSnapshotAsync(string db, string rp, string key, BufferedPoint[] snapshot, long maxSeq, long snapshotBytes)
+    private void FlushSnapshotAsync(string db, string rp, string key, FlushGeneration fg)
     {
+        _flushConcurrencyGate.Wait();
+        var succeeded = false;
         try
         {
-            FlushPointsToSegments(db, rp, snapshot);
-            // async flush also validates last-value cache via footer maxTime (snapshot's max is footer max)
-            ValidateLastValueCacheFromFooter(db, rp, snapshot);
+            try
+            {
+                FlushPointsToSegments(db, rp, fg.Points);
+                // async flush also validates last-value cache via footer maxTime (snapshot's max is footer max)
+                ValidateLastValueCacheFromFooter(db, rp, fg.Points);
+                succeeded = true;
+            }
+            catch (Exception ex)
+            {
+                // The generation is still in _flushing and the WAL, so nothing is lost; on cleanup we
+                // merge it back into the active buffer so the next write re-triggers a flush.
+                _health.RecordFailure("async_flush", ex, blocksWrites: false);
+            }
 
             var lk = GetLock(key);
             using (WriteDiagnostics.Measure(WriteDiagnostics.Stage.FlushCleanupWait))
@@ -2963,56 +3022,35 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
             try
             {
                 using var cleanupTiming = WriteDiagnostics.Measure(WriteDiagnostics.Stage.FlushCleanup);
-                if (_buf.TryGetValue(key, out var list))
+                _flushing.TryRemove(key, out _);
+                if (succeeded)
                 {
-                    // Remove exactly the snapshot points by sequence. DROP SERIES/MEASUREMENT may
-                    // have already removed some of them from the middle of the list while the
-                    // flush was in flight, so an index/prefix removal would be wrong.
-                    var trackBytes = _maxBufferBytes > 0;
-                    long removedBytes = 0;
-                    var write = 0;
-                    for (var i = 0; i < list.Count; i++)
-                    {
-                        var bp = list[i];
-                        if (bp.Seq <= maxSeq)
-                        {
-                            if (trackBytes) removedBytes += EstimateBufferedPointBytes(bp.Point);
-                            continue;
-                        }
-                        list[write++] = bp;
-                    }
-                    var removed = list.Count - write;
-                    list.RemoveRange(write, removed);
-                    _bufferedPointCount -= removed;
-                    if (trackBytes) _bufferedByteCount -= removedBytes;
-
-                    if (list.Count == 0)
-                    {
-                        _lastBufferWriteTicks.TryRemove(key, out _);
-                        _bufBySeries.TryRemove(key, out _);
-                    }
-                    else
-                    {
-                        RebuildBufferSeriesIndex(key, list);
-                    }
-                    UpdateBufferReplayFloor(key, list, forceRecalculate: true);
+                    // Retire the whole generation: the active buffer already holds only points appended
+                    // after the swap, so no per-point scan or series-index rebuild is needed.
+                    _bufferedPointCount -= fg.Points.Count;
+                    if (_maxBufferBytes > 0) _bufferedByteCount -= fg.SnapshotBytes;
+                }
+                else
+                {
+                    // Merge the failed generation back into the active buffer so the next flush retries
+                    // it. Failed-gen points have lower seq than active points; rebuilding the series
+                    // index and replay floor keeps the merged state consistent.
+                    if (!_buf.TryGetValue(key, out var active)) { active = []; _buf[key] = active; }
+                    active.InsertRange(0, fg.Points);
+                    RebuildBufferSeriesIndex(key, active);
+                    UpdateBufferReplayFloor(key, active, forceRecalculate: true);
                 }
             }
             finally { lk.ExitWriteLock(); }
-            UpdateWalCheckpoint();
-        }
-        catch (Exception ex)
-        {
-            // The snapshot points are still in the buffer and the WAL, so nothing is lost: the
-            // next write re-triggers a flush. Don't block writes on a transient flush failure.
-            _health.RecordFailure("async_flush", ex, blocksWrites: false);
+
+            if (succeeded) UpdateWalCheckpoint();
         }
         finally
         {
             _flushInFlight.TryRemove(key, out _);
-            Interlocked.Add(ref _flushSnapshotPointCount, -snapshot.Length);
-            Interlocked.Add(ref _flushSnapshotByteCount, -snapshotBytes);
-            _flushSnapshotMinTs.TryRemove(key, out _);
+            Interlocked.Add(ref _flushSnapshotPointCount, -fg.Points.Count);
+            Interlocked.Add(ref _flushSnapshotByteCount, -fg.SnapshotBytes);
+            _flushConcurrencyGate.Release();
         }
     }
 
@@ -3036,9 +3074,9 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
     {
         long min = long.MaxValue;
         var prefix = db + "|";
-        foreach (var kv in _flushSnapshotMinTs)
-            if (kv.Key.StartsWith(prefix, StringComparison.Ordinal) && kv.Value < min)
-                min = kv.Value;
+        foreach (var kv in _flushing)
+            if (kv.Key.StartsWith(prefix, StringComparison.Ordinal) && kv.Value.MinTimestamp < min)
+                min = kv.Value.MinTimestamp;
         return min;
     }
 
@@ -3249,6 +3287,9 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         foreach (var kv in _buf)
             foreach (var p in kv.Value)
                 bytes += EstimateBufferedPointBytes(p.Point);
+        foreach (var kv in _flushing)
+            foreach (var p in kv.Value.Points)
+                bytes += EstimateBufferedPointBytes(p.Point);
         _bufferedByteCount = bytes;
     }
 
@@ -3394,18 +3435,27 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         _lastValueCache.UpdateMany(db, rp, points.Select(static p => p.Point));
     }
 
-    private IEnumerable<BufferedPoint> BufferedCandidates(string key, List<BufferedPoint> list, string? measurement, HashSet<string>? allowedTagsCanonical)
+    private IEnumerable<BufferedPoint> BufferedCandidates(string key, string? measurement, HashSet<string>? allowedTagsCanonical)
     {
+        // Yield the flushing generation first, then the active one. Flushing points were written
+        // earlier (lower seq), so active points must be applied last to win last-write-wins.
         if (measurement == null || allowedTagsCanonical == null || allowedTagsCanonical.Count == 0)
-            return list;
-        if (!_bufBySeries.TryGetValue(key, out var bySeries))
-            return list;
+        {
+            if (_flushing.TryGetValue(key, out var fg))
+                foreach (var p in fg.Points) yield return p;
+            if (_buf.TryGetValue(key, out var active))
+                foreach (var p in active) yield return p;
+            yield break;
+        }
 
-        var candidates = new List<BufferedPoint>();
-        foreach (var tags in allowedTagsCanonical)
-            if (bySeries.TryGetValue(new SeriesKey(measurement, tags), out var points))
-                candidates.AddRange(points);
-        return candidates;
+        if (_flushing.TryGetValue(key, out var fg2))
+            foreach (var tags in allowedTagsCanonical)
+                if (fg2.BySeries.TryGetValue(new SeriesKey(measurement, tags), out var points))
+                    foreach (var p in points) yield return p;
+        if (_bufBySeries.TryGetValue(key, out var activeBySeries))
+            foreach (var tags in allowedTagsCanonical)
+                if (activeBySeries.TryGetValue(new SeriesKey(measurement, tags), out var points))
+                    foreach (var p in points) yield return p;
     }
 
     private void RebuildBufferSeriesIndex(string key, List<BufferedPoint> list)
@@ -3481,17 +3531,21 @@ public long GetFlushSnapshotByteCount() => Interlocked.Read(ref _flushSnapshotBy
         _walAppendGate.EnterWriteLock();
         try
         {
-            // _bufferReplayFloors is a ConcurrentDictionary; snapshot values safely.
-            var snapshot = _bufferReplayFloors.ToArray();
-            if (snapshot.Length == 0)
+            // The checkpoint must cover both the active buffer and any in-flight flushing
+            // generation: the latter's points are not yet in segments and still need WAL replay
+            // after a crash, so its replay floor cannot be advanced past.
+            var floors = new List<WalPosition>(_bufferReplayFloors.Count + _flushing.Count);
+            foreach (var kv in _bufferReplayFloors) floors.Add(kv.Value);
+            foreach (var kv in _flushing) floors.Add(kv.Value.ReplayFloor);
+            if (floors.Count == 0)
             {
                 _wal.Checkpoint(_wal.CurrentPosition);
                 return;
             }
-            var min = snapshot[0].Value;
-            for (var i = 1; i < snapshot.Length; i++)
+            var min = floors[0];
+            for (var i = 1; i < floors.Count; i++)
             {
-                var pos = snapshot[i].Value;
+                var pos = floors[i];
                 if (pos.FileId < min.FileId || (pos.FileId == min.FileId && pos.Offset < min.Offset))
                     min = pos;
             }
@@ -3558,9 +3612,9 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
     /// Flush后校验：用段文件 footer 的 MaxTime 校验缓存，若缺失则回填。
     /// 当前 flush 快照的 maxTime 即 footer maxTime 的真值来源，复核缓存是否与之对齐。
     /// </summary>
-    private void ValidateLastValueCacheFromFooter(string db, string rp, BufferedPoint[] flushed)
+    private void ValidateLastValueCacheFromFooter(string db, string rp, IReadOnlyList<BufferedPoint> flushed)
     {
-        if (flushed.Length == 0) return;
+        if (flushed.Count == 0) return;
         // group by series, find maxTime of flushed batch
         var maxBySeries = new Dictionary<SeriesKey, long>();
         var latestBySeries = new Dictionary<SeriesKey, Point>();
@@ -3603,7 +3657,7 @@ private ReaderWriterLockSlim GetLock(string key, bool alreadyHoldingGlobalWrite 
         _rpExpiryTimer?.Dispose(); _compactionTimer?.Dispose(); _flushTimer?.Dispose();
         FlushAll(); _schema.SaveIfDirty(); _manifest.SaveIfDirty();
         _wal.Dispose(); _walAppendGate.Dispose(); _writeCatalogGate.Dispose(); _globalLock.Dispose();
-        _queryGate.Dispose();
+        _queryGate.Dispose(); _flushConcurrencyGate.Dispose();
         foreach (var lk in _locks.Values) lk.Dispose();
     }
 
