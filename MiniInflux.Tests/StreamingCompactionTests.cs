@@ -118,4 +118,54 @@ public class StreamingCompactionTests : IDisposable
         Assert.Equal(200 * 50, points.Count);
         Assert.All(points, p => Assert.True(p.Fields["value"].AsDouble() >= 1000.0));
     }
+
+    [Fact]
+    public async Task CompactAll_NonOverlappingInputs_ConcatenatesDirectlyAndPreservesOrder()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0);
+        // Two batches with strictly non-overlapping time ranges for the same series: the fast path
+        // should concatenate them without the heap merge, and the result must stay time-ordered.
+        await engine.WriteAsync("testdb", "autogen",
+            [PointAt(1, Ns(1)), PointAt(2, Ns(2)), PointAt(3, Ns(3))]);
+        engine.FlushAll();
+        await engine.WriteAsync("testdb", "autogen",
+            [PointAt(4, Ns(10)), PointAt(5, Ns(11)), PointAt(6, Ns(12))]);
+        engine.FlushAll();
+
+        var compactor = new Compactor(engine.Meta, new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones, engine.Schema, maxL0Segments: 2, maxL1Segments: 99);
+        Assert.Equal(1, compactor.CompactAll());
+
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+            .OrderBy(p => p.TimestampNs).ToList();
+        Assert.Equal(6, points.Count);
+        Assert.Equal([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], points.Select(p => p.Fields["value"].AsDouble()).ToList());
+    }
+
+    [Fact]
+    public async Task CompactAll_LargeGroupSplitByPointBudget_AllPointsReadable()
+    {
+        using var engine = new TsdbEngine(_testDir, flushThreshold: 1, rpCheckIntervalMs: 0, flushIntervalMs: 0, compactionIntervalMs: 0);
+        // 20 points for one series across two non-overlapping segments; with a 5-point chunk
+        // budget the merge must emit 4 columns, and all points must survive the split.
+        var batch1 = new List<Point>();
+        for (var i = 0; i < 10; i++) batch1.Add(PointAt(i, Ns(i + 1)));
+        await engine.WriteAsync("testdb", "autogen", batch1);
+        engine.FlushAll();
+        var batch2 = new List<Point>();
+        for (var i = 10; i < 20; i++) batch2.Add(PointAt(i, Ns(i + 1)));
+        await engine.WriteAsync("testdb", "autogen", batch2);
+        engine.FlushAll();
+
+        var compactor = new Compactor(engine.Meta, new ShardManager(engine.RootPath, engine.Meta),
+            engine.Tombstones, engine.Schema, maxL0Segments: 2, maxL1Segments: 99,
+            mergedColumnPointBudget: 5);
+        Assert.Equal(1, compactor.CompactAll());
+
+        var points = engine.ReadAllPoints("testdb", "autogen", "cpu", null, null)
+            .OrderBy(p => p.TimestampNs).ToList();
+        Assert.Equal(20, points.Count);
+        Assert.Equal(Enumerable.Range(0, 20).Select(v => (double?)v).ToList(),
+            points.Select(p => p.Fields["value"].AsDouble()).ToList());
+    }
 }

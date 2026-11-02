@@ -27,6 +27,7 @@ public sealed class Compactor
     private readonly double _segmentFillRatio;
     // ponytail: optional I/O budget for compaction output writes (bytes/second; 0 = unlimited).
     private readonly long _maxWriteBytesPerSecond;
+    private readonly int _mergedColumnPointBudget;
     private long _throttleWindowStartTicks;
     private long _throttleWindowBytes;
     private readonly object _compactionLock = new();
@@ -49,7 +50,8 @@ public sealed class Compactor
         int minFilesPerCompaction = 2, int maxPassesPerRun = 8, StorageHealth? health = null,
         long maxSegmentFileBytes = 0, double segmentFillRatio = 0.5,
         long maxWriteBytesPerSecond = 0, Func<string, long>? inFlightFlushMinTs = null,
-        Func<IDisposable>? beginPublish = null, Action? segmentsPublished = null)
+        Func<IDisposable>? beginPublish = null, Action? segmentsPublished = null,
+        int mergedColumnPointBudget = 512 * 1024)
     {
         _manifest = manifest;
         _beginPublish = beginPublish;
@@ -68,6 +70,7 @@ public sealed class Compactor
         _maxSegmentFileBytes = maxSegmentFileBytes > 0 ? maxSegmentFileBytes : 512L * 1024 * 1024;
         _segmentFillRatio = segmentFillRatio is > 0 and <= 1 ? segmentFillRatio : 0.5;
         _maxWriteBytesPerSecond = Math.Max(0, maxWriteBytesPerSecond);
+        _mergedColumnPointBudget = Math.Max(1, mergedColumnPointBudget);
     }
 
     public int CompactAll()
@@ -418,10 +421,17 @@ public sealed class Compactor
         var fillFloor = (long)(_maxSegmentFileBytes * _segmentFillRatio);
         var remaining = totalEstimate;
 
+        (string Meas, string Tags, string Field)? lastGroup = null;
         foreach (var col in MergeColumnsStreaming(db, rp, inputMetas, groups, orderedGroups, retentionCutoffNs))
         {
             var colBytes = EstimateColumnBytes(col);
-            remaining -= groupEstimate[(col.Measurement, col.TagsCanonical, col.Field)];
+            // A group may now yield multiple point-budgeted columns; subtract its estimate once.
+            var groupKey = (col.Measurement, col.TagsCanonical, col.Field);
+            if (lastGroup == null || lastGroup != groupKey)
+            {
+                remaining -= groupEstimate[groupKey];
+                lastGroup = groupKey;
+            }
             if (chunk.Count > 0 && chunkBytes >= fillFloor && chunkBytes + colBytes > _maxSegmentFileBytes
                 && remaining >= fillFloor)
             {
@@ -530,19 +540,69 @@ public sealed class Compactor
             }
             if (filtered.Count == 0) continue;
 
-            var merged = MergeGroupColumns(group, filtered);
-            _schema.ValidateAndRegisterColumns(db, [merged]);
-            _manifest.UpdateIndexes(db, [(group.Meas, group.Tags, ParseTags(group.Tags))]);
-            yield return merged;
+            var registered = false;
+            foreach (var merged in MergeGroupColumns(group, filtered))
+            {
+                if (!registered)
+                {
+                    _schema.ValidateAndRegisterColumns(db, [merged]);
+                    _manifest.UpdateIndexes(db, [(group.Meas, group.Tags, ParseTags(group.Tags))]);
+                    registered = true;
+                }
+                yield return merged;
+            }
         }
     }
 
     /// <summary>
-    /// K-way merge of sorted, deduplicated columns. On equal timestamps the column from the latest
-    /// input (highest position in the ordered input list) wins, matching the previous
-    /// SortedDictionary-based merge semantics.
+    /// K-way merge of sorted, deduplicated columns, yielded in point-budgeted chunks. On equal
+    /// timestamps the column from the latest input (highest position in the ordered input list)
+    /// wins, matching the previous SortedDictionary-based merge semantics.
+    /// <para>
+    /// When all inputs are strictly non-overlapping in time they are concatenated directly instead
+    /// of going through the heap, since no equal-timestamp tie-break is possible.
+    /// </para>
     /// </summary>
-    private static SegmentColumn MergeGroupColumns((string Meas, string Tags, string Field) group, List<SegmentColumn> cols)
+    private IEnumerable<SegmentColumn> MergeGroupColumns((string Meas, string Tags, string Field) group, List<SegmentColumn> cols)
+    {
+        var kind = cols[0].Kind;
+
+        // Fast path: sort by MinTime; if every column starts strictly after the previous one ends,
+        // there are no overlapping timestamps and concatenation is order-correct.
+        var sorted = cols.OrderBy(c => c.MinTime).ToList();
+        var nonOverlapping = true;
+        for (var i = 1; i < sorted.Count; i++)
+        {
+            if (sorted[i].MinTime <= sorted[i - 1].MaxTime) { nonOverlapping = false; break; }
+        }
+
+        var merged = nonOverlapping ? ConcatenateNonOverlapping(sorted) : HeapMerge(cols);
+
+        var ts = new List<long>();
+        var vals = new List<FieldValue>();
+        foreach (var (t, v) in merged)
+        {
+            ts.Add(t);
+            vals.Add(v);
+            if (ts.Count >= _mergedColumnPointBudget)
+            {
+                yield return new SegmentColumn(group.Meas, group.Tags, group.Field, kind, ts[0], ts[^1], ts, vals);
+                ts = new List<long>();
+                vals = new List<FieldValue>();
+            }
+        }
+        if (ts.Count > 0)
+            yield return new SegmentColumn(group.Meas, group.Tags, group.Field, kind, ts[0], ts[^1], ts, vals);
+    }
+
+    private static IEnumerable<(long Ts, FieldValue Val)> ConcatenateNonOverlapping(List<SegmentColumn> sorted)
+    {
+        foreach (var col in sorted)
+            for (var i = 0; i < col.Timestamps.Count; i++)
+                yield return (col.Timestamps[i], col.Values[i]);
+    }
+
+    private static IEnumerable<(long Ts, FieldValue Val)> HeapMerge(List<SegmentColumn> cols)
     {
         var heap = new PriorityQueue<(int Col, int Idx, long Ts), long>();
         for (var c = 0; c < cols.Count; c++)
@@ -550,9 +610,6 @@ public sealed class Compactor
             var timestamps = cols[c].Timestamps;
             if (timestamps.Count > 0) heap.Enqueue((c, 0, timestamps[0]), timestamps[0]);
         }
-
-        var ts = new List<long>();
-        var vals = new List<FieldValue>();
 
         while (heap.TryDequeue(out var item, out var priority))
         {
@@ -576,12 +633,9 @@ public sealed class Compactor
                 }
             }
 
-            ts.Add(timestamp);
-            vals.Add(value);
+            yield return (timestamp, value);
             EnqueueNext(heap, cols, col, idx);
         }
-
-        return new SegmentColumn(group.Meas, group.Tags, group.Field, cols[0].Kind, ts[0], ts[^1], ts, vals);
     }
 
     private static void EnqueueNext(PriorityQueue<(int Col, int Idx, long Ts), long> heap, List<SegmentColumn> cols, int col, int idx)
